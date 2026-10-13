@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- EXAMPLE ONLY: regenerate with the BMC installer for your release and keep the placeholders. -->
+<AutomatedInstallation>
+  <Product name="Control-M/Enterprise Manager" installType="secondary"/>
+  <Parameters>
+    <Parameter name="INSTALL_DIR"            value="__EM_HOME__"/>
+    <Parameter name="OS_USER"                value="__EM_USER__"/>
+    <Parameter name="HOST_NAME"              value="__HOSTNAME__"/>
+    <Parameter name="HA_PRIMARY_HOST"        value="__PRIMARY_HOST__"/>
+    <Parameter name="HA_SECONDARY_HOST"      value="__SECONDARY_HOST__"/>
+    <Parameter name="DB_TYPE"                value="PostgreSQL"/>
+    <Parameter name="DB_EXISTING"            value="yes"/>
+    <Parameter name="DB_HOST"                value="__DB_HOST__"/>
+    <Parameter name="DB_PORT"                value="__DB_PORT__"/>
+    <Parameter name="DB_NAME"                value="__DB_NAME__"/>
+    <Parameter name="DBA_USER"               value="__DB_ADMIN_USER__"/>
+    <Parameter name="DBA_PASSWORD"           value="__DB_ADMIN_PASSWORD__"/>
+    <Parameter name="DBO_USER"               value="__EM_DB_USER__"/>
+    <Parameter name="DBO_PASSWORD"           value="__EM_DB_PASSWORD__"/>
+    <Parameter name="EM_ADMIN_PASSWORD"      value="__EM_ADMIN_PASSWORD__"/>
+    <Parameter name="WEB_SERVER_HTTPS_PORT"  value="__WEB_PORT__"/>
+    <Parameter name="START_SERVICES"         value="yes"/>
+  </Parameters>
+</AutomatedInstallation>

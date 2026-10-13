@@ -1,0 +1,104 @@
+# ---------------------------------------------------------------------------
+# Control-M/Server node (${server_role}).
+# Primary runs the scheduler (ctm) + Configuration Agent (ca).
+# Secondary runs only the CA and waits for failover (shares the same database).
+# ---------------------------------------------------------------------------
+SERVER_ROLE="${server_role}"
+CTM_USER="${ctm_user}"
+CTM_HOME="$DATA_MOUNT/$CTM_USER"
+SERVER_INSTALLER_BLOB="${server_installer_blob}"
+SERVER_SILENT_BLOB="${server_silent_blob}"
+DB_HOST="${db_host}"
+DB_PORT="${db_port}"
+CTM_DB_NAME="${ctm_db_name}"
+CTM_DB_USER="${ctm_db_user}"
+DB_ADMIN_USER="${db_admin_user}"
+CTM_SERVER_NAME="${ctm_server_name}"
+SERVER_PRIMARY_HOST="${server_primary_host}"
+SERVER_SECONDARY_HOST="${server_secondary_host}"
+EM_HOST="${em_host}"
+
+id -u "$CTM_USER" >/dev/null 2>&1 || useradd -m -d "$CTM_HOME" -s /bin/bash "$CTM_USER"
+mkdir -p "$CTM_HOME" && chown "$CTM_USER":"$CTM_USER" "$CTM_HOME"
+
+if [ -f "$CTM_HOME/.ctm_installed" ]; then
+  echo "Control-M/Server already installed on persistent disk; starting services only"
+else
+  DB_ADMIN_PASSWORD=$(kv_secret db-admin-password)
+  CTM_DB_PASSWORD=$(kv_secret ctm-db-password)
+
+  if [ "$SERVER_ROLE" = "secondary" ]; then
+    echo "== secondary: waiting for primary Control-M/Server ($SERVER_PRIMARY_HOST) Configuration Agent (2369)"
+    wait_for 7200 bash -c "exec 3<>/dev/tcp/$SERVER_PRIMARY_HOST/2369"
+  fi
+
+  INSTALL_SRC="$SHARED_MOUNT/installers/server/$CTM_VERSION"
+  if [ ! -f "$INSTALL_SRC/.extracted" ]; then
+    mkdir -p "$INSTALL_SRC"
+    blob_get "$SERVER_INSTALLER_BLOB" /tmp/server-installer.bin
+    tar -xf /tmp/server-installer.bin -C "$INSTALL_SRC"
+    rm -f /tmp/server-installer.bin
+    touch "$INSTALL_SRC/.extracted"
+  fi
+  chown -R "$CTM_USER":"$CTM_USER" "$INSTALL_SRC"
+
+  blob_get "$SERVER_SILENT_BLOB" /tmp/server-silent.xml
+  sed -i \
+    -e "s|__DB_HOST__|$DB_HOST|g" \
+    -e "s|__DB_PORT__|$DB_PORT|g" \
+    -e "s|__DB_NAME__|$CTM_DB_NAME|g" \
+    -e "s|__DB_ADMIN_USER__|$DB_ADMIN_USER|g" \
+    -e "s|__DB_ADMIN_PASSWORD__|$DB_ADMIN_PASSWORD|g" \
+    -e "s|__CTM_DB_USER__|$CTM_DB_USER|g" \
+    -e "s|__CTM_DB_PASSWORD__|$CTM_DB_PASSWORD|g" \
+    -e "s|__CTM_HOME__|$CTM_HOME|g" \
+    -e "s|__CTM_USER__|$CTM_USER|g" \
+    -e "s|__CTM_SERVER_NAME__|$CTM_SERVER_NAME|g" \
+    -e "s|__HOSTNAME__|$(hostname -s)|g" \
+    -e "s|__PRIMARY_HOST__|$SERVER_PRIMARY_HOST|g" \
+    -e "s|__SECONDARY_HOST__|$SERVER_SECONDARY_HOST|g" \
+    -e "s|__EM_HOST__|$EM_HOST|g" \
+    /tmp/server-silent.xml
+  chown "$CTM_USER":"$CTM_USER" /tmp/server-silent.xml && chmod 600 /tmp/server-silent.xml
+
+  SETUP=$(find "$INSTALL_SRC" -maxdepth 2 -name setup.sh | head -n1)
+  [ -n "$SETUP" ] || { echo "setup.sh not found under $INSTALL_SRC"; exit 1; }
+  echo "== installing Control-M/Server ($SERVER_ROLE) from $SETUP"
+  su - "$CTM_USER" -c "$SETUP -silent /tmp/server-silent.xml"
+  rm -f /tmp/server-silent.xml
+  touch "$CTM_HOME/.ctm_installed"
+fi
+
+if [ "$SERVER_ROLE" = "primary" ]; then
+  START_CMD='start_ca; start_ctm'
+  STOP_CMD='shut_ctm; shut_ca'
+else
+  START_CMD='start_ca'
+  STOP_CMD='shut_ca'
+fi
+
+cat > /etc/systemd/system/controlm-server.service <<UNIT
+[Unit]
+Description=Control-M/Server ($SERVER_ROLE)
+After=network-online.target remote-fs.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+User=$CTM_USER
+WorkingDirectory=$CTM_HOME
+ExecStart=/bin/bash -lc '$START_CMD'
+ExecStop=/bin/bash -lc '$STOP_CMD'
+TimeoutStartSec=600
+TimeoutStopSec=300
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now controlm-server.service || true
+
+date -u +%FT%TZ > "$MARKER"
+echo "== Control-M/Server bootstrap finished"
