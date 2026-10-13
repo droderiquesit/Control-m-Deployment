@@ -27,6 +27,9 @@ modules/
   backup/                Recovery Services vault, VM + file share policies
   dr/                    DB cross-region replica, Site Recovery, blob replication, Traffic Manager
 bootstrap/               remote state (resource group + storage account)
+azure-pipelines.yml      Azure DevOps pipeline (Checkmarx One + Delinea DSV + gated applies)
+pipelines/               pipeline stage/step templates and variables
+.github/workflows/       equivalent GitHub Actions pipeline
 scripts/
   silent-install/        placeholder contract for BMC silent-install XML files
   dr-failover.sh         scripted regional failover
@@ -106,10 +109,13 @@ Bootstrap order is enforced on the nodes themselves: the secondary EM waits for
 the primary's web server, the secondary Server waits for the primary's
 Configuration Agent, and agents wait for the Automation API behind the LB.
 
-Promotion between environments is a pull request that changes only tfvars; CI
-(`.github/workflows/terraform.yml`) runs fmt/validate/tflint, posts a plan per
-environment on PRs, auto-applies `dev` on merge to `main`, and gates
-`qa`/`uat`/`prod` behind GitHub environment approvals.
+Promotion between environments is a pull request that changes only tfvars.
+The **Azure DevOps pipeline** (`azure-pipelines.yml`, setup in
+`docs/AZURE-DEVOPS.md`) runs fmt/validate/tflint, a Checkmarx One scan (SAST,
+SCA, IaC), a plan per environment, then applies dev → qa → uat → prod on
+`main` behind Azure DevOps environment approvals. Platform passwords come from
+Delinea DevOps Secrets Vault and override the Terraform-generated ones. An
+equivalent GitHub Actions workflow lives in `.github/workflows/terraform.yml`.
 
 ## What you still own after `apply`
 

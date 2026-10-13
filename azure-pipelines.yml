@@ -1,0 +1,83 @@
+# ---------------------------------------------------------------------------
+# Control-M platform — Azure DevOps pipeline
+#
+#   validate ─► security (Checkmarx One: SAST + SCA + IaC) ─► plan(dev|qa|uat|prod)
+#            ─► apply dev ─► apply qa ─► apply uat ─► apply prod   (main branch only)
+#               approvals/checks live on the ADO environments ctm-dev … ctm-prod
+#
+# Secrets: Delinea DevOps Secrets Vault (DSV) supplies the Control-M platform
+# passwords (TF_VAR_platform_secrets) and the Checkmarx credentials; Azure auth
+# is a Workload Identity Federation service connection (no stored SPN secret).
+# Setup steps: docs/AZURE-DEVOPS.md
+# ---------------------------------------------------------------------------
+name: ctm-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [modules, environments, pipelines, azure-pipelines.yml]
+
+pr:
+  branches:
+    include: [main]
+  paths:
+    include: [modules, environments, pipelines, azure-pipelines.yml]
+
+parameters:
+  - name: environments
+    displayName: Environments (order = promotion order)
+    type: object
+    default:
+      - name: dev
+      - name: qa
+        promoteFrom: dev
+      - name: uat
+        promoteFrom: qa
+      - name: prod
+        promoteFrom: uat
+  - name: runCheckmarx
+    displayName: Run Checkmarx One scan
+    type: boolean
+    default: true
+  - name: failOnCheckmarxThreshold
+    displayName: Fail the pipeline when Checkmarx thresholds are exceeded
+    type: boolean
+    default: true
+  - name: applyEnvironments
+    displayName: Environments allowed to apply in this run (manual runs can restrict)
+    type: object
+    default: [dev, qa, uat, prod]
+
+variables:
+  - template: pipelines/variables/common.yml
+  # Variable group holding the DSV client credentials (secret) — see docs/AZURE-DEVOPS.md
+  - group: ctm-dsv-auth
+
+pool:
+  vmImage: ${{ variables.agentImage }}
+
+stages:
+  # ---------------- 1. static validation ----------------
+  - template: pipelines/templates/stage-validate.yml
+    parameters:
+      environments: ${{ parameters.environments }}
+
+  # ---------------- 2. Checkmarx One ----------------
+  - template: pipelines/templates/stage-security.yml
+    parameters:
+      enabled: ${{ parameters.runCheckmarx }}
+      failOnThreshold: ${{ parameters.failOnCheckmarxThreshold }}
+      dependsOn: [validate]
+
+  # ---------------- 3+4. plan and gated apply per environment ----------------
+  - ${{ each env in parameters.environments }}:
+      - template: pipelines/templates/stage-plan.yml
+        parameters:
+          environment: ${{ env.name }}
+
+      - template: pipelines/templates/stage-apply.yml
+        parameters:
+          environment: ${{ env.name }}
+          previousEnvironment: ${{ coalesce(env.promoteFrom, '') }}
+          enabled: ${{ containsValue(parameters.applyEnvironments, env.name) }}

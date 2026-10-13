@@ -1,0 +1,62 @@
+# Gated apply. The ADO environment "ctm-<env>" carries the approvals, business
+# hours and exclusive-lock checks (configured once in the portal, see docs).
+parameters:
+  - name: environment
+    type: string
+  - name: previousEnvironment
+    type: string
+    default: ""
+  - name: enabled
+    type: boolean
+    default: true
+
+stages:
+  - stage: apply_${{ parameters.environment }}
+    displayName: Apply ${{ parameters.environment }}
+    dependsOn:
+      - plan_${{ parameters.environment }}
+      - ${{ if ne(parameters.previousEnvironment, '') }}:
+          - apply_${{ parameters.previousEnvironment }}
+    # Runs on main only, when this environment's plan has changes, and when the
+    # previous environment applied successfully or had nothing to apply (Skipped).
+    ${{ if ne(parameters.previousEnvironment, '') }}:
+      condition: >-
+        and(
+          eq('${{ parameters.enabled }}', 'True'),
+          eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+          ne(variables['Build.Reason'], 'PullRequest'),
+          eq(dependencies.plan_${{ parameters.environment }}.result, 'Succeeded'),
+          eq(dependencies.plan_${{ parameters.environment }}.outputs['plan.plan.planHasChanges'], 'true'),
+          in(dependencies.apply_${{ parameters.previousEnvironment }}.result, 'Succeeded', 'Skipped')
+        )
+    ${{ else }}:
+      condition: >-
+        and(
+          eq('${{ parameters.enabled }}', 'True'),
+          eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+          ne(variables['Build.Reason'], 'PullRequest'),
+          eq(dependencies.plan_${{ parameters.environment }}.result, 'Succeeded'),
+          eq(dependencies.plan_${{ parameters.environment }}.outputs['plan.plan.planHasChanges'], 'true')
+        )
+    jobs:
+      - deployment: apply
+        displayName: terraform apply (${{ parameters.environment }})
+        environment: ctm-${{ parameters.environment }}
+        timeoutInMinutes: 180
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  fetchDepth: 1
+
+                - template: steps-dsv-secrets.yml
+                  parameters:
+                    environment: ${{ parameters.environment }}
+                    readPlatform: true
+
+                - template: steps-terraform-run.yml
+                  parameters:
+                    environment: ${{ parameters.environment }}
+                    command: apply
+                    planArtifact: tfplan-${{ parameters.environment }}

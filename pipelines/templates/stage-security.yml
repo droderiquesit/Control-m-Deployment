@@ -1,0 +1,87 @@
+# Checkmarx One scan (SAST + SCA + IaC Security/KICS for Terraform).
+# Two ways to run it:
+#   1. marketplace task "Checkmarx AST" with a Checkmarx One service connection
+#      (set variable checkmarxServiceConnection)
+#   2. the cx CLI authenticated with an OAuth client whose credentials are
+#      read from Delinea DSV (<prefix>/shared/checkmarx) — default
+parameters:
+  - name: enabled
+    type: boolean
+    default: true
+  - name: failOnThreshold
+    type: boolean
+    default: true
+  - name: dependsOn
+    type: object
+    default: []
+
+stages:
+  - stage: security
+    displayName: Security (Checkmarx One)
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: and(succeeded(), eq('${{ parameters.enabled }}', 'True'))
+    jobs:
+      - job: checkmarx
+        displayName: Checkmarx One scan
+        steps:
+          - checkout: self
+            fetchDepth: 0 # full history lets Checkmarx attribute findings to commits
+
+          # ---- option 1: marketplace task ----
+          - ${{ if ne(variables.checkmarxServiceConnection, '') }}:
+              - task: Checkmarx AST Scan@2
+                displayName: Checkmarx One scan (service connection)
+                continueOnError: ${{ not(parameters.failOnThreshold) }}
+                inputs:
+                  CheckmarxService: $(checkmarxServiceConnection)
+                  projectName: $(checkmarxProjectName)
+                  branchName: $(Build.SourceBranchName)
+                  tenantName: $(checkmarxTenant)
+                  additionalParams: >-
+                    --scan-types $(checkmarxScanTypes)
+                    --threshold "$(checkmarxThreshold)"
+                    --report-format sarif,summaryHTML
+                    --output-path $(Build.ArtifactStagingDirectory)
+                    --tags pipeline=$(Build.DefinitionName),build=$(Build.BuildId)
+
+          # ---- option 2: cx CLI + Delinea DSV credentials ----
+          - ${{ if eq(variables.checkmarxServiceConnection, '') }}:
+              - template: steps-dsv-secrets.yml
+                parameters:
+                  readPlatform: false
+                  readCheckmarx: true
+
+              - bash: |
+                  set -euo pipefail
+                  V="$(checkmarxCliVersion)"
+                  curl -fsSL -o "$(Agent.TempDirectory)/cx.tar.gz" \
+                    "https://github.com/Checkmarx/ast-cli/releases/download/${V}/ast-cli_${V}_linux_x64.tar.gz"
+                  tar -xzf "$(Agent.TempDirectory)/cx.tar.gz" -C "$(Agent.TempDirectory)" cx
+                  sudo install -m 0755 "$(Agent.TempDirectory)/cx" /usr/local/bin/cx
+                  cx version
+                displayName: Install Checkmarx cx CLI
+
+              - bash: |
+                  set -euo pipefail
+                  cx scan create \
+                    --project-name "$(checkmarxProjectName)" \
+                    --branch "$(Build.SourceBranchName)" \
+                    -s "$(Build.SourcesDirectory)" \
+                    --scan-types "$(checkmarxScanTypes)" \
+                    --threshold "$(checkmarxThreshold)" \
+                    --report-format sarif,summaryHTML \
+                    --output-path "$(Build.ArtifactStagingDirectory)" \
+                    --tags "pipeline=$(Build.DefinitionName),build=$(Build.BuildId)" \
+                    --file-filter '!**/.terraform/**,!**/*.tfstate*'
+                displayName: cx scan create (sast, sca, iac-security)
+                continueOnError: ${{ not(parameters.failOnThreshold) }}
+                env:
+                  CX_BASE_URI: $(checkmarxBaseUri)
+                  CX_TENANT: $(checkmarxTenant)
+                  CX_CLIENT_ID: $(checkmarxClientId)
+                  CX_CLIENT_SECRET: $(checkmarxClientSecret)
+
+          - publish: $(Build.ArtifactStagingDirectory)
+            artifact: checkmarx-results
+            displayName: Publish Checkmarx results (SARIF + summary)
+            condition: always()

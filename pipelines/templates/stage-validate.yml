@@ -1,0 +1,41 @@
+parameters:
+  - name: environments
+    type: object
+
+stages:
+  - stage: validate
+    displayName: Validate
+    jobs:
+      - job: static_checks
+        displayName: fmt / validate / tflint
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - template: steps-terraform-install.yml
+            parameters:
+              version: $(terraformVersion)
+
+          - bash: terraform fmt -check -recursive -diff
+            displayName: terraform fmt
+
+          - ${{ each env in parameters.environments }}:
+              - bash: |
+                  set -euo pipefail
+                  terraform init -backend=false -input=false >/dev/null
+                  terraform validate -no-color
+                displayName: terraform validate (${{ env.name }})
+                workingDirectory: environments/${{ env.name }}
+
+          - bash: |
+              set -euo pipefail
+              curl -fsSL https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+              tflint --init
+              tflint --recursive --config "$(Build.SourcesDirectory)/.tflint.hcl" --format compact
+            displayName: tflint
+
+          - bash: |
+              set -euo pipefail
+              for f in modules/platform/templates/*.tftpl scripts/*.sh; do bash -n "$f" || exit 1; done
+              echo "bootstrap scripts parse"
+            displayName: shell syntax check

@@ -1,0 +1,17 @@
+# Installs a pinned Terraform version (no marketplace extension required).
+parameters:
+  - name: version
+    type: string
+
+steps:
+  - bash: |
+      set -euo pipefail
+      V="${{ parameters.version }}"
+      cd "$(Agent.TempDirectory)"
+      curl -fsSLO "https://releases.hashicorp.com/terraform/${V}/terraform_${V}_linux_amd64.zip"
+      curl -fsSLO "https://releases.hashicorp.com/terraform/${V}/terraform_${V}_SHA256SUMS"
+      grep "terraform_${V}_linux_amd64.zip" "terraform_${V}_SHA256SUMS" | sha256sum -c -
+      unzip -oq "terraform_${V}_linux_amd64.zip"
+      sudo install -m 0755 terraform /usr/local/bin/terraform
+      terraform version
+    displayName: Install Terraform ${{ parameters.version }}

@@ -1,0 +1,23 @@
+variables:
+  agentImage: ubuntu-latest
+  terraformVersion: "1.9.8"
+
+  # Azure Resource Manager service connection (Workload Identity Federation).
+  # The GUID is shown in Project settings > Service connections > (connection) > URL (resourceId).
+  azureServiceConnection: sc-ctm-platform-wif
+  azureServiceConnectionId: 00000000-0000-0000-0000-000000000000
+
+  # Delinea DevOps Secrets Vault
+  dsvCliVersion: "1.40.5"
+  dsvDomain: secretsvaultcloud.com
+  dsvAuthType: clientcred            # clientcred | azure (managed identity on self-hosted agents)
+  dsvSecretPathPrefix: control-m     # secrets live at <prefix>/<env>/platform and <prefix>/shared/checkmarx
+
+  # Checkmarx One
+  checkmarxServiceConnection: ""     # set to use the marketplace task; empty = cx CLI with DSV credentials
+  checkmarxProjectName: control-m-platform
+  checkmarxTenant: your-tenant
+  checkmarxBaseUri: https://ast.checkmarx.net
+  checkmarxCliVersion: "2.3.5"
+  checkmarxScanTypes: sast,sca,iac-security
+  checkmarxThreshold: "sast-high=0;sast-medium=5;sca-high=0;iac-security-high=0"
