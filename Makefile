@@ -1,17 +1,17 @@
 # Control-M platform IaC helper targets.
-#   make init ENV=dev
+#   make init ENV=nonprod
 #   make plan ENV=prod
-#   make apply ENV=uat
-ENV ?= dev
+#   make apply ENV=prod
+ENV ?= nonprod
 TF  ?= terraform
 DIR  = environments/$(ENV)
-ENVS = dev qa uat prod
+ENVS = nonprod prod
 
 .PHONY: help bootstrap init plan apply destroy fmt validate lint output clean
 
 help:
 	@echo "Targets: bootstrap init plan apply destroy fmt validate lint output clean"
-	@echo "Usage:   make <target> ENV=<dev|qa|uat|prod>"
+	@echo "Usage:   make <target> ENV=<nonprod|prod>"
 
 bootstrap:
 	$(TF) -chdir=bootstrap init && $(TF) -chdir=bootstrap apply

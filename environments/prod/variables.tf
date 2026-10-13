@@ -4,7 +4,7 @@ variable "subscription_id" {
 }
 
 variable "environment" {
-  description = "dev | qa | uat | prod"
+  description = "Platform: nonprod (hosts dev + qa Control-M/Servers) or prod (hosts uat + prod)."
   type        = string
 }
 
@@ -95,30 +95,28 @@ variable "em" {
   })
 }
 
-variable "server" {
-  type = object({
+variable "servers" {
+  description = "Control-M/Servers on this platform keyed by stage (dev/qa on nonprod, uat/prod on prod). Each has its own VM pair, database and agent scale set."
+  type = map(object({
+    name             = optional(string)
     vm_size          = string
     data_disk_gb     = optional(number, 256)
     disk_type        = optional(string, "Premium_LRS")
     enable_secondary = optional(bool, true)
     zones            = optional(list(string), ["1", "2"])
-    server_name      = optional(string)
-  })
-}
-
-variable "agents" {
-  type = object({
-    vm_size         = string
-    min             = number
-    max             = number
-    default         = number
-    zones           = optional(list(string), ["1", "2", "3"])
-    use_spot        = optional(bool, false)
-    hostgroup       = optional(string, "azure-agents")
-    provision_image = optional(string, "Agent.Linux")
-    scale_out_cpu   = optional(number, 70)
-    scale_in_cpu    = optional(number, 25)
-  })
+    agents = object({
+      vm_size         = string
+      min             = number
+      max             = number
+      default         = number
+      zones           = optional(list(string), ["1", "2", "3"])
+      use_spot        = optional(bool, false)
+      hostgroup       = optional(string)
+      provision_image = optional(string, "Agent.Linux")
+      scale_out_cpu   = optional(number, 70)
+      scale_in_cpu    = optional(number, 25)
+    })
+  }))
 }
 
 variable "database" {
@@ -187,7 +185,7 @@ variable "dr" {
         postgres = optional(string)
       }), {})
     }))
-    warm_agents          = optional(number, 0)
+    warm_agents          = optional(number, 0) # per Control-M/Server
     replica_sku_name     = optional(string)
     enable_site_recovery = optional(bool, true)
     traffic_manager      = optional(bool, false)

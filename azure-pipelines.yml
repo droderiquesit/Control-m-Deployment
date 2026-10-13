@@ -1,9 +1,10 @@
 # ---------------------------------------------------------------------------
 # Control-M platform — Azure DevOps pipeline
 #
-#   validate ─► security (Checkmarx One: SAST + SCA + IaC) ─► plan(dev|qa|uat|prod)
-#            ─► apply dev ─► apply qa ─► apply uat ─► apply prod   (main branch only)
-#               approvals/checks live on the ADO environments ctm-dev … ctm-prod
+#   validate ─► security (Checkmarx One: SAST + SCA + IaC) ─► plan(nonprod|prod)
+#            ─► apply nonprod (CTM_DEV + CTM_QA) ─► apply prod (CTM_UAT + CTM_PROD)
+#               main branch only; approvals/checks live on the ADO environments
+#               ctm-nonprod and ctm-prod
 #
 # Secrets: Delinea DevOps Secrets Vault (DSV) supplies the Control-M platform
 # passwords (TF_VAR_platform_secrets) and the Checkmarx credentials; Azure auth
@@ -29,13 +30,9 @@ parameters:
     displayName: Environments (order = promotion order)
     type: object
     default:
-      - name: dev
-      - name: qa
-        promoteFrom: dev
-      - name: uat
-        promoteFrom: qa
+      - name: nonprod
       - name: prod
-        promoteFrom: uat
+        promoteFrom: nonprod
   - name: runCheckmarx
     displayName: Run Checkmarx One scan
     type: boolean
@@ -47,7 +44,7 @@ parameters:
   - name: applyEnvironments
     displayName: Environments allowed to apply in this run (manual runs can restrict)
     type: object
-    default: [dev, qa, uat, prod]
+    default: [nonprod, prod]
 
 variables:
   - template: pipelines/variables/common.yml

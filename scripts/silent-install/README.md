@@ -18,15 +18,15 @@ How to produce the real files for your release:
 
 | Placeholder             | EM | Server | Value injected at boot                              |
 |-------------------------|----|--------|-----------------------------------------------------|
-| `__DB_HOST__`           | ✔  | ✔      | `ctm-db.<env>.ctm.internal` (CNAME to PostgreSQL)   |
+| `__DB_HOST__`           | ✔  | ✔      | `ctm-db.<platform>.ctm.internal` (CNAME to PostgreSQL) |
 | `__DB_PORT__`           | ✔  | ✔      | 5432                                                |
-| `__DB_NAME__`           | ✔  | ✔      | `emdb` / `ctmdb`                                    |
+| `__DB_NAME__`           | ✔  | ✔      | `emdb` / `ctm_<stage>`                              |
 | `__DB_ADMIN_USER__`     | ✔  | ✔      | PostgreSQL administrator login                      |
 | `__DB_ADMIN_PASSWORD__` | ✔  | ✔      | Key Vault secret `db-admin-password`                |
 | `__EM_DB_USER__`        | ✔  |        | EM database owner                                   |
 | `__EM_DB_PASSWORD__`    | ✔  |        | Key Vault secret `em-db-password`                   |
 | `__CTM_DB_USER__`       |    | ✔      | Server database owner                               |
-| `__CTM_DB_PASSWORD__`   |    | ✔      | Key Vault secret `ctm-db-password`                  |
+| `__CTM_DB_PASSWORD__`   |    | ✔      | Key Vault secret `ctm-db-password-<stage>`          |
 | `__EM_HOME__`           | ✔  |        | `/ctm/emuser`                                       |
 | `__EM_USER__`           | ✔  |        | `emuser`                                            |
 | `__EM_ADMIN_PASSWORD__` | ✔  |        | Key Vault secret `em-admin-password`                |
@@ -34,8 +34,8 @@ How to produce the real files for your release:
 | `__CTM_USER__`          |    | ✔      | `controlm`                                          |
 | `__CTM_SERVER_NAME__`   |    | ✔      | Logical Control-M/Server name, e.g. `CTM_PROD`      |
 | `__HOSTNAME__`          | ✔  | ✔      | Short hostname of the node                          |
-| `__PRIMARY_HOST__`      | ✔  | ✔      | `ctm-em-a` / `ctm-srv-a`                            |
-| `__SECONDARY_HOST__`    | ✔  | ✔      | `ctm-em-b` / `ctm-srv-b` (empty when HA is off)     |
+| `__PRIMARY_HOST__`      | ✔  | ✔      | `ctm-em-a` / `ctm-srv-<stage>-a`                    |
+| `__SECONDARY_HOST__`    | ✔  | ✔      | `ctm-em-b` / `ctm-srv-<stage>-b` (empty when HA is off) |
 | `__WEB_PORT__`          | ✔  |        | 8443                                                |
 | `__EM_HOST__`           |    | ✔      | `ctm-em-a`                                          |
 

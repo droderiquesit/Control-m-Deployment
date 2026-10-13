@@ -4,7 +4,7 @@
 # DevOps Secrets Vault) through TF_VAR_platform_secrets, see docs/AZURE-DEVOPS.md.
 # Special characters in generated values are limited to ones safe in XML and sed.
 variable "platform_secrets" {
-  description = "Optional overrides from an external vault: db-admin-password, em-db-password, ctm-db-password, em-admin-password, ssh-private-key."
+  description = "Optional overrides from an external vault: db-admin-password, em-db-password, em-admin-password, ssh-private-key, ctm-db-password-<server key>."
   type        = map(string)
   sensitive   = true
   default     = {}
@@ -24,6 +24,7 @@ resource "random_password" "em_db" {
 }
 
 resource "random_password" "ctm_db" {
+  for_each         = var.servers
   length           = 32
   special          = true
   override_special = "!#%^*-_=+"
@@ -41,13 +42,15 @@ resource "tls_private_key" "ssh" {
 }
 
 locals {
-  generated_secrets = {
-    "db-admin-password" = random_password.db_admin.result
-    "em-db-password"    = random_password.em_db.result
-    "ctm-db-password"   = random_password.ctm_db.result
-    "em-admin-password" = random_password.em_admin.result
-    "ssh-private-key"   = tls_private_key.ssh.private_key_pem
-  }
+  generated_secrets = merge(
+    {
+      "db-admin-password" = random_password.db_admin.result
+      "em-db-password"    = random_password.em_db.result
+      "em-admin-password" = random_password.em_admin.result
+      "ssh-private-key"   = tls_private_key.ssh.private_key_pem
+    },
+    { for k, p in random_password.ctm_db : "ctm-db-password-${k}" => p.result },
+  )
 
   # External values win; anything not supplied falls back to the generated value.
   secrets = merge(local.generated_secrets, { for k, v in var.platform_secrets : k => v if v != "" })

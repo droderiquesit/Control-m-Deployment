@@ -2,11 +2,11 @@
 # Identity / placement
 # ---------------------------------------------------------------------------
 variable "environment" {
-  description = "dev | qa | uat | prod"
+  description = "Platform name: nonprod (hosts the dev and qa Control-M/Servers) or prod (hosts uat and prod)."
   type        = string
   validation {
-    condition     = contains(["dev", "qa", "uat", "prod"], var.environment)
-    error_message = "environment must be one of dev, qa, uat, prod."
+    condition     = contains(["nonprod", "prod"], var.environment)
+    error_message = "environment must be nonprod or prod."
   }
 }
 
@@ -92,7 +92,7 @@ variable "key_vault_public_access" {
 # Secrets (generated once at the environment root and replicated to DR)
 # ---------------------------------------------------------------------------
 variable "secrets" {
-  description = "Secrets to store in Key Vault: db-admin-password, em-db-password, ctm-db-password, em-admin-password, ssh-private-key."
+  description = "Secrets to store in Key Vault: db-admin-password, em-db-password, em-admin-password, ssh-private-key and one ctm-db-password-<server key> per Control-M/Server."
   type        = map(string)
   sensitive   = true
 }
@@ -167,39 +167,36 @@ variable "em" {
   })
 }
 
-variable "server" {
-  description = "Control-M/Server tier."
-  type = object({
-    deploy           = optional(bool, true)
+variable "servers" {
+  description = <<-EOT
+    Control-M/Servers hosted on this platform, keyed by stage (dev, qa, uat, prod).
+    Every Server gets its own VM pair (ctm-srv-<key>-a/b), its own database on the
+    shared PostgreSQL host, its own credentials and its own agent scale set / host group.
+    All Servers are managed by the platform's single Enterprise Manager.
+  EOT
+  type = map(object({
+    name             = optional(string) # logical Control-M/Server name, default CTM_<KEY>
     vm_size          = string
     data_disk_gb     = optional(number, 256)
     disk_type        = optional(string, "Premium_LRS")
     enable_secondary = optional(bool, true)
     zones            = optional(list(string), ["1", "2"])
     os_user          = optional(string, "controlm")
-    db_name          = optional(string, "ctmdb")
-    db_user          = optional(string, "ctmuser")
-    server_name      = optional(string)
-  })
-}
-
-variable "agents" {
-  description = "Control-M/Agent scale set."
-  type = object({
-    deploy          = optional(bool, true)
-    vm_size         = string
-    min             = number
-    max             = number
-    default         = number
-    zones           = optional(list(string), ["1", "2", "3"])
-    use_spot        = optional(bool, false)
-    hostgroup       = optional(string, "azure-agents")
-    provision_image = optional(string, "Agent.Linux")
-    agent_port      = optional(number, 7006)
-    os_user         = optional(string, "ctmagent")
-    scale_out_cpu   = optional(number, 70)
-    scale_in_cpu    = optional(number, 25)
-  })
+    agents = object({
+      vm_size         = string
+      min             = number
+      max             = number
+      default         = number
+      zones           = optional(list(string), ["1", "2", "3"])
+      use_spot        = optional(bool, false)
+      hostgroup       = optional(string) # default <key>-agents
+      provision_image = optional(string, "Agent.Linux")
+      agent_port      = optional(number, 7006)
+      os_user         = optional(string, "ctmagent")
+      scale_out_cpu   = optional(number, 70)
+      scale_in_cpu    = optional(number, 25)
+    })
+  }))
 }
 
 variable "database" {

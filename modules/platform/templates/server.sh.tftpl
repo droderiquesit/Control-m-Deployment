@@ -12,6 +12,7 @@ DB_HOST="${db_host}"
 DB_PORT="${db_port}"
 CTM_DB_NAME="${ctm_db_name}"
 CTM_DB_USER="${ctm_db_user}"
+CTM_DB_SECRET_NAME="${ctm_db_secret_name}"
 DB_ADMIN_USER="${db_admin_user}"
 CTM_SERVER_NAME="${ctm_server_name}"
 SERVER_PRIMARY_HOST="${server_primary_host}"
@@ -25,7 +26,7 @@ if [ -f "$CTM_HOME/.ctm_installed" ]; then
   echo "Control-M/Server already installed on persistent disk; starting services only"
 else
   DB_ADMIN_PASSWORD=$(kv_secret db-admin-password)
-  CTM_DB_PASSWORD=$(kv_secret ctm-db-password)
+  CTM_DB_PASSWORD=$(kv_secret "$CTM_DB_SECRET_NAME")
 
   if [ "$SERVER_ROLE" = "secondary" ]; then
     echo "== secondary: waiting for primary Control-M/Server ($SERVER_PRIMARY_HOST) Configuration Agent (2369)"

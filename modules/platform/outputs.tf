@@ -103,8 +103,16 @@ output "load_balancer_backend_pool_id" {
   value = module.load_balancer.backend_pool_id
 }
 
-output "ctm_server_name" {
-  value = local.ctm_server_name
+output "servers" {
+  description = "Control-M/Servers on this platform keyed by stage: logical name, hosts, database, host group, agent scale set."
+  value = { for k, s in local.servers : k => {
+    name           = s.name
+    primary_host   = s.primary_host
+    secondary_host = s.secondary_host
+    database       = s.db_name
+    hostgroup      = s.hostgroup
+    agent_vmss_id  = module.agent_pool[k].vmss_id
+  } }
 }
 
 output "nodes" {
@@ -115,8 +123,8 @@ output "nodes" {
   )
 }
 
-output "agent_vmss_id" {
-  value = var.agents.deploy ? module.agent_pool[0].vmss_id : null
+output "agent_vmss_ids" {
+  value = { for k, m in module.agent_pool : k => m.vmss_id }
 }
 
 output "log_analytics_workspace_id" {

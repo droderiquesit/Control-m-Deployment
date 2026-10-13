@@ -1,8 +1,18 @@
 # Control-M on Azure — Terraform
 
 Infrastructure as Code for a highly available, disaster-recoverable and
-horizontally scalable **BMC Control-M** platform on Microsoft Azure, with
-dedicated **dev, qa, uat and prod** environments.
+horizontally scalable **BMC Control-M** platform on Microsoft Azure, serving
+the **dev, qa, uat and prod** stages from two platforms:
+
+| Platform | Enterprise Manager | Control-M/Servers | Why |
+|----------|--------------------|-------------------|-----|
+| **nonprod** | 1 node (HA optional) | `CTM_DEV`, `CTM_QA` | cheap, isolated place to develop jobs and rehearse upgrades |
+| **prod** | HA pair | `CTM_UAT`, `CTM_PROD` | UAT runs on production infrastructure (same EM, database host, DR), so what is accepted is what goes live |
+
+Each Control-M/Server has its own VM pair, its own database on the shared
+PostgreSQL host, its own credentials and its own agent scale set / host group.
+Job definitions move dev → qa → uat → prod with the Automation API
+(`ctm deploy`), not by re-deploying infrastructure.
 
 The platform is deployed **into networks you already own**: every environment
 points at an existing VNet and subnets. Terraform creates the Control-M tiers,
@@ -10,8 +20,8 @@ database, storage, secrets, monitoring, backup and DR plumbing — nothing in th
 network team's domain.
 
 ```
-environments/            one root per environment (same code, different tfvars)
-  dev | qa | uat | prod  main.tf  variables.tf  terraform.tfvars  backend.hcl
+environments/            one root per platform (same code, different tfvars)
+  nonprod | prod         main.tf  variables.tf  terraform.tfvars  backend.hcl
 modules/
   platform/              composition for ONE region (primary or dr role)
     templates/           cloud-init bootstrap for EM, Server and Agent nodes
@@ -36,13 +46,13 @@ scripts/
 docs/                    architecture, network requirements, DR runbook, operations
 ```
 
-## Architecture (per environment)
+## Architecture (per platform)
 
 | Tier | Resource | HA | Scale |
 |------|----------|----|-------|
 | Control-M/Enterprise Manager | 2 zonal VMs (`ctm-em-a` zone 1, `ctm-em-b` zone 2), persistent data disk, shared DB | EM primary/secondary; LB health probe follows the active node | vertical (VM size) |
-| Control-M/Server | 2 zonal VMs (`ctm-srv-a`, `ctm-srv-b`), persistent data disk, shared DB | Server primary/secondary via Configuration Agent failover | vertical |
-| Control-M/Agents | VM Scale Set across 3 zones, registered to a host group | zone balanced, self-healing | autoscale on CPU, min/max per env, Spot optional |
+| Control-M/Server (one per stage) | 2 zonal VMs per Server (`ctm-srv-<stage>-a/b`), persistent data disk, own database | Server primary/secondary via Configuration Agent failover | vertical; add a stage by adding a map entry |
+| Control-M/Agents (one pool per Server) | VM Scale Set across 3 zones, registered to the Server's host group | zone balanced, self-healing | autoscale on CPU, min/max per stage, Spot optional |
 | Database | Azure Database for PostgreSQL Flexible Server | **ZoneRedundant** standby, automatic failover | SKU/storage per env, auto-grow |
 | Shared filesystem | Azure Files Premium, **NFS 4.1**, ZRS | zone redundant | quota per env |
 | Media/backups | Blob storage, RA-GZRS | geo redundant | — |
@@ -50,26 +60,29 @@ docs/                    architecture, network requirements, DR runbook, operati
 | Secrets | Key Vault (RBAC, private endpoint), VM managed identity | — | — |
 | Monitoring | Log Analytics + Azure Monitor Agent, metric alerts, Service Health | — | — |
 | Backup | Recovery Services vault (GRS + cross-region restore in prod), daily VM + file share | — | — |
-| DR (uat/prod) | second region: PostgreSQL cross-region replica, **Site Recovery** replication of EM/Server VMs, replicated installers, warm agent scale set, optional Traffic Manager | — | — |
+| DR (prod platform) | second region: PostgreSQL cross-region replica, **Site Recovery** replication of EM/Server VMs, replicated installers, warm agent scale set, optional Traffic Manager | — | — |
 
 Node identity is stable: hostnames, persistent `/ctm` data disks and the
 `ctm-db` / `ctm-web` DNS aliases are identical in the primary and DR regions,
 so a failed-over node starts Control-M unchanged against the promoted database.
 See `docs/ARCHITECTURE.md` for the diagram and `docs/DR-RUNBOOK.md` for failover.
 
-## Environment matrix
+## Platform matrix
 
-| | dev | qa | uat | prod |
-|---|---|---|---|---|
-| EM / Server HA pair | no (single) | yes | yes | yes |
-| EM/Server VM size | D4s_v5 | D4s_v5 | D8s_v5 (ZRS disks) | D16s_v5 (ZRS disks) |
-| PostgreSQL | B2ms, no HA, 7d | D2ds_v5, zone-redundant, 7d | D4ds_v5, zone-redundant, geo-backup, 14d | D8ds_v5, zone-redundant, geo-backup, 35d |
-| Agents (min/max) | 1 / 2, Spot | 1 / 4, Spot | 2 / 6 | 3 / 20 |
-| Backup vault | LRS, 7d | ZRS, 14d | GRS + cross-region restore, 30d | GRS + cross-region restore, 35d / 52w |
-| DR region | — | — | pilot light (replica + ASR) | warm standby (replica + ASR + 1 agent) |
-| Locks / purge protection | — | — | — | yes |
+| | nonprod | prod |
+|---|---|---|
+| Control-M/Servers | `CTM_DEV` (single VM), `CTM_QA` (HA pair) | `CTM_UAT` (HA pair), `CTM_PROD` (HA pair) |
+| EM | single D4s_v5 | HA pair D16s_v5, ZRS disks |
+| Server VM sizes | D4s_v5 | uat D8s_v5, prod D16s_v5, ZRS disks |
+| PostgreSQL (one host, one DB per Server + EM) | D2ds_v5, zone-redundant, 7d | D8ds_v5, zone-redundant, geo-backup, 35d |
+| Agents (min/max) | dev 1/2 Spot, qa 1/4 Spot | uat 2/6, prod 3/20 |
+| Backup vault | ZRS, 14d | GRS + cross-region restore, 35d / 52w |
+| DR region | — | replica + Site Recovery + 1 warm agent per Server |
+| Locks / purge protection | — | yes |
+| EM/Server VMs | 4 | 6 |
 
-Everything above is in `environments/<env>/terraform.tfvars`; the code is identical.
+Everything above is in `environments/<platform>/terraform.tfvars`; the code is identical.
+Moving a stage to its own platform later is a tfvars change (new root with one Server).
 
 ## Prerequisites
 
@@ -92,10 +105,10 @@ terraform -chdir=bootstrap init
 terraform -chdir=bootstrap apply -var subscription_id=<sub> -var state_storage_account_name=<unique>
 #    then put the storage account name into environments/*/backend.hcl
 
-# 1. edit environments/dev/terraform.tfvars: subscription, network names, deployer IPs, emails
-make init  ENV=dev
-make plan  ENV=dev
-make apply ENV=dev           # creates everything except the VM installs (they wait for media)
+# 1. edit environments/nonprod/terraform.tfvars: subscription, network names, deployer IPs, emails
+make init  ENV=nonprod
+make plan  ENV=nonprod
+make apply ENV=nonprod       # creates everything except the VM installs (they wait for media)
 
 # 2. upload media + silent XML into the installers container printed by `terraform output`
 az storage blob upload-batch --auth-mode login \
@@ -112,17 +125,21 @@ Configuration Agent, and agents wait for the Automation API behind the LB.
 Promotion between environments is a pull request that changes only tfvars.
 The **Azure DevOps pipeline** (`azure-pipelines.yml`, setup in
 `docs/AZURE-DEVOPS.md`) runs fmt/validate/tflint, a Checkmarx One scan (SAST,
-SCA, IaC), a plan per environment, then applies dev → qa → uat → prod on
-`main` behind Azure DevOps environment approvals. Platform passwords come from
+SCA, IaC), a plan per platform, then applies nonprod → prod on `main` behind
+Azure DevOps environment approvals. Platform passwords come from
 Delinea DevOps Secrets Vault and override the Terraform-generated ones. An
 equivalent GitHub Actions workflow lives in `.github/workflows/terraform.yml`.
 
 ## What you still own after `apply`
 
-* **Register the Control-M/Server in EM** (Control-M Configuration Manager →
-  Add Control-M/Server, host `ctm-srv-a`, secondary `ctm-srv-b`) and enable
-  automatic failover. Agents register themselves through the Automation API
-  once the Server exists.
+* **Register each Control-M/Server in its EM** (Control-M Configuration
+  Manager → Add Control-M/Server: `CTM_DEV` on `ctm-srv-dev-a`, `CTM_QA` on
+  `ctm-srv-qa-a` / `ctm-srv-qa-b`, and on prod `CTM_UAT`, `CTM_PROD`) and
+  enable automatic failover for the HA pairs. Agents register themselves to
+  their Server through the Automation API once the Server exists.
+* **Promote job definitions** between stages with the Automation API
+  (`ctm deploy` against the stage's Server) or Workload Change Manager; the
+  infrastructure pipeline only promotes platform changes.
 * **Certificates**: EM ships a self-signed certificate; replace it and remove
   the `-k` / `NODE_TLS_REJECT_UNAUTHORIZED=0` shortcuts in
   `modules/platform/templates/agent.sh.tftpl`.

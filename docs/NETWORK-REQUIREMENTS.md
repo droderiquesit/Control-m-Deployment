@@ -1,7 +1,7 @@
 # Network requirements (bring-your-own VNet)
 
 The platform never creates or modifies a VNet, subnet, NSG, route table or
-firewall. Each environment (and each DR region) needs the following to exist
+firewall. Each platform (nonprod, prod, and the prod DR region) needs the following to exist
 before `terraform apply`.
 
 ## Subnets
@@ -34,8 +34,8 @@ SaaS APIs) — those belong to the agent host group's own NSG policy.
 ## DNS
 
 * The platform creates one private DNS zone per region named
-  `<env>.ctm.internal` with **auto-registration** linked to the VNet. VM
-  hostnames (`ctm-em-a`, `ctm-srv-a`, `ctm-agent-xxxxxx`) resolve without
+  `<platform>.ctm.internal` with **auto-registration** linked to the VNet. VM
+  hostnames (`ctm-em-a`, `ctm-srv-prod-a`, `ctm-agent-xxxxxx`) resolve without
   manual records; `ctm-web` and `ctm-db` are managed aliases.
 * Private endpoints need the standard zones `privatelink.blob.core.windows.net`,
   `privatelink.file.core.windows.net`, `privatelink.vaultcore.azure.net` and a

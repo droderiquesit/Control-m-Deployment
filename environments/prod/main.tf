@@ -28,8 +28,7 @@ module "platform" {
   image           = var.image
 
   em            = var.em
-  server        = var.server
-  agents        = var.agents
+  servers       = var.servers
   database      = var.database
   storage       = var.storage
   load_balancer = var.load_balancer
@@ -61,9 +60,11 @@ module "platform_dr" {
   installer_blobs = var.installer_blobs
   image           = var.image
 
-  em     = merge(var.em, { deploy = false })
-  server = merge(var.server, { deploy = false })
-  agents = merge(var.agents, { min = 0, default = var.dr.warm_agents })
+  em = merge(var.em, { deploy = false })
+  # Same Servers, but only warm agents in DR (VMs arrive through Site Recovery).
+  servers = { for k, s in var.servers : k => merge(s, {
+    agents = merge(s.agents, { min = 0, default = var.dr.warm_agents })
+  }) }
 
   database = {
     create        = false

@@ -11,7 +11,7 @@ on:
       environment:
         description: Environment to apply
         type: choice
-        options: [dev, qa, uat, prod]
+        options: [nonprod, prod]
         required: true
 
 permissions:
@@ -38,7 +38,7 @@ jobs:
       - run: terraform fmt -check -recursive
       - name: validate every environment
         run: |
-          for e in dev qa uat prod; do
+          for e in nonprod prod; do
             terraform -chdir=environments/$e init -backend=false -input=false >/dev/null
             terraform -chdir=environments/$e validate -no-color
           done
@@ -53,7 +53,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        env: [dev, qa, uat, prod]
+        env: [nonprod, prod]
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
@@ -73,17 +73,17 @@ jobs:
             });
 
   apply:
-    name: apply (${{ github.event.inputs.environment || 'dev' }})
+    name: apply (${{ github.event.inputs.environment || 'nonprod' }})
     needs: lint
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
-    # GitHub "environments" carry required reviewers for qa/uat/prod.
-    environment: ${{ github.event.inputs.environment || 'dev' }}
-    concurrency: terraform-${{ github.event.inputs.environment || 'dev' }}
+    # GitHub "environments" carry required reviewers for prod.
+    environment: ${{ github.event.inputs.environment || 'nonprod' }}
+    concurrency: terraform-${{ github.event.inputs.environment || 'nonprod' }}
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
-      - run: terraform -chdir=environments/${{ github.event.inputs.environment || 'dev' }} init -input=false -backend-config=backend.hcl
-      - run: terraform -chdir=environments/${{ github.event.inputs.environment || 'dev' }} apply -input=false -auto-approve
+      - run: terraform -chdir=environments/${{ github.event.inputs.environment || 'nonprod' }} init -input=false -backend-config=backend.hcl
+      - run: terraform -chdir=environments/${{ github.event.inputs.environment || 'nonprod' }} apply -input=false -auto-approve

@@ -1,8 +1,9 @@
 # ---------------------------------------------------------------------------
 # Control-M platform composition for ONE region.
-#   role = primary : EM (primary+secondary), Server (primary+secondary),
-#                    agent scale set, PostgreSQL Flexible Server (zone-redundant HA),
-#                    shared NFS, Key Vault, LB, monitoring, backup.
+#   role = primary : one EM pair, N Control-M/Server pairs (one per stage hosted on
+#                    this platform), an agent scale set per Server, PostgreSQL
+#                    Flexible Server (zone-redundant HA), shared NFS, Key Vault,
+#                    LB, monitoring, backup.
 #   role = dr      : same foundation without DB/VMs. The dr module adds a
 #                    cross-region PostgreSQL replica and Site Recovery for the VMs.
 # ---------------------------------------------------------------------------
@@ -19,31 +20,37 @@ locals {
     managedBy   = "terraform"
   })
 
-  zone_name       = var.private_dns_zone_name
-  db_alias        = "ctm-db.${local.zone_name}"
-  web_alias       = "ctm-web.${local.zone_name}"
-  ctm_server_name = coalesce(var.server.server_name, upper("CTM_${var.environment}"))
+  zone_name = var.private_dns_zone_name
+  db_alias  = "ctm-db.${local.zone_name}"
+  web_alias = "ctm-web.${local.zone_name}"
 
-  em_primary_host    = "ctm-em-a"
-  em_secondary_host  = "ctm-em-b"
-  srv_primary_host   = "ctm-srv-a"
-  srv_secondary_host = "ctm-srv-b"
-  data_mount         = "/ctm"
-  deploy_nodes       = var.role == "primary"
+  em_primary_host   = "ctm-em-a"
+  em_secondary_host = "ctm-em-b"
+  data_mount        = "/ctm"
+  deploy_nodes      = var.role == "primary"
+
+  # Per-Server derived settings (hostnames, database, secret name, host group).
+  servers = { for k, s in var.servers : k => merge(s, {
+    name           = coalesce(s.name, upper("CTM_${k}"))
+    db_name        = "ctm_${k}"
+    db_user        = "ctm_${k}"
+    secret_name    = "ctm-db-password-${k}"
+    hostgroup      = coalesce(s.agents.hostgroup, "${k}-agents")
+    primary_host   = "ctm-srv-${k}-a"
+    secondary_host = s.enable_secondary ? "ctm-srv-${k}-b" : ""
+  }) }
 
   em_nodes = local.deploy_nodes && var.em.deploy ? merge(
     { (local.em_primary_host) = { role = "primary", zone = var.em.zones[0] } },
     var.em.enable_secondary ? { (local.em_secondary_host) = { role = "secondary", zone = var.em.zones[1] } } : {}
   ) : {}
 
-  server_nodes = local.deploy_nodes && var.server.deploy ? merge(
-    { (local.srv_primary_host) = { role = "primary", zone = var.server.zones[0] } },
-    var.server.enable_secondary ? { (local.srv_secondary_host) = { role = "secondary", zone = var.server.zones[1] } } : {}
-  ) : {}
+  server_nodes = local.deploy_nodes ? merge([for k, s in local.servers : merge(
+    { (s.primary_host) = { server = k, role = "primary", zone = s.zones[0] } },
+    s.enable_secondary ? { (s.secondary_host) = { server = k, role = "secondary", zone = s.zones[1] } } : {}
+  )]...) : {}
 
   pg_fqdn = var.database.create ? module.database[0].fqdn : var.database.host_override
-
-  secret_names = ["db-admin-password", "em-db-password", "ctm-db-password", "em-admin-password", "ssh-private-key"]
 }
 
 resource "azurerm_resource_group" "this" {
@@ -89,7 +96,7 @@ module "security" {
   allowed_ip_cidrs              = var.deployer_ip_cidrs
   pe_subnet_id                  = module.network.pe_subnet_id
   vault_private_dns_zone_id     = module.network.privatelink_zone_ids["vault"]
-  secrets                       = { for k in local.secret_names : k => var.secrets[k] }
+  secrets                       = var.secrets
   tags                          = local.tags
 }
 
@@ -132,7 +139,7 @@ module "database" {
   geo_redundant_backup_enabled = var.database.geo_redundant_backup
   administrator_login          = var.database.admin_user
   administrator_password       = var.secrets["db-admin-password"]
-  databases                    = [var.em.db_name, var.server.db_name]
+  databases                    = concat([var.em.db_name], [for k, srv in local.servers : srv.db_name])
   tags                         = local.tags
 }
 
@@ -217,34 +224,37 @@ locals {
       templatefile("${path.module}/templates/common.sh.tftpl", merge(local.common_tpl, { role = "server-${n.role}", attach_data_disk = "true" })),
       templatefile("${path.module}/templates/server.sh.tftpl", {
         server_role           = n.role
-        ctm_user              = var.server.os_user
+        ctm_user              = local.servers[n.server].os_user
         server_installer_blob = var.installer_blobs.server_installer
         server_silent_blob    = n.role == "primary" ? var.installer_blobs.server_silent_primary : var.installer_blobs.server_silent_secondary
         db_host               = local.db_alias
         db_port               = var.database.port
-        ctm_db_name           = var.server.db_name
-        ctm_db_user           = var.server.db_user
+        ctm_db_name           = local.servers[n.server].db_name
+        ctm_db_user           = local.servers[n.server].db_user
+        ctm_db_secret_name    = local.servers[n.server].secret_name
         db_admin_user         = var.database.admin_user
-        ctm_server_name       = local.ctm_server_name
-        server_primary_host   = local.srv_primary_host
-        server_secondary_host = var.server.enable_secondary ? local.srv_secondary_host : ""
+        ctm_server_name       = local.servers[n.server].name
+        server_primary_host   = local.servers[n.server].primary_host
+        server_secondary_host = local.servers[n.server].secondary_host
         em_host               = local.em_primary_host
       })
     ])
   }
 
-  agent_userdata = join("\n", [
-    templatefile("${path.module}/templates/common.sh.tftpl", merge(local.common_tpl, { role = "agent", attach_data_disk = "false" })),
-    templatefile("${path.module}/templates/agent.sh.tftpl", {
-      agent_user      = var.agents.os_user
-      em_api_endpoint = "https://${local.web_alias}:${var.em.web_port}/automation-api"
-      em_api_user     = "emuser"
-      ctm_server_name = local.ctm_server_name
-      hostgroup       = var.agents.hostgroup
-      agent_port      = var.agents.agent_port
-      provision_image = var.agents.provision_image
-    })
-  ])
+  agent_userdata = {
+    for k, srv in local.servers : k => join("\n", [
+      templatefile("${path.module}/templates/common.sh.tftpl", merge(local.common_tpl, { role = "agent-${k}", attach_data_disk = "false" })),
+      templatefile("${path.module}/templates/agent.sh.tftpl", {
+        agent_user      = srv.agents.os_user
+        em_api_endpoint = "https://${local.web_alias}:${var.em.web_port}/automation-api"
+        em_api_user     = "emuser"
+        ctm_server_name = srv.name
+        hostgroup       = srv.hostgroup
+        agent_port      = srv.agents.agent_port
+        provision_image = srv.agents.provision_image
+      })
+    ])
+  }
 }
 
 # ---------------- EM nodes ----------------
@@ -281,42 +291,42 @@ module "server_node" {
   location                = var.location
   zone                    = each.value.zone
   subnet_id               = module.network.app_subnet_id
-  vm_size                 = var.server.vm_size
+  vm_size                 = local.servers[each.value.server].vm_size
   image                   = var.image
   ssh_public_key          = var.ssh_public_key
   identity_id             = module.security.identity_id
-  data_disk_gb            = var.server.data_disk_gb
-  disk_type               = var.server.disk_type
+  data_disk_gb            = local.servers[each.value.server].data_disk_gb
+  disk_type               = local.servers[each.value.server].disk_type
   custom_data             = local.server_userdata[each.key]
   data_collection_rule_id = module.observability.data_collection_rule_id
-  tags                    = merge(local.tags, { "ctm:component" = "server", "ctm:role" = each.value.role })
+  tags                    = merge(local.tags, { "ctm:component" = "server", "ctm:role" = each.value.role, "ctm:server" = local.servers[each.value.server].name })
 
   depends_on = [module.database, module.storage, module.security]
 }
 
-# ---------------- Agent scale set ----------------
+# ---------------- Agent scale set per Control-M/Server ----------------
 module "agent_pool" {
-  count  = var.agents.deploy ? 1 : 0
-  source = "../agent-pool"
+  for_each = local.servers
+  source   = "../agent-pool"
 
-  name                    = "${local.name}-agents"
+  name                    = "${local.name}-agents-${each.key}"
   resource_group_name     = azurerm_resource_group.this.name
   location                = var.location
   subnet_id               = module.network.app_subnet_id
-  zones                   = var.agents.zones
-  vm_size                 = var.agents.vm_size
+  zones                   = each.value.agents.zones
+  vm_size                 = each.value.agents.vm_size
   image                   = var.image
   ssh_public_key          = var.ssh_public_key
   identity_id             = module.security.identity_id
-  custom_data             = local.agent_userdata
-  min_instances           = var.agents.min
-  max_instances           = var.agents.max
-  default_instances       = var.agents.default
-  scale_out_cpu_percent   = var.agents.scale_out_cpu
-  scale_in_cpu_percent    = var.agents.scale_in_cpu
-  use_spot                = var.agents.use_spot
+  custom_data             = local.agent_userdata[each.key]
+  min_instances           = each.value.agents.min
+  max_instances           = each.value.agents.max
+  default_instances       = each.value.agents.default
+  scale_out_cpu_percent   = each.value.agents.scale_out_cpu
+  scale_in_cpu_percent    = each.value.agents.scale_in_cpu
+  use_spot                = each.value.agents.use_spot
   data_collection_rule_id = module.observability.data_collection_rule_id
-  tags                    = merge(local.tags, { "ctm:component" = "agent" })
+  tags                    = merge(local.tags, { "ctm:component" = "agent", "ctm:server" = each.value.name, "ctm:stage" = each.key })
 
   depends_on = [module.storage, module.security]
 }

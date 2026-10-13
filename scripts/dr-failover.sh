@@ -13,7 +13,7 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-ENV="${1:?usage: $0 <dev|qa|uat|prod> [--test]}"
+ENV="${1:?usage: $0 <prod|nonprod> [--test]}"
 MODE="${2:-}"
 cd "$(dirname "$0")/../environments/$ENV"
 
@@ -24,7 +24,6 @@ REPLICA_FQDN=$(tf_out '.dr.value.replica_fqdn')
 REPLICA_NAME="${REPLICA_FQDN%%.*}"
 ASR_VAULT=$(tf_out '.dr.value.site_recovery_vault')
 ZONE="$ENV.ctm.internal"
-MIN_AGENTS=$(grep -E '^\s*min\s*=' terraform.tfvars | head -1 | awk -F= '{gsub(/ /,"",$2); print $2}')
 
 echo "== Control-M DR failover: env=$ENV dr_rg=$DR_RG replica=$REPLICA_NAME mode=${MODE:-real}"
 
@@ -56,8 +55,19 @@ echo "== 3/4 ensuring ctm-db.$ZONE -> $REPLICA_FQDN in the DR private zone"
 az network private-dns record-set cname set-record --resource-group "$DR_RG" --zone-name "$ZONE" \
   --record-set-name ctm-db --cname "$REPLICA_FQDN" >/dev/null
 
-echo "== 4/4 scaling DR agents to $MIN_AGENTS"
-az vmss scale --resource-group "$DR_RG" --name "ctm-$ENV-dr-agents" --new-capacity "${MIN_AGENTS:-1}" >/dev/null
+echo "== 4/4 scaling DR agent pools (one per Control-M/Server)"
+for key in $(tf_out '.servers.value | keys[]'); do
+  MIN=$(python3 - "$key" <<'PY2'
+import re,sys
+key=sys.argv[1]; txt=open("terraform.tfvars").read()
+blk=re.search(r'\b'+key+r'\s*=\s*\{.*?agents\s*=\s*\{(.*?)\}', txt, re.S)
+m=re.search(r'\bmin\s*=\s*(\d+)', blk.group(1)) if blk else None
+print(m.group(1) if m else 1)
+PY2
+)
+  echo "   $key -> $MIN"
+  az vmss scale --resource-group "$DR_RG" --name "ctm-$ENV-dr-agents-$key" --new-capacity "$MIN" >/dev/null
+done
 
 cat <<MSG
 

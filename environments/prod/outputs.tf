@@ -32,8 +32,9 @@ output "nfs_mount" {
   value = module.platform.nfs_mount
 }
 
-output "ctm_server_name" {
-  value = module.platform.ctm_server_name
+output "servers" {
+  description = "Control-M/Servers hosted on this platform (dev/qa or uat/prod)."
+  value       = module.platform.servers
 }
 
 output "dr" {

@@ -4,9 +4,10 @@
 
 | Need | Change | Effect |
 |------|--------|--------|
-| More job throughput | `agents.max` / `agents.min` / `agents.scale_out_cpu` | autoscale bounds; no downtime |
-| Different agent size | `agents.vm_size` | scale set model updates; roll instances (`az vmss update-instances`) |
-| Bigger EM / Server | `em.vm_size` / `server.vm_size` | VM resize = reboot, do secondary first then fail over |
+| More job throughput for a stage | `servers.<stage>.agents.max` / `.min` / `.scale_out_cpu` | autoscale bounds; no downtime |
+| Different agent size | `servers.<stage>.agents.vm_size` | scale set model updates; roll instances (`az vmss update-instances`) |
+| Bigger EM / Server | `em.vm_size` / `servers.<stage>.vm_size` | VM resize = reboot, do secondary first then fail over |
+| New stage on a platform | add a `servers.<stage>` entry | new Server VM pair, database, secret, agent pool; register in EM afterwards |
 | Database compute | `database.sku_name` | scale with brief failover to standby (zone-redundant HA) |
 | Database storage | `database.storage_mb` | online grow (auto-grow is on) |
 | Shared share | `storage.shared_share_quota_gb` | online |
@@ -35,7 +36,7 @@ The SSH private key is the `ssh-private-key` secret; rotate by tainting
 
 ## Backups and restore
 
-* **Database**: automated backups (7-35 days per env) + geo-redundant copies in
+* **Database**: automated backups (7-35 days per platform) + geo-redundant copies in
   uat/prod. Point-in-time restore creates a new server; update the `ctm-db`
   CNAME (`modules/dns`) or swap the server name and apply.
 * **VM**: nightly Recovery Services vault backups of EM/Server. Restore disk or
@@ -58,7 +59,7 @@ The SSH private key is the `ssh-private-key` secret; rotate by tainting
 ## Rebuilding a node
 
 The persistent data disk holds the installation. To replace a VM but keep the
-install, `terraform taint module.platform.module.em_node[\"ctm-em-b\"].azurerm_linux_virtual_machine.this`
+install, `terraform taint 'module.platform.module.server_node["ctm-srv-qa-b"].azurerm_linux_virtual_machine.this'`
 and apply: the new VM attaches the same disk, bootstrap detects
 `/ctm/<user>/.ctm_installed` and only recreates the systemd units.
 

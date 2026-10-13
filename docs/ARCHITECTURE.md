@@ -7,16 +7,16 @@ flowchart TB
   end
 
   subgraph primary["Primary region (existing VNet)"]
-    LB["Standard Load Balancer<br/>ctm-web.&lt;env&gt;.ctm.internal :8443"]
+    LB["Standard Load Balancer<br/>ctm-web.&lt;platform&gt;.ctm.internal :8443"]
     subgraph app[app subnet]
       EMA["EM primary<br/>ctm-em-a (zone 1)"]
       EMB["EM secondary<br/>ctm-em-b (zone 2)"]
-      SRVA["Control-M/Server primary<br/>ctm-srv-a (zone 1)"]
-      SRVB["Control-M/Server secondary<br/>ctm-srv-b (zone 2)"]
-      VMSS["Agent VM Scale Set<br/>zones 1-3, autoscale, host group"]
+      SRVA["Control-M/Server &lt;stage&gt; primary<br/>ctm-srv-&lt;stage&gt;-a (zone 1)"]
+      SRVB["Control-M/Server &lt;stage&gt; secondary<br/>ctm-srv-&lt;stage&gt;-b (zone 2)"]
+      VMSS["Agent VM Scale Set per Server<br/>zones 1-3, autoscale, host group &lt;stage&gt;-agents"]
     end
     subgraph data[data subnet]
-      PG["PostgreSQL Flexible Server<br/>zone-redundant HA<br/>ctm-db.&lt;env&gt;.ctm.internal"]
+      PG["PostgreSQL Flexible Server<br/>zone-redundant HA, one DB per EM/Server<br/>ctm-db.&lt;platform&gt;.ctm.internal"]
     end
     subgraph pe[private endpoints]
       KV[(Key Vault)]
@@ -30,8 +30,8 @@ flowchart TB
   subgraph dr["DR region (existing VNet)"]
     LBD[Standard Load Balancer]
     PGR["PostgreSQL read replica<br/>(promote on failover)"]
-    ASR["Site Recovery replicas<br/>ctm-em-a/b, ctm-srv-a/b"]
-    VMSSD[Warm agent scale set]
+    ASR["Site Recovery replicas<br/>ctm-em-a/b, ctm-srv-&lt;stage&gt;-a/b"]
+    VMSSD[Warm agent scale set per Server]
     KVD[(Key Vault replica secrets)]
     BLOBD[(Blob - object replication)]
   end
@@ -57,6 +57,18 @@ flowchart TB
 
 ## Design decisions
 
+**Why two platforms instead of four.** Control-M's own hierarchy already
+separates stages: one Enterprise Manager manages many Control-M/Servers, and
+each Server has its own agents, host groups, folders and authorizations. The
+prod platform hosts `CTM_UAT` next to `CTM_PROD` so acceptance testing runs on
+the exact infrastructure, EM version, database host and DR path that
+production uses. The nonprod platform hosts `CTM_DEV` and `CTM_QA` and is where
+EM/Server upgrades and patches are rehearsed first. Stage boundaries are
+Server boundaries (separate VMs, databases, credentials, agent pools), so a
+runaway dev scheduler cannot touch qa, and uat cannot touch prod, while the
+control plane is shared. Adding a stage or splitting one out to its own
+platform is a tfvars change.
+
 **Why VMs and not Kubernetes for EM/Server.** BMC supports the EM and Server
 components on Linux hosts with a shared external PostgreSQL. Their HA model is
 an active/standby pair bound to stable hostnames and a shared database, which
@@ -69,7 +81,7 @@ the database or VMs, which arrive through replication. Reusing `modules/platform
 with `role = "dr"` keeps the two regions drift-free.
 
 **Why aliases instead of real hostnames in Control-M config.** Nodes connect
-to `ctm-db.<env>.ctm.internal` and `ctm-web.<env>.ctm.internal`. The same zone
+to `ctm-db.<platform>.ctm.internal` and `ctm-web.<platform>.ctm.internal`. The same zone
 name exists in both regions, linked to each region's VNet. After failover the
 CNAME in the DR zone points at the promoted replica and Site Recovery brings
 the VMs up with their original hostnames, so Control-M starts unchanged.
@@ -87,7 +99,7 @@ Premium ZRS Files over NFS 4.1 through a private endpoint provides that.
 gives an identical host in the DR region in minutes, versus re-installing and
 re-registering a secondary EM/Server across regions.
 
-**Scaling.** Agents scale horizontally on CPU with min/max per environment and
+**Scaling.** Each Server's agent pool scales horizontally on CPU with its own min/max and
 deregister gracefully on scale-in via Azure Scheduled Events. EM, Server and
 database scale vertically by changing one tfvars value; the data disks and
 database storage auto-grow.

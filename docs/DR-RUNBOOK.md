@@ -1,6 +1,6 @@
 # Disaster recovery runbook
 
-Applies to environments with `dr.enabled = true` (uat, prod).
+Applies to platforms with `dr.enabled = true` (the prod platform, which hosts `CTM_UAT` and `CTM_PROD`).
 
 | Objective | Target | Mechanism |
 |-----------|--------|-----------|
@@ -11,7 +11,7 @@ Applies to environments with `dr.enabled = true` (uat, prod).
 ## Standing posture
 
 * **Primary**: full platform. **DR**: foundation + replica + ASR replicas +
-  warm agents (`dr.warm_agents`, 0 in uat, 1 in prod).
+  warm agents per Server (`dr.warm_agents`).
 * Secrets, DNS aliases (`ctm-db`, `ctm-web`), hostnames and the NFS layout are
   identical in both regions.
 * Installer media and EM/Server backup exports are object-replicated to the DR
@@ -24,7 +24,7 @@ Applies to environments with `dr.enabled = true` (uat, prod).
 ./scripts/dr-failover.sh prod --test
 ```
 
-Site Recovery brings test copies of the four VMs up in the DR VNet (in an
+Site Recovery brings test copies of the EM and Server VMs up in the DR VNet (in an
 isolated test network if you configure one in the vault). Validate boot,
 `/ctm` mounts and that the services start; then **clean up the test failover**
 in the Azure portal. The database replica is not touched.
@@ -38,15 +38,16 @@ in the Azure portal. The database replica is not touched.
    ./scripts/dr-failover.sh prod
    ```
    It promotes the replica (`forced`, standalone), starts an unplanned ASR
-   failover for `ctm-em-a/b` and `ctm-srv-a/b`, sets the DR `ctm-db` CNAME to
-   the promoted server and scales the DR agent scale set to the production
-   minimum.
+   failover for `ctm-em-a/b`, `ctm-srv-uat-a/b` and `ctm-srv-prod-a/b`, sets
+   the DR `ctm-db` CNAME to the promoted server and scales each Server's DR
+   agent scale set to its configured minimum.
 3. When the ASR jobs finish, log in to `ctm-em-a` (DR) and check
-   `systemctl status controlm-em` and on `ctm-srv-a` `controlm-server`. The
+   `systemctl status controlm-em`, and `controlm-server` on `ctm-srv-prod-a`
+   and `ctm-srv-uat-a`. The
    services start automatically; the `ctm-db` alias resolves to the promoted
    database so no Control-M reconfiguration is needed.
-4. In Control-M Configuration Manager verify the Server is connected and the
-   DR agents registered into the host group. Agents that were running in the
+4. In Control-M Configuration Manager verify both Servers are connected and
+   the DR agents registered into their host groups (prod first). Agents that were running in the
    primary region are gone; re-run or resubmit jobs per business policy.
 5. Switch users: Traffic Manager does this automatically for public endpoints;
    for internal access update the corporate DNS record for Control-M Web to the
