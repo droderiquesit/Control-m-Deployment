@@ -1,7 +1,9 @@
 // Resource-group-scope entry point: Control-M EM/Server VMs (nodePlan), one
 // agent VMSS per Control-M/Server (agentPools), Recovery Services backup and a
-// per-VM availability alert. The node plan and rendered cloud-init come from
-// the orchestrator: python -m ctmdeploy deploy --env <env> --phase compute
+// per-VM availability alert. Placement is per item: every node/pool carries its
+// own subnetId (EM => utility VNet, each Server + its agents => that server's
+// own VNet), computed by the orchestrator together with the rendered cloud-init
+// and the isNew flags: python -m ctmdeploy deploy --env <env> --phase compute
 targetScope = 'resourceGroup'
 
 @description('Platform name, e.g. ctm-prod or ctm-prod-dr.')
@@ -9,9 +11,6 @@ param name string
 
 @description('Region of this resource group.')
 param location string
-
-@description('Subnet the VM / VMSS NICs land in (foundation output).')
-param appSubnetId string
 
 @description('Compute Gallery image id (.../galleries/<g>/images/<def>/versions/<v>), resolved by the orchestrator from config.yaml image settings.')
 param imageId string
@@ -36,10 +35,10 @@ param actionGroupId string
 // rendered cloud-init carries no secrets, only resource names, ids and
 // endpoints. Every credential is fetched from Key Vault at boot through the
 // node's managed identity, the same posture as before this migration.
-@description('VMs to create. Items: {name, component(em|server), role(primary|secondary), zone, vmSize, dataDiskGb, diskType, customData, joinLb(bool), tags(object)}.')
+@description('VMs to create. Items: {name, component(em|server), role(primary|secondary), zone, subnetId, vmSize, dataDiskGb, diskType, customData, isNew(bool), joinLb(bool), tags(object)}. subnetId places each node (EM => utility em subnet, server => its own VNet); isNew=false on re-deploys omits the immutable customData.')
 param nodePlan array
 
-@description('Agent scale sets. Items: {stage, name, vmSize, zones, min, max, default, scaleOutCpu, scaleInCpu, useSpot, customData}.')
+@description('Agent scale sets. Items: {stage, name, subnetId, vmSize, zones, min, max, default, scaleOutCpu, scaleInCpu, useSpot, customData, isNew(bool)}. subnetId places the pool in its server\'s VNet; isNew=false omits sku.capacity so autoscale keeps owning the count.')
 param agentPools array
 
 @description('config.yaml backup shape (enabled, storage_mode_type, cross_region_restore, daily_retention_days, weekly_retention_weeks, include_files_share).')
@@ -64,11 +63,12 @@ module nodeVms 'modules/node.bicep' = [for n in nodePlan: {
     name: n.name
     location: location
     zone: n.zone
-    subnetId: appSubnetId
+    subnetId: n.subnetId
     vmSize: n.vmSize
     imageId: imageId
     sshPublicKey: sshPublicKey
     customData: n.customData
+    isNew: n.isNew
     dataDiskGb: n.dataDiskGb
     diskType: n.diskType
     identityId: identityId
@@ -85,11 +85,12 @@ module pools 'modules/agent-pool.bicep' = [for p in agentPools: {
   params: {
     name: p.name
     location: location
-    subnetId: appSubnetId
+    subnetId: p.subnetId
     vmSize: p.vmSize
     imageId: imageId
     sshPublicKey: sshPublicKey
     customData: p.customData
+    isNew: p.isNew
     zones: p.zones
     minInstances: p.min
     maxInstances: p.max

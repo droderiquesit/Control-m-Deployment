@@ -14,10 +14,17 @@ PostgreSQL host, its own credentials and its own agent scale set / host group.
 Job definitions move dev → qa → uat → prod with the Automation API
 (`ctm deploy`), not by re-deploying infrastructure.
 
-The platform is deployed **into networks you already own**: every environment
-points at an existing VNet and subnets. The toolchain creates the Control-M
-tiers, database, storage, secrets, monitoring, backup and DR plumbing —
-nothing in the network team's domain.
+The platform is deployed **into networks you already own**, and the placement
+of every tier is config-driven: the EM and all shared services (LB, database,
+private endpoints) live in a per-platform **utility VNet**, while every
+Control-M/Server runs in its **own VNet** with its agent scale set beside it
+(hub-and-spoke per platform; server VNets peer only with the utility VNet,
+never with each other, so stages are isolated at the network layer). The DR
+region mirrors this with a DR utility VNet plus one DR VNet per DR-protected
+Server. The toolchain creates the Control-M tiers, database, storage, secrets,
+monitoring, backup and DR plumbing — nothing in the network team's domain
+(VNets, subnets, peering and NSGs pre-exist; see
+`docs/NETWORK-REQUIREMENTS.md`).
 
 ## Toolchain
 
@@ -66,9 +73,10 @@ Makefile                    make whatif/deploy/image/failover/fmt/lint/test
 
 | Tier | Resource | HA | Scale |
 |------|----------|----|-------|
-| Control-M/Enterprise Manager | 2 zonal VMs (`ctm-em-a` zone 1, `ctm-em-b` zone 2), persistent data disk, shared DB | EM primary/secondary; LB health probe follows the active node | vertical (VM size) |
-| Control-M/Server (one per stage) | 2 zonal VMs per Server (`ctm-srv-<stage>-a/b`), persistent data disk, own database | Server primary/secondary via Configuration Agent failover | vertical; add a stage by adding a map entry |
-| Control-M/Agents (one pool per Server) | VM Scale Set across 3 zones, registered to the Server's host group | zone balanced, self-healing | autoscale on CPU, min/max per stage, Spot optional |
+| Network placement | utility VNet (`network.utility`): EM, LB, PostgreSQL, private endpoints; one VNet per Server (`servers.<stage>.network`): Server VMs + agent VMSS | server VNets peer to the utility VNet only — never to each other (stage isolation) | config-driven per component; agents relocatable via `agents_vnet_name` |
+| Control-M/Enterprise Manager | 2 zonal VMs (`ctm-em-a` zone 1, `ctm-em-b` zone 2) in the utility VNet's em subnet, persistent data disk, shared DB | EM primary/secondary; LB health probe follows the active node | vertical (VM size) |
+| Control-M/Server (one per stage) | 2 zonal VMs per Server (`ctm-srv-<stage>-a/b`) in the stage's own VNet, persistent data disk, own database | Server primary/secondary via Configuration Agent failover | vertical; add a stage by adding a map entry |
+| Control-M/Agents (one pool per Server) | VM Scale Set across 3 zones in the stage's VNet, registered to the Server's host group | zone balanced, self-healing | autoscale on CPU, min/max per stage, Spot optional |
 | Database | Azure Database for PostgreSQL Flexible Server | **ZoneRedundant** standby, automatic failover | SKU/storage per env, auto-grow |
 | Shared filesystem | Azure Files Premium, **NFS 4.1**, ZRS | zone redundant | quota per env |
 | Media/backups | Blob storage, RA-GZRS | geo redundant | — |
@@ -76,7 +84,7 @@ Makefile                    make whatif/deploy/image/failover/fmt/lint/test
 | Secrets | Key Vault (RBAC, private endpoint), VM managed identity | — | — |
 | Monitoring | Log Analytics + Azure Monitor Agent, metric alerts, Service Health | — | — |
 | Backup | Recovery Services vault (GRS + cross-region restore in prod), daily VM + file share | — | — |
-| DR (prod platform) | second region: PostgreSQL cross-region replica, **Site Recovery** replication of EM/Server VMs, replicated installers, warm agent scale set, optional Traffic Manager | — | — |
+| DR (prod platform) | second region: PostgreSQL cross-region replica, **Site Recovery** replication of the EM VMs + the VMs of Servers opted in via `dr.server_networks` (shipped config: CTM_PROD only), replicated installers, warm agent scale set per DR-protected Server, optional Traffic Manager | — | — |
 | Golden image | **ctm-rhel9** in Compute Gallery `ctmgallery` (`ctm-images-rg`), versions replicated to both regions | — | rebuild with Packer, bump `image.image_version` |
 
 Node identity is stable: hostnames, persistent `/ctm` data disks and the
@@ -95,7 +103,7 @@ built, stored and consumed) and `docs/DR-RUNBOOK.md` for failover.
 | PostgreSQL (one host, one DB per Server + EM) | D2ds_v5, zone-redundant, 7d | D8ds_v5, zone-redundant, geo-backup, 35d |
 | Agents (min/max) | dev 1/2 Spot, qa 1/4 Spot | uat 2/6, prod 3/20 |
 | Backup vault | ZRS, 14d | GRS + cross-region restore, 35d / 52w |
-| DR region | — | replica + Site Recovery + 1 warm agent per Server |
+| DR region | — | replica + Site Recovery (EM + `CTM_PROD`; `CTM_UAT` opted out) + 1 warm agent for prod |
 | Locks / purge protection | — | yes |
 | EM/Server VMs | 4 | 6 |
 
@@ -105,10 +113,15 @@ environment with one Server).
 
 ## Prerequisites
 
-1. **Network** that already exists in each region (see `docs/NETWORK-REQUIREMENTS.md`):
-   an app subnet, a subnet delegated to `Microsoft.DBforPostgreSQL/flexibleServers`,
-   and (optionally) a private-endpoint subnet. Hub-managed private DNS zones can be
-   passed in; missing ones are created in the platform resource group.
+1. **Networks** that already exist in each region (see `docs/NETWORK-REQUIREMENTS.md`):
+   a utility VNet (`network.utility`) with an em subnet, a subnet delegated to
+   `Microsoft.DBforPostgreSQL/flexibleServers` and a private-endpoint subnet,
+   plus **one VNet per Control-M/Server** (`servers.<stage>.network`) with a
+   server subnet and (optionally separate) agents subnet, each peered to the
+   utility VNet — and the DR equivalents (`dr.network.utility`,
+   `dr.server_networks`) where DR is enabled. Hub-managed private DNS zones can
+   be passed in; missing ones are created in the platform resource group and
+   linked to every platform VNet.
 2. **BMC media** (EPD download) for Control-M/EM and Control-M/Server, plus the four
    silent-install XML files described in `scripts/silent-install/README.md`.
 3. **Azure identity** running the deployment with `Contributor` + `User Access
@@ -165,6 +178,32 @@ environment approvals. Platform passwords come from Delinea DevOps Secrets
 Vault and override the generated ones. An equivalent GitHub Actions workflow
 lives in `.github/workflows/deploy.yml`. A manual pipeline run with
 `runImageBuild=true` publishes a new golden-image version with Packer.
+
+## Idempotency
+
+`ctmdeploy deploy --env <env> --phase all` is **safe to re-run** at any time:
+every deployment is a stateless ARM operation in Incremental mode, and the
+orchestrator guards the few properties ARM cannot converge on its own:
+
+* **VM `customData`** is immutable after create — it is sent only for VMs that
+  do not exist yet, so re-deploys never try to change it. (VMSS `customData`
+  *is* updatable and is always sent; it applies to new instances.)
+* **VMSS capacity** is set only when the scale set is first created; afterwards
+  autoscale owns the instance count and re-deploys omit it.
+* **Role assignments** use deterministic GUID names, so re-deploys converge
+  instead of colliding.
+* **DR replica**: a promoted (no longer replica) server is detected and not
+  re-created; **object replication** policy ids are read back and re-used;
+  the **PostgreSQL HA zone layout** is read from the live server, so a zone
+  swap after an HA failover is not fought.
+* **Secrets** are seeded only when absent (or explicitly overridden) — never
+  rotated silently.
+
+The one thing re-running does **not** do is remove drift: Incremental
+deployments never delete resources, so anything renamed in config or created
+out-of-band must be removed manually (`az resource delete` / portal) — or via
+a future opt-in to Azure Deployment Stacks. `ctmdeploy whatif` shows exactly
+what a run would change.
 
 ## What you still own after deploy
 

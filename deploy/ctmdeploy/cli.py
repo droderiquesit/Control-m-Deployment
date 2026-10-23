@@ -300,7 +300,12 @@ def cmd_render(args: argparse.Namespace) -> int:
     if args.role == "agent":
         if not args.stage or args.stage not in cfg.servers:
             raise ConfigError(f"--stage must be one of {sorted(cfg.servers)} for --role agent")
-        pool = next(p for p in agent_pools(cfg, region_role) if p.stage == args.stage)
+        pool = next((p for p in agent_pools(cfg, region_role) if p.stage == args.stage), None)
+        if pool is None:  # --dr with a server that is not in the DR opt-in set
+            raise ConfigError(
+                f"server {args.stage!r} has no agent pool in the {region_role} region "
+                "(dr.server_networks is the DR opt-in set)"
+            )
         print(agent_custom_data(cfg, view, pool, template_dir))
         return 0
 

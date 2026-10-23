@@ -1,29 +1,18 @@
-// Bring-your-own network: everything here is a lookup of pre-existing networking
-// (see docs/NETWORK-REQUIREMENTS.md for what the subnets must provide). The only
-// resources created are the privatelink DNS zones the platform needs and that were
-// not supplied (hub-managed zones are preferred), each linked to the existing VNet.
+// Bring-your-own network, v2 placement: resolves the platform UTILITY VNet
+// (EM subnet + delegated data subnet + private-endpoint subnet) and creates
+// only the privatelink DNS zones that were not supplied (hub-managed zones are
+// preferred). Every zone created here is linked to EVERY VNet of the platform
+// region (utility + each isolated server/agent VNet) so all nodes resolve it.
 
-@description('Name prefix for the VNet links of any private DNS zones created here.')
-param namePrefix string
+@description('Utility VNet reference, config.yaml shape: vnet_name, vnet_resource_group_name, em_subnet_name, data_subnet_name, pe_subnet_name.')
+param utility object
 
-@description('Name of the EXISTING virtual network to deploy into.')
-param vnetName string
-
-@description('Resource group of the existing virtual network.')
-param vnetResourceGroupName string
-
-@description('Existing subnet for EM/Server VMs, the agent scale set and the load balancer frontend.')
-param appSubnetName string
-
-@description('Existing subnet delegated to Microsoft.DBforPostgreSQL/flexibleServers.')
-param dataSubnetName string
-
-@description('Existing subnet for private endpoints (Key Vault, Blob, Files). Defaults to the app subnet.')
-param peSubnetName string = ''
+@description('Deduped list of EVERY VNet in this platform region (utility + each server VNet + agent overrides + extra_dns_vnets), computed by the orchestrator. Items: {name, resourceGroupName}. Each private DNS zone created here gets one link per entry.')
+param allVnets array
 
 // Keys: blob (privatelink.blob...), file (privatelink.file...), vault
 // (privatelink.vaultcore...), postgres (<x>.postgres.database.azure.com).
-@description('Ids of private DNS zones that already exist (typically in a hub) and are linked to the VNet. Keys: blob, file, vault, postgres. Any key left out (or empty) is created in the platform resource group and linked to the VNet.')
+@description('Ids of private DNS zones that already exist (typically in a hub) and are linked to the VNets. Keys: blob, file, vault, postgres. Any key left out (or empty) is created in the platform resource group and linked to every VNet in allVnets.')
 param existingPrivateDnsZoneIds object = {}
 
 @description('Prefix for a postgres private DNS zone created here (<prefix>.postgres.database.azure.com).')
@@ -33,23 +22,25 @@ param postgresDnsZonePrefix string
 param tags object = {}
 
 // ---------------------------------------------------------------------------
-// Existing network lookups (cross-RG via scope).
+// Existing utility network lookups (cross-RG via scope).
 // ---------------------------------------------------------------------------
-resource vnet 'Microsoft.Network/virtualNetworks@2023-11-01' existing = {
-  name: vnetName
-  scope: resourceGroup(vnetResourceGroupName)
+resource utilityVnet 'Microsoft.Network/virtualNetworks@2023-11-01' existing = {
+  name: utility.vnet_name
+  scope: resourceGroup(utility.vnet_resource_group_name)
 }
 
-var effectivePeSubnetName = empty(peSubnetName) ? appSubnetName : peSubnetName
+var peSubnetNameRaw = utility.?pe_subnet_name ?? ''
+var effectivePeSubnetName = empty(peSubnetNameRaw) ? utility.em_subnet_name : peSubnetNameRaw
 
 // Subnet ids are composed with resourceId() against the VNet's resource group:
 // 'existing' child resources cannot be addressed individually across RGs in outputs.
-var appSubnetId = resourceId(subscription().subscriptionId, vnetResourceGroupName, 'Microsoft.Network/virtualNetworks/subnets', vnetName, appSubnetName)
-var dataSubnetId = resourceId(subscription().subscriptionId, vnetResourceGroupName, 'Microsoft.Network/virtualNetworks/subnets', vnetName, dataSubnetName)
-var peSubnetId = resourceId(subscription().subscriptionId, vnetResourceGroupName, 'Microsoft.Network/virtualNetworks/subnets', vnetName, effectivePeSubnetName)
+var emSubnetId = resourceId(subscription().subscriptionId, utility.vnet_resource_group_name, 'Microsoft.Network/virtualNetworks/subnets', utility.vnet_name, utility.em_subnet_name)
+var dataSubnetId = resourceId(subscription().subscriptionId, utility.vnet_resource_group_name, 'Microsoft.Network/virtualNetworks/subnets', utility.vnet_name, utility.data_subnet_name)
+var peSubnetId = resourceId(subscription().subscriptionId, utility.vnet_resource_group_name, 'Microsoft.Network/virtualNetworks/subnets', utility.vnet_name, effectivePeSubnetName)
 
 // ---------------------------------------------------------------------------
-// Private DNS zones: create only the ones not supplied, then link to the VNet.
+// Private DNS zones: create only the ones not supplied, then link each created
+// zone to every VNet of the platform (link name = vnet name, registration off).
 // ---------------------------------------------------------------------------
 var existingBlobZoneId = existingPrivateDnsZoneIds.?blob ?? ''
 var existingFileZoneId = existingPrivateDnsZoneIds.?file ?? ''
@@ -91,16 +82,23 @@ resource privateDnsZones 'Microsoft.Network/privateDnsZones@2020-06-01' = [
   }
 ]
 
+// Cross product zone x vnet, flattened because Bicep resource loops cannot nest.
+var zoneLinkPlan = flatten(map(range(0, length(zoneCatalog)), zoneIndex => map(allVnets, vnet => {
+  zoneIndex: zoneIndex
+  vnetName: vnet.name
+  vnetResourceGroupName: vnet.resourceGroupName
+})))
+
 resource privateDnsZoneLinks 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2020-06-01' = [
-  for (entry, i) in zoneCatalog: if (empty(entry.existingId)) {
-    parent: privateDnsZones[i]
-    name: '${namePrefix}-${entry.key}'
+  for pair in zoneLinkPlan: if (empty(zoneCatalog[pair.zoneIndex].existingId)) {
+    parent: privateDnsZones[pair.zoneIndex]
+    name: pair.vnetName
     location: 'global'
     tags: tags
     properties: {
       registrationEnabled: false
       virtualNetwork: {
-        id: vnet.id
+        id: resourceId(subscription().subscriptionId, pair.vnetResourceGroupName, 'Microsoft.Network/virtualNetworks', pair.vnetName)
       }
     }
   }
@@ -114,8 +112,8 @@ var privatelinkZoneIdMap = {
   postgres: empty(existingPostgresZoneId) ? resourceId('Microsoft.Network/privateDnsZones', zoneCatalog[3].zoneName) : existingPostgresZoneId
 }
 
-output vnetId string = vnet.id
-output appSubnetId string = appSubnetId
+output utilityVnetId string = utilityVnet.id
+output emSubnetId string = emSubnetId
 output dataSubnetId string = dataSubnetId
 output peSubnetId string = peSubnetId
 
@@ -123,3 +121,8 @@ output peSubnetId string = peSubnetId
 output privatelinkZoneIds object = privatelinkZoneIdMap
 
 output postgresPrivateDnsZoneId string = privatelinkZoneIdMap.postgres
+
+@description('Ids of the VNet links created on the postgres private DNS zone, one per allVnets entry ([] when the zone was supplied).')
+output postgresDnsLinkIds array = empty(existingPostgresZoneId)
+  ? map(allVnets, vnet => resourceId('Microsoft.Network/privateDnsZones/virtualNetworkLinks', zoneCatalog[3].zoneName, vnet.name))
+  : []

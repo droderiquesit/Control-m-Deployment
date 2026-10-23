@@ -20,6 +20,9 @@ dependencies = [
     "azure-mgmt-postgresqlflexibleservers>=1.0",
     "azure-mgmt-privatedns>=1.1",
     "azure-mgmt-compute>=33.0",
+    # Reads existing object-replication policy/rule ids so DR re-deploys
+    # converge instead of creating duplicate policies (idempotency).
+    "azure-mgmt-storage>=21.2",
     "PyYAML>=6.0",
     "cryptography>=42.0",
 ]

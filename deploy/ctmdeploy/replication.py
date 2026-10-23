@@ -1,24 +1,36 @@
 # ---------------------------------------------------------------------------
 # Azure Site Recovery enablement (A2A) via the SiteRecovery SDK: fabrics,
-# protection containers, replication policy, container/network mappings and
-# one replication-protected item per EM/Server VM. Idempotent — existing
-# objects are skipped. Azure SDK imports are guarded inside the functions.
+# protection containers, replication policy, container mappings, one network
+# mapping PER VNET PAIR (utility -> DR utility + each server VNet -> its DR
+# VNet) and one replication-protected item per EM/Server VM, each targeting
+# its component's DR subnet. Idempotent — existing objects are skipped.
+# Azure SDK imports are guarded inside the functions.
 # ---------------------------------------------------------------------------
 """Enable cross-region VM replication for the Control-M platform.
 
 Ported from the old ``modules/dr`` Site Recovery resources: fabrics
 ``ctm-<env>-fabric-primary/-dr``, containers ``ctm-<env>-container-primary/
 -dr``, A2A policy ``ctm-<env>-asr-policy`` (24h recovery points, 60m
-app-consistent snapshots), a container and a network mapping, and per-node
-protected items replicating the OS + data disk through the cache storage
-account to Premium_LRS targets; EM nodes also join the DR LB backend pool.
+app-consistent snapshots), a container mapping, and per-node protected items
+replicating the OS + data disk through the cache storage account to
+Premium_LRS targets; EM nodes also join the DR LB backend pool.
+
+v2 network placement: ASR network mappings are created PER VNET PAIR —
+the utility VNet maps to the DR utility VNet and every DR-PARTICIPATING
+Control-M/Server's own VNet maps to its ``dr.server_networks.<stage>``
+VNet. ``dr.server_networks`` is the DR OPT-IN set: servers absent from it
+(PoC: uat) get NO network mapping and NO protected items — only EM nodes
+and participating servers' nodes are replicated. Each replicated VM
+targets its component's DR subnet: EM -> DR utility ``em_subnet``,
+Server -> its DR server VNet's ``server_subnet``. All ids are built from
+config names; no network lookups are needed.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
-from ctmdeploy.config import EnvironmentConfig
+from ctmdeploy.config import EnvironmentConfig, ServerNetworkConfig
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime Azure import
     from azure.core.credentials import TokenCredential
@@ -66,21 +78,123 @@ def _exists(getter, *args) -> Any | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# v2 placement helpers (pure: ids are built from config names)
+# ---------------------------------------------------------------------------
+
+
+def server_key_for_node(cfg: EnvironmentConfig, name: str) -> str:
+    """The servers.<key> a node hostname belongs to (ctm-srv-<key>-a/b)."""
+    for key, server in cfg.servers.items():
+        if name in (server.primary_host, server.secondary_host):
+            return key
+    raise ReplicationError(
+        f"node {name!r} does not match any configured Control-M/Server host"
+    )
+
+
+def _dr_server_network(cfg: EnvironmentConfig, key: str) -> ServerNetworkConfig:
+    try:
+        return cfg.dr.server_networks[key]
+    except KeyError:  # callers only pass DR-participating servers
+        raise ReplicationError(
+            f"dr.server_networks.{key} is not configured (server {key!r} is "
+            "not DR-protected; dr.server_networks is the DR opt-in set)"
+        ) from None
+
+
+def dr_protected_nodes(
+    cfg: EnvironmentConfig, nodes: Iterable[Mapping[str, Any]]
+) -> list[Mapping[str, Any]]:
+    """The compute nodes ASR protects: the EM pair plus the nodes of
+    DR-PARTICIPATING servers (``dr.server_networks``, the opt-in set).
+    Nodes of non-participating servers (PoC: uat) are skipped entirely."""
+    protected: list[Mapping[str, Any]] = []
+    for node in nodes:
+        if node.get("component") == "em":
+            protected.append(node)
+            continue
+        key = server_key_for_node(cfg, _require(node, "name"))
+        if key in cfg.dr.server_networks:
+            protected.append(node)
+    return protected
+
+
+def vnet_pairs(cfg: EnvironmentConfig) -> list[tuple[str, str, str]]:
+    """Deduped ``(pair key, primary vnet id, dr vnet id)`` network-mapping
+    pairs: utility -> DR utility, then each DR-PARTICIPATING server VNet ->
+    its DR VNet (non-participating servers get no mapping)."""
+    if cfg.dr.network is None:
+        raise ReplicationError("dr.network must be configured to enable replication")
+    primary_utility = cfg.network.utility
+    dr_utility = cfg.dr.network.utility
+    pairs: list[tuple[str, str, str]] = [
+        (
+            "utility",
+            cfg.vnet_id(primary_utility.vnet_resource_group_name, primary_utility.vnet_name),
+            cfg.vnet_id(dr_utility.vnet_resource_group_name, dr_utility.vnet_name),
+        )
+    ]
+    for key in cfg.dr_servers():
+        source = cfg.servers[key].network
+        target = _dr_server_network(cfg, key)
+        pairs.append(
+            (
+                key,
+                cfg.vnet_id(source.vnet_resource_group_name, source.vnet_name),
+                cfg.vnet_id(target.vnet_resource_group_name, target.vnet_name),
+            )
+        )
+    seen: set[tuple[str, str]] = set()
+    deduped: list[tuple[str, str, str]] = []
+    for pair_key, primary_id, dr_id in pairs:
+        ident = (primary_id.lower(), dr_id.lower())
+        if ident not in seen:
+            seen.add(ident)
+            deduped.append((pair_key, primary_id, dr_id))
+    return deduped
+
+
+def recovery_target(cfg: EnvironmentConfig, node: Mapping[str, Any]) -> tuple[str, str]:
+    """``(recovery vnet id, recovery subnet name)`` for one replicated node:
+    EM -> DR utility em subnet, Server -> its DR VNet's server subnet."""
+    if cfg.dr.network is None:
+        raise ReplicationError("dr.network must be configured to enable replication")
+    if node.get("component") == "em":
+        utility = cfg.dr.network.utility
+        return (
+            cfg.vnet_id(utility.vnet_resource_group_name, utility.vnet_name),
+            utility.em_subnet_name,
+        )
+    key = server_key_for_node(cfg, _require(node, "name"))
+    target = _dr_server_network(cfg, key)
+    return (
+        cfg.vnet_id(target.vnet_resource_group_name, target.vnet_name),
+        target.server_subnet_name,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Enablement
+# ---------------------------------------------------------------------------
+
+
 def ensure(
     cfg: EnvironmentConfig,
     nodes: Iterable[Mapping[str, Any]],
     *,
-    primary_vnet_id: str,
-    dr_vnet_id: str,
     cache_storage_account_id: str,
     dr_lb_backend_pool_id: str = "",
     credential: "TokenCredential | None" = None,
     wait: bool = False,
 ) -> None:
-    """Idempotently enable A2A replication for every EM/Server node.
+    """Idempotently enable A2A replication for the EM pair and every
+    DR-PARTICIPATING server's nodes (``dr.server_networks`` opt-in set).
 
     ``nodes`` is the ``nodes`` output of the compute deployment (items with
-    name, vmId, nicId, osDiskId, dataDiskId, zone, component). Pass
+    name, vmId, nicId, osDiskId, dataDiskId, zone, component); nodes of
+    non-participating servers are skipped. The VNet pairs and per-component
+    recovery subnets are derived from config. Pass
     ``wait=True`` to block on the long-running enable-protection jobs;
     otherwise they are started and left to complete in Azure.
     """
@@ -187,42 +301,52 @@ def ensure(
     else:
         print(f"    container mapping {mapping_name}: exists")
 
-    # -- 5. network mapping (primary vnet -> dr vnet) ---------------------------
-    network_mapping_name = f"{cfg.name}-network-mapping"
-    existing_network_mapping = _exists(
-        client.replication_network_mappings.get,
-        cfg.asr_fabric_primary,
-        AZURE_NETWORK_NAME,
-        network_mapping_name,
-    )
-    if existing_network_mapping is None:
-        print(f"    creating network mapping {network_mapping_name}")
-        client.replication_network_mappings.begin_create(
+    # -- 5. network mappings: ONE PER VNET PAIR ----------------------------------
+    # utility -> dr-utility plus each server VNet -> its DR VNet (v2 model).
+    for pair_key, primary_vnet_id, dr_vnet_id in vnet_pairs(cfg):
+        network_mapping_name = f"{cfg.name}-network-mapping-{pair_key}"
+        existing_network_mapping = _exists(
+            client.replication_network_mappings.get,
             cfg.asr_fabric_primary,
             AZURE_NETWORK_NAME,
             network_mapping_name,
-            models.CreateNetworkMappingInput(
-                properties=models.CreateNetworkMappingInputProperties(
-                    recovery_fabric_name=cfg.asr_fabric_dr,
-                    recovery_network_id=dr_vnet_id,
-                    fabric_specific_details=models.AzureToAzureCreateNetworkMappingInput(
-                        primary_network_id=primary_vnet_id
-                    ),
-                )
-            ),
-        ).result()
-    else:
-        print(f"    network mapping {network_mapping_name}: exists")
+        )
+        if existing_network_mapping is None:
+            print(f"    creating network mapping {network_mapping_name}")
+            client.replication_network_mappings.begin_create(
+                cfg.asr_fabric_primary,
+                AZURE_NETWORK_NAME,
+                network_mapping_name,
+                models.CreateNetworkMappingInput(
+                    properties=models.CreateNetworkMappingInputProperties(
+                        recovery_fabric_name=cfg.asr_fabric_dr,
+                        recovery_network_id=dr_vnet_id,
+                        fabric_specific_details=models.AzureToAzureCreateNetworkMappingInput(
+                            primary_network_id=primary_vnet_id
+                        ),
+                    )
+                ),
+            ).result()
+        else:
+            print(f"    network mapping {network_mapping_name}: exists")
 
-    # -- 6. protected items (one per EM/Server VM) ------------------------------
-    app_subnet = cfg.dr.network.app_subnet_name
+    # -- 6. protected items (EM pair + DR-participating servers' VMs only) ------
+    # Each node targets its component's DR subnet (EM -> utility em subnet,
+    # Server -> its DR server subnet). Non-participating servers (opt-in set)
+    # get no protected items at all.
+    nodes = list(nodes)
+    protected_nodes = dr_protected_nodes(cfg, nodes)
+    skipped = [str(n.get("name")) for n in nodes if n not in protected_nodes]
+    if skipped:
+        print(f"    not DR-protected (no dr.server_networks entry): {', '.join(skipped)}")
     pollers: list[tuple[str, Any]] = []
     em_nodes: list[Mapping[str, Any]] = []
-    for node in nodes:
+    for node in protected_nodes:
         name = _require(node, "name")
         item_name = f"{name}-replication"
         if node.get("component") == "em":
             em_nodes.append(node)
+        recovery_vnet_id, recovery_subnet = recovery_target(cfg, node)
         existing = _exists(
             client.replication_protected_items.get,
             cfg.asr_fabric_primary,
@@ -232,7 +356,7 @@ def ensure(
         if existing is not None:
             print(f"    protected item {item_name}: exists")
             continue
-        print(f"    enabling replication for {name}")
+        print(f"    enabling replication for {name} -> {recovery_subnet}")
         disks = [
             models.A2AVmManagedDiskInputDetails(
                 disk_id=_require(node, disk_key),
@@ -255,8 +379,8 @@ def ensure(
                         recovery_container_id=dr_container.id,
                         recovery_resource_group_id=dr_resource_group_id,
                         recovery_availability_zone=str(node.get("zone", "")) or None,
-                        recovery_azure_network_id=dr_vnet_id,
-                        recovery_subnet_name=app_subnet,
+                        recovery_azure_network_id=recovery_vnet_id,
+                        recovery_subnet_name=recovery_subnet,
                         vm_managed_disks=disks,
                     ),
                 )
@@ -284,9 +408,7 @@ def ensure(
             )
         else:
             for node in em_nodes:
-                _ensure_em_lb_pool(
-                    client, models, cfg, node, app_subnet, dr_vnet_id, dr_lb_backend_pool_id
-                )
+                _ensure_em_lb_pool(client, models, cfg, node, dr_lb_backend_pool_id)
 
 
 def _ensure_em_lb_pool(
@@ -294,17 +416,17 @@ def _ensure_em_lb_pool(
     models: Any,
     cfg: EnvironmentConfig,
     node: Mapping[str, Any],
-    app_subnet: str,
-    dr_vnet_id: str,
     pool_id: str,
 ) -> None:
     """Point the failed-over EM NIC at the DR load balancer backend pool.
 
     TF equivalent: network_interface.recovery_load_balancer_backend_address_
     pool_ids on azurerm_site_recovery_replicated_vm for component == 'em'.
+    The recovery subnet is the DR utility em subnet (where the DR LB lives).
     Best-effort: NIC details only exist once initial replication has synced.
     """
     item_name = f"{_require(node, 'name')}-replication"
+    recovery_vnet_id, recovery_subnet = recovery_target(cfg, node)
     try:
         item = client.replication_protected_items.get(
             cfg.asr_fabric_primary, cfg.asr_container_primary, item_name
@@ -320,7 +442,7 @@ def _ensure_em_lb_pool(
                 models.IPConfigInputDetails(
                     ip_config_name=getattr(ip_config, "name", None) or "primary",
                     is_primary=True,
-                    recovery_subnet_name=app_subnet,
+                    recovery_subnet_name=recovery_subnet,
                     recovery_lb_backend_address_pool_ids=[pool_id],
                 )
                 for ip_config in (getattr(nic, "ip_configs", None) or [None])[:1]
@@ -338,7 +460,7 @@ def _ensure_em_lb_pool(
             item_name,
             models.UpdateReplicationProtectedItemInput(
                 properties=models.UpdateReplicationProtectedItemInputProperties(
-                    selected_recovery_azure_network_id=dr_vnet_id,
+                    selected_recovery_azure_network_id=recovery_vnet_id,
                     vm_nics=nic_inputs,
                     provider_specific_details=models.A2AUpdateReplicationProtectedItemInput(),
                 )

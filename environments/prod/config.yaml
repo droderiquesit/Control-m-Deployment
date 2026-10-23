@@ -1,9 +1,13 @@
 # ---------------------------------------------------------------------------
 # PROD platform: Enterprise Manager HA pair managing two Control-M/Servers,
 # CTM_UAT and CTM_PROD. UAT runs on production infrastructure (same EM,
-# same database host, same DR) so what is accepted is what goes live.
+# same database host) so what is accepted is what goes live.
 # Zone-redundant everything, 35-day geo backups, Site Recovery + DB replica
 # in the paired region, resource locks and purge protection.
+# Network placement v2: the EM + shared services live in the utility VNet;
+# every Control-M/Server runs in its OWN VNet with its agents beside it, and
+# DR mirrors the layout for the DR-protected servers only (DR utility VNet +
+# one DR VNet per server opted into dr.server_networks; PoC: prod only).
 # Single source of truth: ctmdeploy reads this file and feeds Bicep its params.
 # ---------------------------------------------------------------------------
 subscription_id: "00000000-0000-0000-0000-000000000000"
@@ -17,18 +21,24 @@ tags:
   owner: platform-team
   criticality: tier-1
 
+# Existing networks (select, not create). All VNets pre-exist and must be
+# peered per docs/NETWORK-REQUIREMENTS.md (each server VNet <-> utility VNet).
 network:
-  vnet_name: vnet-prod-eastus2
-  vnet_resource_group_name: rg-network-prod
-  app_subnet_name: snet-ctm-app
-  data_subnet_name: snet-ctm-postgres
-  pe_subnet_name: snet-ctm-pe
+  utility: # EM VMs + internal LB frontend, delegated postgres subnet, private endpoints
+    vnet_name: vnet-prod-utility
+    vnet_resource_group_name: rg-network-prod
+    em_subnet_name: snet-ctm-em
+    data_subnet_name: snet-ctm-postgres
+    pe_subnet_name: snet-ctm-pe
   # Hub-managed zones (recommended in prod):
   # existing_private_dns_zone_ids:
   #   blob: "/subscriptions/.../privateDnsZones/privatelink.blob.core.windows.net"
   #   file: "/subscriptions/.../privateDnsZones/privatelink.file.core.windows.net"
   #   vault: "/subscriptions/.../privateDnsZones/privatelink.vaultcore.azure.net"
   existing_private_dns_zone_ids: {}
+  # Extra VNets to link into the platform/privatelink DNS zones (e.g. a jump VNet):
+  # extra_dns_vnets: [{vnet_name: ..., vnet_resource_group_name: ...}]
+  extra_dns_vnets: []
 
 deployer_ip_cidrs:
   - "203.0.113.10/32"
@@ -65,6 +75,14 @@ servers:
     disk_type: Premium_ZRS
     enable_secondary: true
     zones: ["1", "2"]
+    network: # REQUIRED: this server's own VNet (isolated from the other servers)
+      vnet_name: vnet-ctm-uat
+      vnet_resource_group_name: rg-network-prod
+      server_subnet_name: snet-ctm-server
+      agents_subnet_name: snet-ctm-agents # optional; default = server_subnet_name
+      # Agents may be relocated to another VNet entirely (optional overrides):
+      # agents_vnet_name: null
+      # agents_vnet_resource_group_name: null
     agents:
       vm_size: Standard_D4s_v5
       min: 2
@@ -80,6 +98,11 @@ servers:
     disk_type: Premium_ZRS
     enable_secondary: true
     zones: ["1", "2"]
+    network:
+      vnet_name: vnet-ctm-prod
+      vnet_resource_group_name: rg-network-prod
+      server_subnet_name: snet-ctm-server
+      agents_subnet_name: snet-ctm-agents
     agents:
       vm_size: Standard_D4s_v5
       min: 3
@@ -123,13 +146,28 @@ dr:
   enabled: true
   location: centralus
   network:
-    vnet_name: vnet-prod-centralus
-    vnet_resource_group_name: rg-network-prod-dr
-    app_subnet_name: snet-ctm-app
-    data_subnet_name: snet-ctm-postgres
-    pe_subnet_name: snet-ctm-pe
+    utility: # DR EM failover target, DB replica subnet, PEs, DR LB frontend
+      vnet_name: vnet-dr-utility
+      vnet_resource_group_name: rg-network-prod-dr
+      em_subnet_name: snet-ctm-em
+      data_subnet_name: snet-ctm-postgres
+      pe_subnet_name: snet-ctm-pe
     existing_private_dns_zone_ids: {}
-  warm_agents: 1 # per Server (uat + prod) in the DR region
+    extra_dns_vnets: []
+  # DR OPT-IN SET: a server is DR-protected if and only if it has an entry
+  # here (ASR failover target + warm agents, same shape as servers.*.network).
+  # CTM_UAT is intentionally absent: it is re-deployable and not
+  # business-critical — no uat DR VNet, no uat ASR items, no uat warm pool.
+  # Note: the shared PG replica still carries EVERY database on the server
+  # (ctm_uat included) because replication is server-level, so UAT *data*
+  # survives even though UAT compute is not replicated.
+  server_networks:
+    prod:
+      vnet_name: vnet-ctm-prod-dr
+      vnet_resource_group_name: rg-network-prod-dr
+      server_subnet_name: snet-ctm-server
+      agents_subnet_name: snet-ctm-agents
+  warm_agents: 1 # per DR-protected Server (prod only) in the DR region
   replica_sku_name: GP_Standard_D8ds_v5
   enable_site_recovery: true
   traffic_manager: false

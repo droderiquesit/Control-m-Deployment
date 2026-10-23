@@ -1,5 +1,17 @@
 # Architecture
 
+Every tier's network placement is **config-driven**: the Enterprise Manager
+and all shared services (load balancer, database, private endpoints) live in a
+per-platform **utility VNet** (`network.utility`), while every Control-M/Server
+runs in its **own VNet** (`servers.<stage>.network`) with its agent scale set
+beside it. Server VNets peer only with the utility VNet — never with each
+other — so each server+agent couple is fully isolated at the network layer.
+The DR region mirrors the layout: a DR utility VNet (`dr.network.utility`)
+plus one DR VNet per DR-protected Server (`dr.server_networks.<stage>`; in the
+shipped prod config only CTM_PROD participates). All VNets pre-exist
+(bring-your-own); see `docs/NETWORK-REQUIREMENTS.md` for the required subnets,
+peering and NSGs.
+
 ```mermaid
 flowchart TB
   subgraph users[Users / schedulers]
@@ -10,54 +22,70 @@ flowchart TB
     GAL["Azure Compute Gallery ctmgallery<br/>image ctm-rhel9 (Packer-built,<br/>versions replicated eastus2 + centralus)"]
   end
 
-  subgraph primary["Primary region (existing VNet)"]
-    LB["Standard Load Balancer<br/>ctm-web.&lt;platform&gt;.ctm.internal :8443"]
-    subgraph app[app subnet]
-      EMA["EM primary<br/>ctm-em-a (zone 1)"]
-      EMB["EM secondary<br/>ctm-em-b (zone 2)"]
-      SRVA["Control-M/Server &lt;stage&gt; primary<br/>ctm-srv-&lt;stage&gt;-a (zone 1)"]
-      SRVB["Control-M/Server &lt;stage&gt; secondary<br/>ctm-srv-&lt;stage&gt;-b (zone 2)"]
-      VMSS["Agent VM Scale Set per Server<br/>zones 1-3, autoscale, host group &lt;stage&gt;-agents"]
+  subgraph primary["Primary region — existing VNets, hub-and-spoke per platform"]
+    subgraph util["utility VNet (vnet-dev-utility / vnet-prod-utility)"]
+      subgraph emsub[em subnet]
+        LB["Standard Load Balancer<br/>ctm-web.&lt;platform&gt;.ctm.internal :8443"]
+        EMA["EM primary<br/>ctm-em-a (zone 1)"]
+        EMB["EM secondary<br/>ctm-em-b (zone 2)"]
+      end
+      subgraph datasub["data subnet (delegated)"]
+        PG["PostgreSQL Flexible Server<br/>zone-redundant HA, one DB per EM/Server<br/>ctm-db.&lt;platform&gt;.ctm.internal"]
+      end
+      subgraph pesub["pe subnet (private endpoints)"]
+        KV[(Key Vault)]
+        BLOB[(Blob: installers / backups)]
+        NFS[(Premium Files NFS<br/>/mnt/ctm-shared)]
+      end
     end
-    subgraph data[data subnet]
-      PG["PostgreSQL Flexible Server<br/>zone-redundant HA, one DB per EM/Server<br/>ctm-db.&lt;platform&gt;.ctm.internal"]
-    end
-    subgraph pe[private endpoints]
-      KV[(Key Vault)]
-      BLOB[(Blob: installers / backups)]
-      NFS[(Premium Files NFS<br/>/mnt/ctm-shared)]
+    subgraph spoke["server VNet per stage (vnet-ctm-&lt;stage&gt;)<br/>peered to the utility VNet ONLY — never to another server VNet"]
+      subgraph srvsub[server subnet]
+        SRVA["Control-M/Server &lt;stage&gt; primary<br/>ctm-srv-&lt;stage&gt;-a (zone 1)"]
+        SRVB["Control-M/Server &lt;stage&gt; secondary<br/>ctm-srv-&lt;stage&gt;-b (zone 2)"]
+      end
+      subgraph agsub[agents subnet]
+        VMSS["Agent VM Scale Set per Server<br/>zones 1-3, autoscale, host group &lt;stage&gt;-agents"]
+      end
     end
     LAW[Log Analytics + alerts]
     RSV[Recovery Services vault<br/>VM + file share backup]
   end
 
-  subgraph dr["DR region (existing VNet)"]
-    LBD[Standard Load Balancer]
-    PGR["PostgreSQL read replica<br/>(promote on failover)"]
-    ASR["Site Recovery replicas<br/>ctm-em-a/b, ctm-srv-&lt;stage&gt;-a/b"]
-    VMSSD[Warm agent scale set per Server]
-    KVD[(Key Vault replica secrets)]
-    BLOBD[(Blob - object replication)]
+  subgraph dr["DR region — existing VNets, same hub-and-spoke"]
+    subgraph drutil["DR utility VNet (vnet-dr-utility)"]
+      LBD[Standard Load Balancer]
+      PGR["PostgreSQL read replica<br/>all databases, ctm_uat included<br/>(promote on failover)"]
+      ASREM["Site Recovery target: ctm-em-a/b<br/>(em subnet)"]
+      KVD[(Key Vault replica secrets)]
+      BLOBD[(Blob - object replication)]
+    end
+    subgraph drspoke["DR server VNet per DR-protected stage (vnet-ctm-prod-dr)"]
+      ASRSRV["Site Recovery target: ctm-srv-prod-a/b<br/>(server subnet)"]
+      VMSSD["Warm agent scale set<br/>(agents subnet)"]
+    end
   end
 
   GAL -. "imageReference (boot)" .-> EMA & EMB & SRVA & SRVB & VMSS & VMSSD
   U --> LB
   LB --> EMA
   LB -. standby .-> EMB
-  EMA <--> SRVA
-  EMB <--> SRVB
-  SRVA <--> VMSS
-  EMA & EMB & SRVA & SRVB --> PG
-  EMA & EMB & SRVA & SRVB & VMSS --> KV & BLOB & NFS
+  EMA <-->|"2369 + dynamic ports, via peering"| SRVA
+  EMB <-->|"2369 + dynamic ports, via peering"| SRVB
+  SRVA <-->|7005-7006| VMSS
+  VMSS -->|"8443, via peering"| LB
+  EMA & EMB --> PG
+  SRVA & SRVB -->|"5432, via peering"| PG
+  EMA & EMB & SRVA & SRVB & VMSS -->|"443 / 2049"| KV & BLOB & NFS
   EMA & EMB & SRVA & SRVB & VMSS --> LAW
   EMA & EMB & SRVA & SRVB --> RSV
   PG == async replication ==> PGR
-  EMA & EMB & SRVA & SRVB == disk replication ==> ASR
+  EMA & EMB == disk replication ==> ASREM
+  SRVA & SRVB == "disk replication (DR-protected stages only)" ==> ASRSRV
   BLOB == object replication ==> BLOBD
   U -. Traffic Manager / DNS switch .-> LBD
-  LBD --> ASR
-  ASR --> PGR
-  VMSSD --> ASR
+  LBD --> ASREM
+  ASREM --> PGR
+  VMSSD --> ASRSRV
 ```
 
 ## Image pipeline (how the VMs are built and stored)
@@ -113,10 +141,24 @@ prod platform hosts `CTM_UAT` next to `CTM_PROD` so acceptance testing runs on
 the exact infrastructure, EM version, database host and DR path that
 production uses. The nonprod platform hosts `CTM_DEV` and `CTM_QA` and is where
 EM/Server upgrades and patches are rehearsed first. Stage boundaries are
-Server boundaries (separate VMs, databases, credentials, agent pools), so a
+Server boundaries (separate VMs, databases, credentials, agent pools) **and
+network boundaries** (each Server and its agents in their own VNet), so a
 runaway dev scheduler cannot touch qa, and uat cannot touch prod, while the
 control plane is shared. Adding a stage or splitting one out to its own
 platform is a `config.yaml` change.
+
+**Why a utility VNet plus isolated server VNets.** The EM, load balancer,
+database and private endpoints are shared services — they belong in one
+per-platform utility VNet. Each Control-M/Server and its agent pool are a
+stage-private workload — they get their own VNet, peered to the utility VNet
+only. Isolation then holds at the network layer, not just in Control-M
+authorizations: no peering between server VNets means no path between stages,
+and the blast radius of a compromised agent subnet is one stage. Placement is
+entirely config (`network.utility`, `servers.<stage>.network`,
+`dr.network.utility`, `dr.server_networks`): moving a tier — including
+relocating a stage's agents to another VNet via
+`servers.<stage>.network.agents_vnet_name` — is a config change and a
+`--phase compute` (or `foundation`) deployment, not a code change.
 
 **Why VMs and not Kubernetes for EM/Server.** BMC supports the EM and Server
 components on Linux hosts with a shared external PostgreSQL. Their HA model is
@@ -133,11 +175,13 @@ differs per environment and node (secrets, names, mounts, Control-M install).
 **Why one foundation template with a `role`.** The DR region needs the same
 foundation (identity, secrets, storage, LB, monitoring, DNS aliases) but not
 the database or VMs, which arrive through replication. Reusing
-`bicep/foundation.bicep` with `role = 'dr'` keeps the two regions drift-free.
+`bicep/foundation.bicep` with `role = 'dr'` — pointed at the DR utility VNet
+and the DR server VNets — keeps the two regions drift-free.
 
 **Why aliases instead of real hostnames in Control-M config.** Nodes connect
 to `ctm-db.<platform>.ctm.internal` and `ctm-web.<platform>.ctm.internal`. The same zone
-name exists in both regions, linked to each region's VNet. After failover the
+name exists in both regions, linked to every VNet of that region's platform
+(utility + each server VNet, auto-registration on). After failover the
 CNAME in the DR zone points at the promoted replica and Site Recovery brings
 the VMs up with their original hostnames, so Control-M starts unchanged.
 

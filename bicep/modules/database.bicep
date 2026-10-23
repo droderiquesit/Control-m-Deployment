@@ -47,13 +47,17 @@ param administratorPassword string
 @description('Databases to pre-create (Control-M installers can also create their own).')
 param databases array
 
+// Azure swaps the two zones after an HA failover. The orchestrator reads the
+// LIVE server's zones when it already exists and passes them here, so a
+// re-deploy converges on reality instead of fighting the swap back.
+@description('Availability zone of the primary. Defaults for first create; pass the live value on re-deploys.')
+param availabilityZone string = '1'
+
+@description('Standby availability zone for ZoneRedundant HA. Defaults for first create; pass the live value on re-deploys.')
+param standbyZone string = '2'
+
 @description('Tags applied to every resource.')
 param tags object = {}
-
-// Primary zone 1, ZoneRedundant standby in zone 2. Azure swaps zones after an
-// HA failover; a later redeployment may report that swap as a change.
-var availabilityZone = '1'
-var standbyZone = '2'
 
 // Sku tier mapping: 'GP_Standard_D8ds_v5' -> { name: 'Standard_D8ds_v5', tier: 'GeneralPurpose' }.
 var skuTierByPrefix = {

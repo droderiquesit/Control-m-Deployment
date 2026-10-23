@@ -58,8 +58,30 @@ def _protected_item_names(client: Any, cfg: EnvironmentConfig) -> list[str]:
     return [item.name for item in items]
 
 
-def _test_failover(client: Any, cfg: EnvironmentConfig, dr_vnet_id: str | None) -> None:
-    """Site Recovery test failover of every protected item (continue on error)."""
+def _recovery_network_id(cfg: EnvironmentConfig, item_name: str) -> str | None:
+    """The DR VNet a protected item fails over into (v2 placement).
+
+    Server nodes -> their ``dr.server_networks.<stage>`` VNet; everything
+    else (the EM pair) -> the DR utility VNet.
+    """
+    if cfg.dr.network is None:
+        return None
+    node = item_name.removesuffix("-replication")
+    for key, server in cfg.servers.items():
+        if node in (server.primary_host, server.secondary_host):
+            net = cfg.dr.server_networks.get(key)
+            if net is None:
+                return None
+            return cfg.vnet_id(net.vnet_resource_group_name, net.vnet_name)
+    utility = cfg.dr.network.utility
+    return cfg.vnet_id(utility.vnet_resource_group_name, utility.vnet_name)
+
+
+def _test_failover(client: Any, cfg: EnvironmentConfig) -> None:
+    """Site Recovery test failover of every protected item (continue on error).
+
+    Each item is tested into its own component's DR VNet (per-VNet mappings).
+    """
     from azure.mgmt.recoveryservicessiterecovery import models
 
     names = _protected_item_names(client, cfg)
@@ -76,7 +98,7 @@ def _test_failover(client: Any, cfg: EnvironmentConfig, dr_vnet_id: str | None) 
                 models.TestFailoverInput(
                     properties=models.TestFailoverInputProperties(
                         failover_direction="PrimaryToRecovery",
-                        network_id=dr_vnet_id,
+                        network_id=_recovery_network_id(cfg, name),
                         provider_specific_details=models.A2ATestFailoverInput(),
                     )
                 ),
@@ -154,12 +176,17 @@ def _upsert_db_cname(cfg: EnvironmentConfig, credential: "TokenCredential", fqdn
 
 
 def _scale_dr_agent_pools(cfg: EnvironmentConfig, credential: "TokenCredential") -> None:
-    """Scale ctm-<env>-dr-agents-<stage> to agents.min from config (default 1)."""
+    """Scale ctm-<env>-dr-agents-<stage> to agents.min from config (default 1).
+
+    Only the DR-PARTICIPATING servers (``dr.server_networks``, the opt-in
+    set) have warm pools in the DR region; the others are skipped.
+    """
     from azure.mgmt.compute import ComputeManagementClient
 
-    print("== 4/4 scaling DR agent pools (one per Control-M/Server)")
+    print("== 4/4 scaling DR agent pools (one per DR-protected Control-M/Server)")
     client = ComputeManagementClient(credential, cfg.subscription_id)
-    for stage, server in cfg.servers.items():
+    for stage in cfg.dr_servers():
+        server = cfg.servers[stage]
         capacity = server.agents.min if server.agents.min is not None else 1
         vmss_name = cfg.dr_agent_pool_name(stage)
         print(f"   {stage} -> {capacity}")
@@ -178,7 +205,6 @@ def run(
     test: bool = False,
     yes: bool = False,
     credential: "TokenCredential | None" = None,
-    dr_vnet_id: str | None = None,
 ) -> int:
     """Execute the DR failover (or a test failover). Returns an exit code."""
     if not cfg.dr.enabled:
@@ -198,7 +224,7 @@ def run(
     asr = _asr_client(cfg, credential)
 
     if test:
-        _test_failover(asr, cfg, dr_vnet_id)
+        _test_failover(asr, cfg)
         return 0
 
     if not yes:

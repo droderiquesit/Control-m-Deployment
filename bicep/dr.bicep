@@ -1,8 +1,10 @@
 // Subscription-scope entry point: cross-region disaster recovery (prod only).
-//   1. PostgreSQL cross-region read replica (promote on failover)
+//   1. PostgreSQL cross-region read replica (promote on failover; the
+//      orchestrator gates deployReplica off once the replica was promoted)
 //   2. Site Recovery vault + replication cache account (fabrics/mappings/
 //      replicated items are created by ctmdeploy --phase replication)
 //   3. Blob object replication of installers/backups to the DR account
+//      (re-deploys converge on the live policy/rule ids the orchestrator reads)
 //   4. Optional Traffic Manager priority failover for a public web endpoint
 // Deployed by: python -m ctmdeploy deploy --env prod --phase dr
 targetScope = 'subscription'
@@ -28,6 +30,9 @@ param replicaName string
 @description('Replica compute SKU (GP_/B_/MO_-prefixed).')
 param replicaSkuName string
 
+@description('Deploy (or converge on) the PostgreSQL replica. The orchestrator passes false once the live server exists and is no longer a replica (promoted): a promoted server must never be re-PUT with createMode Replica.')
+param deployReplica bool = true
+
 @description('Resource id of the primary PostgreSQL Flexible Server.')
 param primaryDatabaseServerId string
 
@@ -45,6 +50,12 @@ param drBlobAccountName string
 
 @description('Create the Site Recovery vault and replication cache account.')
 param enableSiteRecovery bool
+
+@description('Object replication policy id already on the destination (DR) account, read live by the orchestrator; \'default\' on the first run lets the service mint one. Re-deploys then converge on the existing policy instead of stacking duplicates.')
+param existingPolicyId string = 'default'
+
+@description('Service-assigned object replication rule ids on the destination policy, positional with [installers, backups]; [] on the first run. Read live by the orchestrator.')
+param existingRuleIds array = []
 
 @description('Traffic Manager settings: {enabled, relativeName}.')
 param trafficManager object
@@ -66,7 +77,9 @@ var drBlobAccountId = resourceId(drRg, 'Microsoft.Storage/storageAccounts', drBl
 var trafficManagerEnabled = (trafficManager.?enabled ?? false) && primaryLbPublicIpId != '' && drLbPublicIpId != ''
 
 // ---------------- 1. Database replica ----------------
-module replica 'modules/dr-replica.bicep' = {
+// Gated: once promoted, the server stays managed outside this template (the
+// orchestrator GETs it first and flips deployReplica off).
+module replica 'modules/dr-replica.bicep' = if (deployReplica) {
   name: '${name}-dr-replica'
   scope: resourceGroup(drRg)
   params: {
@@ -104,20 +117,25 @@ module asrCache 'modules/asr-cache.bicep' = if (enableSiteRecovery) {
 }
 
 // ---------------- 3. Installer media replication ----------------
-// Destination policy first (the service mints policy/rule ids), then the
-// source policy echoing them.
+// Destination policy first (the service mints policy/rule ids on the first
+// run; later runs pass the live ids back in via existingPolicyId/
+// existingRuleIds so the PUT converges), then the source policy echoing the
+// destination's ids.
+var replicationRules = [
+  { sourceContainer: 'installers', destinationContainer: 'installers' }
+  { sourceContainer: 'backups', destinationContainer: 'backups' }
+]
+
 module orDestination 'modules/object-replication.bicep' = {
   name: '${name}-or-destination'
   scope: resourceGroup(drRg)
   params: {
     accountName: drBlobAccountName
-    policyId: 'default'
+    policyId: existingPolicyId
     sourceAccountId: primaryBlobAccountId
     destinationAccountId: drBlobAccountId
-    rules: [
-      { sourceContainer: 'installers', destinationContainer: 'installers' }
-      { sourceContainer: 'backups', destinationContainer: 'backups' }
-    ]
+    rules: replicationRules
+    ruleIds: existingRuleIds
   }
 }
 
@@ -129,18 +147,8 @@ module orSource 'modules/object-replication.bicep' = {
     policyId: orDestination.outputs.policyId
     sourceAccountId: primaryBlobAccountId
     destinationAccountId: drBlobAccountId
-    rules: [
-      {
-        sourceContainer: 'installers'
-        destinationContainer: 'installers'
-        ruleId: orDestination.outputs.ruleIds[0]
-      }
-      {
-        sourceContainer: 'backups'
-        destinationContainer: 'backups'
-        ruleId: orDestination.outputs.ruleIds[1]
-      }
-    ]
+    rules: replicationRules
+    ruleIds: orDestination.outputs.ruleIds
   }
 }
 
@@ -160,8 +168,8 @@ module tm 'modules/traffic-manager.bicep' = if (trafficManagerEnabled) {
 // ---------------------------------------------------------------------------
 // Outputs consumed by the replication / failover phases.
 // ---------------------------------------------------------------------------
-output replicaId string = replica.outputs.serverId
-output replicaFqdn string = replica.outputs.fqdn
+output replicaId string = deployReplica ? replica!.outputs.serverId : ''
+output replicaFqdn string = deployReplica ? replica!.outputs.fqdn : ''
 output asrVaultId string = enableSiteRecovery ? asrVault!.outputs.vaultId : ''
 output asrVaultName string = enableSiteRecovery ? asrVault!.outputs.vaultName : ''
 output cacheStorageAccountId string = enableSiteRecovery ? asrCache!.outputs.accountId : ''

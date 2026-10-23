@@ -24,9 +24,12 @@ param adminUsername string = 'ctmops'
 @description('SSH public key for the admin user (password auth is disabled).')
 param sshPublicKey string
 
-@description('cloud-init / shell bootstrap script (plain text; this module base64-encodes). Contains names/ids only - secrets are fetched from Key Vault at boot.')
+@description('cloud-init / shell bootstrap script (plain text; this module base64-encodes). Contains names/ids only - secrets are fetched from Key Vault at boot. Unlike a VM, VMSS customData is updatable and is ALWAYS sent: the model change applies to instances created from then on.')
 @secure()
 param customData string
+
+@description('true = the scale set does not exist yet (the orchestrator checks). sku.capacity is sent only on create; afterwards autoscale owns the instance count and a re-deploy must not reset it.')
+param isNew bool = true
 
 @description('Zones the scale set balances across.')
 param zones array
@@ -67,11 +70,16 @@ resource vmss 'Microsoft.Compute/virtualMachineScaleSets@2024-07-01' = {
   location: location
   zones: zones
   tags: tags
-  sku: {
-    name: vmSize
-    tier: 'Standard'
-    capacity: defaultInstances
-  }
+  // capacity only on first create: autoscale owns the count afterwards, so on
+  // updates the property must be truly OMITTED (union(), not null — ARM would
+  // still serialize an explicit null) or every re-deploy resets the pool size.
+  sku: union(
+    {
+      name: vmSize
+      tier: 'Standard'
+    },
+    isNew ? { capacity: defaultInstances } : {}
+  )
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {

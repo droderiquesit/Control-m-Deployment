@@ -2,6 +2,8 @@
 # NONPROD platform: one Enterprise Manager (single node) managing two
 # Control-M/Servers, CTM_DEV and CTM_QA, each with its own agent pool.
 # Zone-redundant database so QA can rehearse HA; no DR.
+# Network placement v2: the EM + shared services live in the utility VNet;
+# every Control-M/Server runs in its OWN VNet with its agents beside it.
 # Single source of truth: ctmdeploy reads this file and feeds Bicep its params.
 # ---------------------------------------------------------------------------
 subscription_id: "00000000-0000-0000-0000-000000000000"
@@ -14,16 +16,21 @@ tags:
   costCenter: scheduling
   owner: platform-team
 
-# Existing network (select, not create)
+# Existing networks (select, not create). All VNets pre-exist and must be
+# peered per docs/NETWORK-REQUIREMENTS.md (each server VNet <-> utility VNet).
 network:
-  vnet_name: vnet-nonprod-eastus2
-  vnet_resource_group_name: rg-network-nonprod
-  app_subnet_name: snet-ctm-app
-  data_subnet_name: snet-ctm-postgres
-  pe_subnet_name: snet-ctm-pe
+  utility: # EM VMs + internal LB frontend, delegated postgres subnet, private endpoints
+    vnet_name: vnet-dev-utility
+    vnet_resource_group_name: rg-network-nonprod
+    em_subnet_name: snet-ctm-em
+    data_subnet_name: snet-ctm-postgres
+    pe_subnet_name: snet-ctm-pe
   # Hub-managed private DNS zones (optional keys: blob, file, vault, postgres)
   # existing_private_dns_zone_ids: { blob: "...", file: "...", vault: "...", postgres: "..." }
   existing_private_dns_zone_ids: {}
+  # Extra VNets to link into the platform/privatelink DNS zones (e.g. a jump VNet):
+  # extra_dns_vnets: [{vnet_name: ..., vnet_resource_group_name: ...}]
+  extra_dns_vnets: []
 
 deployer_ip_cidrs:
   - "203.0.113.10/32"
@@ -60,6 +67,14 @@ servers:
     disk_type: Premium_LRS
     enable_secondary: false
     zones: ["1", "2"]
+    network: # REQUIRED: this server's own VNet (isolated from the other servers)
+      vnet_name: vnet-ctm-dev
+      vnet_resource_group_name: rg-network-nonprod
+      server_subnet_name: snet-ctm-server
+      agents_subnet_name: snet-ctm-agents # optional; default = server_subnet_name
+      # Agents may be relocated to another VNet entirely (optional overrides):
+      # agents_vnet_name: null
+      # agents_vnet_resource_group_name: null
     agents:
       vm_size: Standard_D2s_v5
       min: 1
@@ -75,6 +90,11 @@ servers:
     disk_type: Premium_LRS
     enable_secondary: true # Server HA pair, so failover is tested before prod
     zones: ["1", "2"]
+    network:
+      vnet_name: vnet-ctm-qa
+      vnet_resource_group_name: rg-network-nonprod
+      server_subnet_name: snet-ctm-server
+      agents_subnet_name: snet-ctm-agents
     agents:
       vm_size: Standard_D2s_v5
       min: 1

@@ -1,10 +1,22 @@
 # ---------------------------------------------------------------------------
 # Typed configuration for the Control-M platform: loads environments/<env>/
-# config.yaml into dataclasses, applies the defaults the old platform modules
-# used, and derives naming, node plans and agent-pool plans. Pure python:
+# config.yaml (v2 network schema: per-platform utility VNet + one VNet per
+# Control-M/Server) into dataclasses and derives naming, per-component
+# placement (subnet ids), node plans and agent-pool plans. Pure python:
 # this module MUST stay importable without any Azure SDK installed.
 # ---------------------------------------------------------------------------
-"""Configuration loading, validation and derived values (names, node plans)."""
+"""Configuration loading, validation and derived values (names, placement, plans).
+
+v2 network model: EMs (and the LB, PostgreSQL, private endpoints) live in a
+per-platform *utility VNet*; every Control-M/Server runs in its OWN VNet with
+its agent VMSS in that same VNet (unless relocated via the agents_vnet_*
+overrides). DR mirrors this with a DR utility VNet plus one DR VNet per
+DR-PARTICIPATING server: ``dr.server_networks`` is the DR opt-in set (a
+non-empty subset of the servers when dr.enabled; PoC: prod only — uat is
+re-deployable and gets no DR VNet, no ASR items, no warm pool). Python
+builds subnet/VNet resource ids directly from names — no Azure lookups are
+needed for placement.
+"""
 
 from __future__ import annotations
 
@@ -73,6 +85,16 @@ def _str(data: Mapping[str, Any], key: str, path: str, default: str | None = Non
     return str(value)
 
 
+def _opt_str(data: Mapping[str, Any], key: str, path: str) -> str:
+    """Optional string where an explicit YAML ``null`` means 'not set' ('')."""
+    value = data.get(key)
+    if value is None:
+        return ""
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ConfigError(f"{path}.{key}: expected a string, got {type(value).__name__}")
+    return str(value)
+
+
 def _int(data: Mapping[str, Any], key: str, path: str, default: int | None = None) -> int:
     value = data.get(key, default)
     if value is None:
@@ -104,31 +126,126 @@ def _str_map(data: Mapping[str, Any], key: str, path: str) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Azure resource-id builders (pure string building, no lookups)
+# ---------------------------------------------------------------------------
+
+
+def vnet_id(subscription_id: str, resource_group_name: str, vnet_name: str) -> str:
+    """Full ARM id of an existing (bring-your-own) virtual network."""
+    return (
+        f"/subscriptions/{subscription_id}/resourceGroups/{resource_group_name}"
+        f"/providers/Microsoft.Network/virtualNetworks/{vnet_name}"
+    )
+
+
+def subnet_id(
+    subscription_id: str, resource_group_name: str, vnet_name: str, subnet_name: str
+) -> str:
+    """Full ARM id of a subnet inside an existing virtual network."""
+    return f"{vnet_id(subscription_id, resource_group_name, vnet_name)}/subnets/{subnet_name}"
+
+
+# ---------------------------------------------------------------------------
 # Dataclasses (one per config.yaml section)
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class NetworkConfig:
-    """Existing VNet/subnets to deploy into (selected, never created)."""
+class VnetRef:
+    """A VNet referenced by name + resource group (always pre-existing)."""
+
+    name: str
+    resource_group_name: str
+
+    def as_param(self) -> dict[str, str]:
+        """Item shape of the bicep `allVnets` array."""
+        return {"name": self.name, "resourceGroupName": self.resource_group_name}
+
+
+@dataclass(frozen=True)
+class UtilityNetworkConfig:
+    """Per-platform utility VNet: EM VMs + internal LB frontend (em subnet),
+    delegated PostgreSQL subnet (data subnet) and private endpoints (pe subnet)."""
 
     vnet_name: str
     vnet_resource_group_name: str
-    app_subnet_name: str
+    em_subnet_name: str
     data_subnet_name: str
     pe_subnet_name: str = ""
+
+    @property
+    def ref(self) -> VnetRef:
+        return VnetRef(self.vnet_name, self.vnet_resource_group_name)
+
+    def as_param(self) -> dict[str, Any]:
+        """Config-shaped `utility` object inside foundation's `network` param."""
+        return {
+            "vnet_name": self.vnet_name,
+            "vnet_resource_group_name": self.vnet_resource_group_name,
+            "em_subnet_name": self.em_subnet_name,
+            "data_subnet_name": self.data_subnet_name,
+            "pe_subnet_name": self.pe_subnet_name,
+        }
+
+
+@dataclass(frozen=True)
+class NetworkConfig:
+    """v2 regional network: the utility VNet reference plus DNS wiring.
+
+    Used for both the primary region (`network:`) and the DR region
+    (`dr.network:`). Per-server VNets live on each server (`servers.<stage>.
+    network`) / in `dr.server_networks`, not here.
+    """
+
+    utility: UtilityNetworkConfig
     existing_private_dns_zone_ids: dict[str, str] = field(default_factory=dict)
+    extra_dns_vnets: tuple[VnetRef, ...] = ()
 
     def as_param(self) -> dict[str, Any]:
         """Config-shaped object passed to bicep/foundation.bicep `network`."""
         return {
-            "vnet_name": self.vnet_name,
-            "vnet_resource_group_name": self.vnet_resource_group_name,
-            "app_subnet_name": self.app_subnet_name,
-            "data_subnet_name": self.data_subnet_name,
-            "pe_subnet_name": self.pe_subnet_name,
+            "utility": self.utility.as_param(),
             "existing_private_dns_zone_ids": dict(self.existing_private_dns_zone_ids),
+            "extra_dns_vnets": [ref.as_param() for ref in self.extra_dns_vnets],
         }
+
+
+@dataclass(frozen=True)
+class ServerNetworkConfig:
+    """One Control-M/Server's own VNet (REQUIRED per server).
+
+    The agent VMSS lands in `agents_subnet_name` of the same VNet by default;
+    the optional agents_vnet_* overrides relocate the agents entirely.
+    """
+
+    vnet_name: str
+    vnet_resource_group_name: str
+    server_subnet_name: str
+    agents_subnet_name: str = ""  # '' -> server_subnet_name
+    agents_vnet_name: str = ""  # '' -> vnet_name
+    agents_vnet_resource_group_name: str = ""  # '' -> vnet_resource_group_name
+
+    @property
+    def ref(self) -> VnetRef:
+        return VnetRef(self.vnet_name, self.vnet_resource_group_name)
+
+    @property
+    def agents_subnet(self) -> str:
+        return self.agents_subnet_name or self.server_subnet_name
+
+    @property
+    def agents_vnet(self) -> str:
+        return self.agents_vnet_name or self.vnet_name
+
+    @property
+    def agents_vnet_resource_group(self) -> str:
+        if self.agents_vnet_name:
+            return self.agents_vnet_resource_group_name or self.vnet_resource_group_name
+        return self.vnet_resource_group_name
+
+    @property
+    def agents_ref(self) -> VnetRef:
+        return VnetRef(self.agents_vnet, self.agents_vnet_resource_group)
 
 
 @dataclass(frozen=True)
@@ -177,6 +294,7 @@ class ServerConfig:
     name: str
     vm_size: str
     agents: AgentsConfig
+    network: ServerNetworkConfig
     data_disk_gb: int = 256
     disk_type: str = "Premium_LRS"
     enable_secondary: bool = True
@@ -335,11 +453,20 @@ class ObservabilityConfig:
 
 @dataclass(frozen=True)
 class DrConfig:
-    """Disaster-recovery region settings; enabled=false skips DR entirely."""
+    """Disaster-recovery region settings; enabled=false skips DR entirely.
+
+    v2: `network.utility` is the DR utility VNet (failed-over EM target,
+    replica data subnet, PEs, DR LB); `server_networks` is the DR OPT-IN
+    set — a server participates in DR if and only if it has an entry here
+    (a non-empty SUBSET of the servers keys when enabled; servers absent
+    from it are simply not DR-protected: no ASR items, no DR VNet, no warm
+    agent pool).
+    """
 
     enabled: bool = False
     location: str = ""
     network: NetworkConfig | None = None
+    server_networks: dict[str, ServerNetworkConfig] = field(default_factory=dict)
     warm_agents: int = 0
     replica_sku_name: str = ""
     enable_site_recovery: bool = True
@@ -365,7 +492,12 @@ class InstallerBlobs:
 
 @dataclass(frozen=True)
 class NodePlanItem:
-    """One EM or Control-M/Server VM in the compute deployment's nodePlan."""
+    """One EM or Control-M/Server VM in the compute deployment's nodePlan.
+
+    v2: each node carries its own `subnet_id` (EM -> utility em subnet,
+    Server -> its own VNet's server subnet). `is_new` (passed at to_bicep
+    time) gates immutable-at-create properties such as customData.
+    """
 
     name: str
     component: str  # 'em' | 'server'
@@ -376,9 +508,10 @@ class NodePlanItem:
     disk_type: str
     join_lb: bool
     tags: dict[str, str]
+    subnet_id: str
     server_key: str = ""  # '' for EM nodes
 
-    def to_bicep(self, custom_data: str) -> dict[str, Any]:
+    def to_bicep(self, custom_data: str, *, is_new: bool = True) -> dict[str, Any]:
         """Exact item shape of bicep/compute.bicep param nodePlan."""
         return {
             "name": self.name,
@@ -391,12 +524,19 @@ class NodePlanItem:
             "customData": custom_data,
             "joinLb": self.join_lb,
             "tags": dict(self.tags),
+            "subnetId": self.subnet_id,
+            "isNew": is_new,
         }
 
 
 @dataclass(frozen=True)
 class AgentPoolPlanItem:
-    """One agent VMSS in the compute deployment's agentPools."""
+    """One agent VMSS in the compute deployment's agentPools.
+
+    v2: carries its own `subnet_id` (the server's agents subnet — same VNet
+    as the server unless relocated). `is_new` (passed at to_bicep time) lets
+    bicep set sku.capacity only at create; autoscale owns the count afterwards.
+    """
 
     stage: str
     name: str
@@ -408,8 +548,9 @@ class AgentPoolPlanItem:
     scale_out_cpu: int
     scale_in_cpu: int
     use_spot: bool
+    subnet_id: str
 
-    def to_bicep(self, custom_data: str) -> dict[str, Any]:
+    def to_bicep(self, custom_data: str, *, is_new: bool = True) -> dict[str, Any]:
         """Exact item shape of bicep/compute.bicep param agentPools."""
         return {
             "stage": self.stage,
@@ -423,6 +564,8 @@ class AgentPoolPlanItem:
             "scaleInCpu": self.scale_in_cpu,
             "useSpot": self.use_spot,
             "customData": custom_data,
+            "subnetId": self.subnet_id,
+            "isNew": is_new,
         }
 
 
@@ -588,6 +731,93 @@ class EnvironmentConfig:
             "managedBy": "bicep",
         }
 
+    # ---- v2 network placement (ids are built from names, never looked up) --
+
+    def vnet_id(self, resource_group_name: str, vnet_name: str) -> str:
+        """ARM id of a VNet in this subscription."""
+        return vnet_id(self.subscription_id, resource_group_name, vnet_name)
+
+    def subnet_id(self, resource_group_name: str, vnet_name: str, subnet_name: str) -> str:
+        """ARM id of a subnet in this subscription."""
+        return subnet_id(self.subscription_id, resource_group_name, vnet_name, subnet_name)
+
+    def region_network(self, role: str = "primary") -> NetworkConfig:
+        """The regional network block: `network` (primary) or `dr.network`."""
+        if role == "primary":
+            return self.network
+        if self.dr.network is None:
+            raise ConfigError("dr.network is required for the DR region")
+        return self.dr.network
+
+    def dr_servers(self) -> list[str]:
+        """Stage keys of the DR-PARTICIPATING servers (the `dr.server_networks`
+        opt-in set), in servers order. Servers absent from the set are not
+        DR-protected (no ASR items, no DR VNet, no warm agent pool)."""
+        return [key for key in self.servers if key in self.dr.server_networks]
+
+    def server_network(self, key: str, role: str = "primary") -> ServerNetworkConfig:
+        """One server's own VNet in a region (`servers.<key>.network` or
+        `dr.server_networks.<key>`)."""
+        if key not in self.servers:
+            raise ConfigError(f"unknown server key {key!r}; expected one of {sorted(self.servers)}")
+        if role == "primary":
+            return self.servers[key].network
+        try:
+            return self.dr.server_networks[key]
+        except KeyError:
+            raise ConfigError(
+                f"dr.server_networks.{key}: server {key!r} is not DR-protected "
+                "(dr.server_networks is the DR opt-in set; add an entry to protect it)"
+            ) from None
+
+    def em_subnet_id(self, role: str = "primary") -> str:
+        """EM VMs + internal LB frontend -> the region's utility em subnet."""
+        utility = self.region_network(role).utility
+        return self.subnet_id(
+            utility.vnet_resource_group_name, utility.vnet_name, utility.em_subnet_name
+        )
+
+    def server_subnet_id(self, key: str, role: str = "primary") -> str:
+        """Server VMs -> the server's own VNet's server subnet."""
+        net = self.server_network(key, role)
+        return self.subnet_id(net.vnet_resource_group_name, net.vnet_name, net.server_subnet_name)
+
+    def agents_subnet_id(self, key: str, role: str = "primary") -> str:
+        """Agent VMSS -> the server's agents subnet (same VNet unless relocated)."""
+        net = self.server_network(key, role)
+        return self.subnet_id(net.agents_vnet_resource_group, net.agents_vnet, net.agents_subnet)
+
+    def all_vnets(self, role: str = "primary") -> list[dict[str, str]]:
+        """Deduped `{name, resourceGroupName}` list of EVERY VNet in a region:
+        utility + each server VNet + agent relocation VNets + extra_dns_vnets
+        (order preserved). This is the bicep `allVnets` param — each created
+        privatelink zone gets one VNet link per entry. In the DR region only
+        the DR-participating servers (`dr.server_networks`) contribute VNets."""
+        region = self.region_network(role)
+        refs: list[VnetRef] = [region.utility.ref]
+        keys = list(self.servers) if role == "primary" else self.dr_servers()
+        for key in keys:
+            net = self.server_network(key, role)
+            refs.append(net.ref)
+            refs.append(net.agents_ref)
+        refs.extend(region.extra_dns_vnets)
+        seen: set[tuple[str, str]] = set()
+        deduped: list[dict[str, str]] = []
+        for ref in refs:
+            ident = (ref.name, ref.resource_group_name)
+            if ident not in seen:
+                seen.add(ident)
+                deduped.append(ref.as_param())
+        return deduped
+
+    def dns_vnet_links(self, role: str = "primary") -> list[dict[str, str]]:
+        """`{name, vnetId}` items for the platform DNS zone's registration-
+        enabled links (bicep `dnsVnetLinks`): one per VNet in the region."""
+        return [
+            {"name": ref["name"], "vnetId": self.vnet_id(ref["resourceGroupName"], ref["name"])}
+            for ref in self.all_vnets(role)
+        ]
+
 
 # ---------------------------------------------------------------------------
 # Plan derivation (ported from modules/platform/main.tf locals and the
@@ -610,6 +840,7 @@ def node_plan(cfg: EnvironmentConfig, role: str = "primary") -> list[NodePlanIte
     base_tags = cfg.platform_tags(role)
     plan: list[NodePlanItem] = []
 
+    em_subnet = cfg.em_subnet_id(role)
     em_nodes = [(EM_PRIMARY_HOST, "primary", cfg.em.zones[0])]
     if cfg.em.enable_secondary:
         em_nodes.append((EM_SECONDARY_HOST, "secondary", cfg.em.zones[1]))
@@ -625,10 +856,12 @@ def node_plan(cfg: EnvironmentConfig, role: str = "primary") -> list[NodePlanIte
                 disk_type=cfg.em.disk_type,
                 join_lb=True,
                 tags={**base_tags, "ctm:component": "em", "ctm:role": node_role},
+                subnet_id=em_subnet,
             )
         )
 
     for key, server in cfg.servers.items():
+        server_subnet = cfg.server_subnet_id(key, role)
         server_nodes = [(server.primary_host, "primary", server.zones[0])]
         if server.enable_secondary:
             server_nodes.append((server.secondary_host, "secondary", server.zones[1]))
@@ -649,6 +882,7 @@ def node_plan(cfg: EnvironmentConfig, role: str = "primary") -> list[NodePlanIte
                         "ctm:role": node_role,
                         "ctm:server": server.name,
                     },
+                    subnet_id=server_subnet,
                     server_key=key,
                 )
             )
@@ -658,14 +892,20 @@ def node_plan(cfg: EnvironmentConfig, role: str = "primary") -> list[NodePlanIte
 def agent_pools(cfg: EnvironmentConfig, role: str = "primary") -> list[AgentPoolPlanItem]:
     """One agent VMSS per Control-M/Server.
 
-    role='primary': sizes straight from config. role='dr': warm pools —
-    min=0, default=dr.warm_agents, max unchanged (the TF DR override).
+    role='primary': one pool per server, sizes straight from config, placed
+    in each server's agents subnet (same VNet as the server unless
+    relocated). role='dr': warm pools for the DR-PARTICIPATING servers only
+    (`dr.server_networks`, the opt-in set) — min=0, default=dr.warm_agents,
+    max unchanged (the TF DR override) — placed in
+    `dr.server_networks.<stage>` agents subnets.
     """
     if role not in ("primary", "dr"):
         raise ConfigError(f"agent_pools role must be primary or dr, got {role!r}")
     prefix = cfg.name if role == "primary" else cfg.dr_name
     pools: list[AgentPoolPlanItem] = []
-    for key, server in cfg.servers.items():
+    keys = list(cfg.servers) if role == "primary" else cfg.dr_servers()
+    for key in keys:
+        server = cfg.servers[key]
         agents = server.agents
         pools.append(
             AgentPoolPlanItem(
@@ -679,6 +919,7 @@ def agent_pools(cfg: EnvironmentConfig, role: str = "primary") -> list[AgentPool
                 scale_out_cpu=agents.scale_out_cpu,
                 scale_in_cpu=agents.scale_in_cpu,
                 use_spot=agents.use_spot,
+                subnet_id=cfg.agents_subnet_id(key, role),
             )
         )
     return pools
@@ -717,16 +958,67 @@ def find_repo_root(start: str | Path | None = None) -> Path:
     )
 
 
-def _parse_network(raw: Mapping[str, Any], path: str) -> NetworkConfig:
+def _parse_vnet_ref(raw: Any, path: str) -> VnetRef:
     data = _mapping(raw, path)
-    return NetworkConfig(
+    return VnetRef(
+        name=_str(data, "vnet_name", path),
+        resource_group_name=_str(data, "vnet_resource_group_name", path),
+    )
+
+
+def _parse_utility(raw: Any, path: str) -> UtilityNetworkConfig:
+    data = _mapping(raw, path)
+    if not data:
+        raise ConfigError(f"{path}: required mapping is missing (v2 network schema)")
+    return UtilityNetworkConfig(
         vnet_name=_str(data, "vnet_name", path),
         vnet_resource_group_name=_str(data, "vnet_resource_group_name", path),
-        app_subnet_name=_str(data, "app_subnet_name", path),
+        em_subnet_name=_str(data, "em_subnet_name", path),
         data_subnet_name=_str(data, "data_subnet_name", path),
-        pe_subnet_name=_str(data, "pe_subnet_name", path, default=""),
-        existing_private_dns_zone_ids=_str_map(data, "existing_private_dns_zone_ids", path),
+        pe_subnet_name=_opt_str(data, "pe_subnet_name", path),
     )
+
+
+def _parse_network(raw: Any, path: str) -> NetworkConfig:
+    data = _mapping(raw, path)
+    if "utility" not in data:
+        raise ConfigError(
+            f"{path}.utility: required mapping is missing "
+            "(v2 network schema: the per-platform utility VNet)"
+        )
+    extra_raw = data.get("extra_dns_vnets") or []
+    if not isinstance(extra_raw, (list, tuple)):
+        raise ConfigError(f"{path}.extra_dns_vnets: expected a list")
+    return NetworkConfig(
+        utility=_parse_utility(data["utility"], f"{path}.utility"),
+        existing_private_dns_zone_ids=_str_map(data, "existing_private_dns_zone_ids", path),
+        extra_dns_vnets=tuple(
+            _parse_vnet_ref(item, f"{path}.extra_dns_vnets[{i}]")
+            for i, item in enumerate(extra_raw)
+        ),
+    )
+
+
+def _parse_server_network(raw: Any, path: str) -> ServerNetworkConfig:
+    data = _mapping(raw, path)
+    if not data:
+        raise ConfigError(
+            f"{path}: required mapping is missing (v2: every server has its own VNet)"
+        )
+    net = ServerNetworkConfig(
+        vnet_name=_str(data, "vnet_name", path),
+        vnet_resource_group_name=_str(data, "vnet_resource_group_name", path),
+        server_subnet_name=_str(data, "server_subnet_name", path),
+        agents_subnet_name=_opt_str(data, "agents_subnet_name", path),
+        agents_vnet_name=_opt_str(data, "agents_vnet_name", path),
+        agents_vnet_resource_group_name=_opt_str(data, "agents_vnet_resource_group_name", path),
+    )
+    if net.agents_vnet_resource_group_name and not net.agents_vnet_name:
+        raise ConfigError(
+            f"{path}.agents_vnet_resource_group_name: requires agents_vnet_name "
+            "(set both to relocate the agents, neither to keep them with the server)"
+        )
+    return net
 
 
 def _parse_agents(raw: Mapping[str, Any], path: str) -> AgentsConfig:
@@ -757,6 +1049,11 @@ def _parse_server(key: str, raw: Mapping[str, Any], path: str) -> ServerConfig:
     data = _mapping(raw, path)
     if "agents" not in data:
         raise ConfigError(f"{path}.agents: required mapping is missing")
+    if data.get("network") is None:
+        raise ConfigError(
+            f"{path}.network: required mapping is missing "
+            "(v2: every Control-M/Server declares its own VNet)"
+        )
     return ServerConfig(
         key=key,
         name=_str(data, "name", path, default=f"CTM_{key.upper()}"),
@@ -767,19 +1064,26 @@ def _parse_server(key: str, raw: Mapping[str, Any], path: str) -> ServerConfig:
         zones=_str_list(data, "zones", path, ["1", "2"]),
         os_user=_str(data, "os_user", path, default="controlm"),
         agents=_parse_agents(data["agents"], f"{path}.agents"),
+        network=_parse_server_network(data["network"], f"{path}.network"),
     )
 
 
-def _parse_dr(raw: Mapping[str, Any], path: str) -> DrConfig:
+def _parse_dr(raw: Mapping[str, Any], path: str, server_keys: list[str]) -> DrConfig:
     data = _mapping(raw, path)
     enabled = _bool(data, "enabled", path, False)
     network = None
     if data.get("network") is not None:
         network = _parse_network(data["network"], f"{path}.network")
+    server_networks_raw = _mapping(data.get("server_networks"), f"{path}.server_networks")
+    server_networks = {
+        str(key): _parse_server_network(value, f"{path}.server_networks.{key}")
+        for key, value in server_networks_raw.items()
+    }
     dr = DrConfig(
         enabled=enabled,
         location=_str(data, "location", path, default=""),
         network=network,
+        server_networks=server_networks,
         warm_agents=_int(data, "warm_agents", path, default=0),
         replica_sku_name=_str(data, "replica_sku_name", path, default=""),
         enable_site_recovery=_bool(data, "enable_site_recovery", path, True),
@@ -790,6 +1094,19 @@ def _parse_dr(raw: Mapping[str, Any], path: str) -> DrConfig:
             raise ConfigError(f"{path}.location: required when dr.enabled is true")
         if dr.network is None:
             raise ConfigError(f"{path}.network: required when dr.enabled is true")
+        # DR OPT-IN set: a non-empty SUBSET of the servers keys. Servers absent
+        # from it are simply not DR-protected (no ASR items, no warm pool).
+        if not dr.server_networks:
+            raise ConfigError(
+                f"{path}.server_networks: at least one DR-protected server is "
+                "required when dr.enabled is true (the DR opt-in set)"
+            )
+        unknown = sorted(key for key in dr.server_networks if key not in server_keys)
+        if unknown:
+            raise ConfigError(
+                f"{path}.server_networks: unknown server keys {unknown} "
+                f"(configured servers: {sorted(server_keys)})"
+            )
     return dr
 
 
@@ -938,7 +1255,7 @@ def load_config_file(
         load_balancer=load_balancer,
         backup=backup,
         observability=observability,
-        dr=_parse_dr(data.get("dr"), f"{top}.dr"),
+        dr=_parse_dr(data.get("dr"), f"{top}.dr", list(servers)),
     )
 
 

@@ -80,6 +80,10 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
 }
 
 // Nodes read secrets at boot (DB credentials, EM admin password, SSH key).
+// Idempotency: deterministic guid(scope, principal, role) name — the identity's
+// RESOURCE id stands in for its principalId, which is runtime-only inside this
+// module and ARM requires names computable at deployment start. The seed is
+// stable across re-deploys, so the assignment is updated in place, never duplicated.
 resource nodesSecretsUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(keyVault.id, nodesIdentity.id, keyVaultSecretsUserRoleId)
   scope: keyVault

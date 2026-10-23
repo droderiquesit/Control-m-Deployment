@@ -5,7 +5,8 @@ All platform changes flow the same way: edit
 `python -m ctmdeploy whatif --env <env>`, then
 `python -m ctmdeploy deploy --env <env> --phase <phase>` (or merge to `main`
 and let the pipeline run). Deployments are stateless ARM operations — safe to
-re-run, nothing to lock or migrate.
+re-run, nothing to lock or migrate (see the Idempotency section in the README
+for the exact re-run guarantees).
 
 ## Scaling
 
@@ -14,19 +15,20 @@ re-run, nothing to lock or migrate.
 | More job throughput for a stage | `servers.<stage>.agents.max` / `.min` / `.scale_out_cpu` | autoscale bounds; no downtime (`--phase compute`) |
 | Different agent size | `servers.<stage>.agents.vm_size` | scale set model updates; roll instances (`az vmss update-instances`) |
 | Bigger EM / Server | `em.vm_size` / `servers.<stage>.vm_size` | VM resize = reboot, do secondary first then fail over |
-| New stage on a platform | add a `servers.<stage>` entry | new Server VM pair, database, secret, agent pool; register in EM afterwards |
+| New stage on a platform | add a `servers.<stage>` entry incl. its `network:` block (a new VNet with server + agents subnets, peered to the utility VNet — see `docs/NETWORK-REQUIREMENTS.md`) | new Server VM pair, database, secret, agent pool in its own VNet; register in EM afterwards |
+| Relocate a stage's agents | `servers.<stage>.network.agents_subnet_name` or `agents_vnet_name`/`agents_vnet_resource_group_name` | drain/deregister the agents, delete the old scale set (`az vmss delete` — Azure cannot move a VMSS between VNets and Incremental mode never deletes), then `--phase compute` creates it in the new subnet |
 | Database compute | `database.sku_name` | scale with brief failover to standby (zone-redundant HA) |
 | Database storage | `database.storage_mb` | online grow (auto-grow is on) |
 | Shared share | `storage.shared_share_quota_gb` | online |
 
-> **Known what-if noise — PostgreSQL zones.** After an Azure HA failover the
-> primary and standby swap availability zones. The templates pin
-> `availabilityZone: '1'` / `standbyAvailabilityZone: '2'`, so the next
-> `ctmdeploy whatif`/`deploy` reports zone drift on the flexible server and a
-> deploy swaps the roles back (a brief failover to the standby). This is
-> expected; there is no ARM equivalent of ignoring the attribute. Review the
-> what-if, and if the swapped layout should stay, deploy during a maintenance
-> window and let it settle.
+> **PostgreSQL zones after an HA failover.** After an Azure HA failover the
+> primary and standby swap availability zones. `ctmdeploy` reads the live
+> server's current zone / standby zone before each deploy and passes them as
+> parameters, so a re-deploy (and `whatif`) accepts the swapped layout instead
+> of fighting it — no zone drift, no surprise failover back. Zones `1`/`2`
+> are only used on first creation. If you *want* to swap the roles back, do it
+> with a forced HA failover in Azure (portal / `az postgres flexible-server`),
+> not through the deployment.
 
 ## Patching and image revisions
 

@@ -1,8 +1,10 @@
 # ---------------------------------------------------------------------------
 # Phase engine: rg -> foundation(primary[,dr]) -> secrets -> compute -> dr ->
-# replication, passing each deployment's outputs to the next. Node plans and
-# agent pools are derived from config exactly like the old platform locals.
-# Azure SDK imports are guarded inside the functions that need them.
+# replication, passing each deployment's outputs to the next. v2: per-node/
+# per-pool subnet placement (utility VNet + one VNet per server) and
+# idempotency pre-reads (existing VMs/VMSS -> isNew, promoted replica,
+# object-replication policy ids, live PG zones). Azure SDK imports are
+# guarded inside the functions that need them.
 # ---------------------------------------------------------------------------
 """Python-orchestrated Bicep deployments for one Control-M environment.
 
@@ -11,6 +13,12 @@ compute|dr|replication]`` runs the phases; ``whatif`` runs the same ARM
 deployments in what-if mode (the pre-apply change preview).
 Deployment names are ``ctm-<env>-<phase>[-dr]``; later phases re-read the
 earlier phases' recorded outputs so each phase can run standalone.
+
+Re-running ``deploy --phase all`` is safe: before each ARM deployment the
+engine reads the live state it must not fight (existing VMs/VMSS for the
+per-item ``isNew`` flags, a promoted DR replica, an existing blob
+object-replication policy, the database's current availability zones) and
+parameterizes the templates so they converge instead of churning.
 """
 
 from __future__ import annotations
@@ -309,15 +317,26 @@ class Engine:
     def _foundation_params(self, role: str) -> dict[str, Any]:
         cfg = self.cfg
         primary = role == "primary"
-        network = cfg.network if primary else cfg.dr.network
-        if network is None:  # defensive: config validation enforces this already
-            raise DeployError("dr.network is required for the DR foundation")
+        try:
+            network = cfg.region_network(role)
+        except Exception as exc:  # defensive: config validation enforces this already
+            raise DeployError(str(exc)) from exc
         secrets_map = self._resolve_secrets()
+        # Idempotency (5.5): never fight an HA zone swap — read the live
+        # primary server's zones and re-assert those instead of the defaults.
+        database = dict(cfg.database.as_param())
+        zone, standby_zone = self._database_zones() if primary else ("1", "2")
+        database["availability_zone"] = zone
+        database["standby_zone"] = standby_zone
         return {
             "environment": cfg.environment,
             "role": role,
             "uniqueSuffix": cfg.unique_suffix,
             "network": network.as_param(),
+            # Every VNet in the region: privatelink zones + the platform DNS
+            # zone get one link per entry (utility + server VNets + extras).
+            "allVnets": cfg.all_vnets(role),
+            "dnsVnetLinks": cfg.dns_vnet_links(role),
             "privateDnsZoneName": cfg.private_dns_zone_name,
             "deployerIpCidrs": list(cfg.deployer_ip_cidrs),
             "keyVaultPublicAccess": cfg.key_vault_public_access,
@@ -325,7 +344,7 @@ class Engine:
             "databaseCreate": primary,
             "databaseHostOverride": "" if primary else cfg.replica_fqdn,
             "databaseAdminPassword": secrets_map["db-admin-password"],
-            "database": cfg.database.as_param(),
+            "database": database,
             "storage": cfg.storage.as_param(),
             "loadBalancer": cfg.load_balancer.as_param(cfg.em.web_port),
             "observability": cfg.observability.as_param(),
@@ -333,6 +352,34 @@ class Engine:
             "emDbName": cfg.em.db_name,
             "tags": cfg.platform_tags(role),
         }
+
+    def _database_zones(self) -> tuple[str, str]:
+        """Live (availabilityZone, standbyAvailabilityZone) of the primary PG
+        server when it exists; the create-time defaults ('1', '2') otherwise.
+
+        Azure may swap the zones after an HA failover; re-deploys must assert
+        the live values, not the originals. Lazy/guarded: offline work never
+        reaches this (it is only called on a real foundation deployment).
+        """
+        default = ("1", "2")
+        try:
+            from azure.core.exceptions import ResourceNotFoundError
+            from azure.mgmt.postgresqlflexibleservers import PostgreSQLManagementClient
+        except ImportError:
+            return default
+        client = PostgreSQLManagementClient(self.deployer.credential, self.cfg.subscription_id)
+        try:
+            server = client.servers.get(self.cfg.resource_group_name, self.cfg.postgres_server_name)
+        except ResourceNotFoundError:
+            return default
+        except Exception as exc:  # noqa: BLE001 - pre-read only; deploy surfaces real errors
+            print(f"    note: could not read live database zones ({exc}); using defaults")
+            return default
+        zone = str(getattr(server, "availability_zone", "") or "") or default[0]
+        ha = getattr(server, "high_availability", None)
+        standby = str(getattr(ha, "standby_availability_zone", "") or "") if ha else ""
+        print(f"    database {self.cfg.postgres_server_name}: live zones {zone}/{standby or '-'}")
+        return (zone, standby or default[1])
 
     def phase_foundation(self, what_if: bool = False) -> list[DeploymentResult]:
         """RG deployments of bicep/foundation.bicep: primary, then DR."""
@@ -369,25 +416,52 @@ class Engine:
         for vault, name, action in actions:
             print(f"    secret {name} @ {vault}: {action}")
 
+    def _existing_compute(self, resource_group: str) -> tuple[set[str], set[str]]:
+        """Names of the VMs and VMSS already in a resource group.
+
+        Drives the per-item ``isNew`` flags (idempotency 5.2): customData is
+        immutable after VM create, and VMSS capacity belongs to autoscale once
+        the scale set exists. A missing resource group means everything is new.
+        """
+        from azure.core.exceptions import ResourceNotFoundError
+        from azure.mgmt.compute import ComputeManagementClient
+
+        client = ComputeManagementClient(self.deployer.credential, self.cfg.subscription_id)
+        try:
+            vms = {vm.name for vm in client.virtual_machines.list(resource_group)}
+            vmss = {s.name for s in client.virtual_machine_scale_sets.list(resource_group)}
+        except ResourceNotFoundError:
+            return set(), set()
+        return vms, vmss
+
     def _compute_params(self, role: str) -> dict[str, Any]:
         cfg = self.cfg
         primary = role == "primary"
         outputs = self._foundation_outputs(role)
         view = foundation_view(outputs)
         template_dir = self._template_dir()
+        resource_group = cfg.resource_group_name if primary else cfg.dr_resource_group_name
+        existing_vms, existing_vmss = self._existing_compute(resource_group)
 
+        # v2: every nodePlan/agentPools item carries its own subnetId (set by
+        # the plan derivation from config) and an isNew flag read from Azure.
         nodes = [
-            item.to_bicep(node_custom_data(cfg, view, item, template_dir))
+            item.to_bicep(
+                node_custom_data(cfg, view, item, template_dir),
+                is_new=item.name not in existing_vms,
+            )
             for item in node_plan(cfg, role)
         ]
         pools = [
-            pool.to_bicep(agent_custom_data(cfg, view, pool, template_dir))
+            pool.to_bicep(
+                agent_custom_data(cfg, view, pool, template_dir),
+                is_new=pool.name not in existing_vmss,
+            )
             for pool in agent_pools(cfg, role)
         ]
         return {
             "name": cfg.name if primary else cfg.dr_name,
             "location": cfg.location if primary else cfg.dr.location,
-            "appSubnetId": outputs["appSubnetId"],
             "imageId": cfg.image_id(),
             "sshPublicKey": self._ssh_public_key(),
             "identityId": outputs["identityId"],
@@ -428,6 +502,82 @@ class Engine:
             )
         return results
 
+    #: PG replication roles that mean 'still a replica' (safe to re-assert).
+    _REPLICA_ROLES = frozenset({"asyncreplica", "geoasyncreplica"})
+
+    def _should_deploy_replica(self) -> bool:
+        """False when the DR replica exists but is no longer a replica.
+
+        Idempotency (5.3): after a failover promotes the replica to a
+        standalone/primary server, re-PUTting createMode=Replica would fail
+        (or worse). GET it first and gate the replica module instead.
+        """
+        cfg = self.cfg
+        try:
+            from azure.core.exceptions import ResourceNotFoundError
+            from azure.mgmt.postgresqlflexibleservers import PostgreSQLManagementClient
+        except ImportError:
+            return True
+        client = PostgreSQLManagementClient(self.deployer.credential, cfg.subscription_id)
+        try:
+            server = client.servers.get(cfg.dr_resource_group_name, cfg.replica_name)
+        except ResourceNotFoundError:
+            return True  # first run: create the replica
+        role = getattr(getattr(server, "replica", None), "role", None)
+        if role is None:
+            role = getattr(server, "replication_role", None)
+        role_value = str(getattr(role, "value", role) or "").lower()
+        if role_value in self._REPLICA_ROLES:
+            return True  # still a replica; the PUT converges
+        print(
+            f"    replica {cfg.replica_name}: exists and is "
+            f"{role_value or 'standalone'} (promoted); deployReplica=false"
+        )
+        return False
+
+    def _object_replication_state(
+        self, primary_account: str, dr_account: str
+    ) -> tuple[str, list[str]]:
+        """(policyId, [installers ruleId, backups ruleId]) of the existing
+        object-replication policy on the DESTINATION (DR) account.
+
+        Idempotency (5.4): the service mints policy/rule ids on first create;
+        re-deploys must echo them or ARM creates duplicate policies. First
+        run (or SDK unavailable): ('default', []) lets the service mint them.
+        The ruleIds order matches dr.bicep's rules array: installers, backups.
+        """
+        cfg = self.cfg
+        try:
+            from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
+            from azure.mgmt.storage import StorageManagementClient
+        except ImportError:
+            return ("default", [])
+        client = StorageManagementClient(self.deployer.credential, cfg.subscription_id)
+        try:
+            policies = list(
+                client.object_replication_policies.list(cfg.dr_resource_group_name, dr_account)
+            )
+        except (ResourceNotFoundError, HttpResponseError):
+            return ("default", [])
+        primary_lower = primary_account.lower()
+        for policy in policies:
+            # source_account is the account name or its full resource id,
+            # depending on the allowCrossTenantReplication setting.
+            source = str(getattr(policy, "source_account", "") or "").lower()
+            if source != primary_lower and not source.endswith(f"/{primary_lower}"):
+                continue
+            rules = {
+                str(rule.destination_container): str(rule.rule_id)
+                for rule in (policy.rules or [])
+                if getattr(rule, "rule_id", None)
+            }
+            rule_ids = [rules.get("installers", ""), rules.get("backups", "")]
+            policy_id = str(getattr(policy, "policy_id", "") or policy.name or "")
+            if policy_id and all(rule_ids):
+                print(f"    object replication: reusing existing policy {policy_id}")
+                return (policy_id, rule_ids)
+        return ("default", [])
+
     def phase_dr(self, what_if: bool = False) -> list[DeploymentResult]:
         """Subscription deployment of bicep/dr.bicep (replica, ASR vault, ...)."""
         cfg = self.cfg
@@ -436,6 +586,9 @@ class Engine:
             return []
         primary = self._foundation_outputs("primary")
         dr = self._foundation_outputs("dr")
+        or_policy_id, or_rule_ids = self._object_replication_state(
+            primary["blobAccountName"], dr["blobAccountName"]
+        )
         params = {
             "name": cfg.name,
             "primaryRg": cfg.resource_group_name,
@@ -444,11 +597,17 @@ class Engine:
             "drLocation": cfg.dr.location,
             "replicaName": cfg.replica_name,
             "replicaSkuName": cfg.replica_sku_name,
+            # Idempotency (5.3): never re-PUT createMode=Replica over a
+            # promoted (standalone) server.
+            "deployReplica": self._should_deploy_replica(),
             "primaryDatabaseServerId": primary["databaseServerId"],
             "drDataSubnetId": dr["dataSubnetId"],
             "drPostgresPrivateDnsZoneId": dr["postgresPrivateDnsZoneId"],
             "primaryBlobAccountName": primary["blobAccountName"],
             "drBlobAccountName": dr["blobAccountName"],
+            # Idempotency (5.4): echo the service-minted policy/rule ids.
+            "existingPolicyId": or_policy_id,
+            "existingRuleIds": or_rule_ids,
             "enableSiteRecovery": cfg.dr.enable_site_recovery,
             "trafficManager": {
                 "enabled": cfg.dr.traffic_manager,
@@ -469,7 +628,6 @@ class Engine:
             return
         from ctmdeploy import replication
 
-        primary = self._foundation_outputs("primary")
         dr = self._foundation_outputs("dr")
         compute = self._saved_outputs(
             ResourceGroupScope(cfg.resource_group_name), f"{cfg.name}-compute", "compute"
@@ -477,11 +635,11 @@ class Engine:
         dr_deploy = self._saved_outputs(
             SubscriptionScope(cfg.location), f"{cfg.name}-dr", "dr"
         )
+        # v2: the VNet pairs (utility -> DR utility, each server VNet -> its
+        # DR VNet) and per-component target subnets come straight from config.
         replication.ensure(
             cfg,
             compute["nodes"],
-            primary_vnet_id=primary["vnetId"],
-            dr_vnet_id=dr["vnetId"],
             cache_storage_account_id=dr_deploy["cacheStorageAccountId"],
             dr_lb_backend_pool_id=dr.get("lbBackendPoolId", "") or "",
             credential=self.deployer.credential,

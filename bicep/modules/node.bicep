@@ -31,6 +31,9 @@ param sshPublicKey string
 @secure()
 param customData string
 
+@description('true = the VM does not exist yet (the orchestrator checks). customData is immutable after create, so re-deploys must not send it.')
+param isNew bool = true
+
 @description('Persistent data disk size (GB) for the Control-M home/installation directory.')
 param dataDiskGb int
 
@@ -141,7 +144,9 @@ resource vm 'Microsoft.Compute/virtualMachines@2024-07-01' = {
     osProfile: {
       computerName: name
       adminUsername: adminUsername
-      customData: base64(customData)
+      // customData is create-time-only on a VM; null omits it on re-deploys so
+      // an incremental deployment never tries to change an immutable property.
+      customData: isNew ? base64(customData) : null
       linuxConfiguration: {
         disablePasswordAuthentication: true
         provisionVMAgent: true

@@ -1,4 +1,7 @@
-// Resource-group-scope entry point: the Control-M foundation for ONE region.
+// Resource-group-scope entry point: the Control-M foundation for ONE region,
+// anchored on that region's UTILITY VNet (EM + LB frontend, delegated data
+// subnet, private endpoints). Per-server VNets only receive DNS links here;
+// their VMs/VMSS are placed by the compute phase.
 //   role = primary : network refs, identity/Key Vault, storage, PostgreSQL,
 //                    load balancer, platform DNS, observability.
 //   role = dr      : same foundation without the database — the ctm-db alias
@@ -17,8 +20,14 @@ param role string
 @description('3-6 lowercase alphanumerics making globally-unique names (storage, key vault, postgres) unique.')
 param uniqueSuffix string
 
-@description('Existing network to deploy into, config.yaml shape: vnet_name, vnet_resource_group_name, app_subnet_name, data_subnet_name, pe_subnet_name, existing_private_dns_zone_ids.')
+@description('Existing network to deploy into, config.yaml v2 shape: utility {vnet_name, vnet_resource_group_name, em_subnet_name, data_subnet_name, pe_subnet_name} + existing_private_dns_zone_ids. The orchestrator passes the role-appropriate block (network: or dr.network:).')
 param network object
+
+@description('Deduped list of EVERY VNet in this platform region (utility + each server VNet + agent overrides + extra_dns_vnets), computed by the orchestrator. Items: {name, resourceGroupName}. Each private DNS zone created here is linked to all of them.')
+param allVnets array
+
+@description('Registration-enabled links for the platform private DNS zone, one per VNet in this region, computed by the orchestrator. Items: {name, vnetId}.')
+param dnsVnetLinks array
 
 @description('Platform private DNS zone (same name in primary and DR so failed-over nodes keep resolving ctm-db / ctm-web), e.g. prod.ctm.internal.')
 param privateDnsZoneName string
@@ -80,16 +89,12 @@ var platformTags = union(tags, {
 // One database per Control-M/Server (ctm_<stage>) plus the EM database.
 var databaseNames = concat([emDbName], map(objectKeys(servers), stage => 'ctm_${stage}'))
 
-// ---------------- Existing network ----------------
+// ---------------- Existing network (utility VNet + zone links) ----------------
 module net 'modules/network.bicep' = {
   name: '${name}-network'
   params: {
-    namePrefix: name
-    vnetName: network.vnet_name
-    vnetResourceGroupName: network.vnet_resource_group_name
-    appSubnetName: network.app_subnet_name
-    dataSubnetName: network.data_subnet_name
-    peSubnetName: network.?pe_subnet_name ?? ''
+    utility: network.utility
+    allVnets: allVnets
     existingPrivateDnsZoneIds: network.?existing_private_dns_zone_ids ?? {}
     postgresDnsZonePrefix: '${compact}${uniqueSuffix}'
     tags: platformTags
@@ -148,6 +153,10 @@ module db 'modules/database.bicep' = if (databaseCreate) {
     highAvailabilityMode: database.?high_availability_mode ?? 'ZoneRedundant'
     backupRetentionDays: database.?backup_retention_days ?? 14
     geoRedundantBackup: database.?geo_redundant_backup ?? false
+    // The orchestrator injects the LIVE zones when the server already exists,
+    // so a re-deploy does not fight an HA zone swap back (idempotency).
+    availabilityZone: database.?availability_zone ?? '1'
+    standbyZone: database.?standby_zone ?? '2'
     administratorLogin: database.?admin_user ?? 'ctmadmin'
     administratorPassword: databaseAdminPassword
     databases: databaseNames
@@ -162,7 +171,7 @@ module lb 'modules/load-balancer.bicep' = {
     name: name
     location: location
     internal: loadBalancer.?internal ?? true
-    subnetId: net.outputs.appSubnetId
+    subnetId: net.outputs.emSubnetId
     publicDnsLabel: loadBalancer.?public_dns_label ?? ''
     webPort: loadBalancer.?web_port ?? 8443
     tags: platformTags
@@ -177,7 +186,7 @@ module dnsZone 'modules/dns.bicep' = {
   name: '${name}-dns'
   params: {
     zoneName: privateDnsZoneName
-    vnetId: net.outputs.vnetId
+    vnetLinks: dnsVnetLinks
     aRecords: { 'ctm-web': lb.outputs.frontendIp }
     cnameRecords: postgresFqdn != '' ? { 'ctm-db': postgresFqdn } : {}
     tags: platformTags
@@ -201,10 +210,10 @@ module obs 'modules/observability.bicep' = {
 // ---------------------------------------------------------------------------
 // Outputs consumed by the compute / dr phases.
 // ---------------------------------------------------------------------------
-output appSubnetId string = net.outputs.appSubnetId
+output emSubnetId string = net.outputs.emSubnetId
 output dataSubnetId string = net.outputs.dataSubnetId
 output peSubnetId string = net.outputs.peSubnetId
-output vnetId string = net.outputs.vnetId
+output vnetId string = net.outputs.utilityVnetId
 output postgresPrivateDnsZoneId string = net.outputs.postgresPrivateDnsZoneId
 output identityId string = sec.outputs.identityId
 output identityClientId string = sec.outputs.identityClientId
