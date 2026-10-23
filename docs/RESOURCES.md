@@ -13,22 +13,25 @@ are created by `ctmdeploy` through SDK / REST data-plane calls and will not
 appear in `whatif` output or deployment history.
 
 Deployment names: `ctm-<env>-<phase>[-dr]` (e.g. `ctm-prod-foundation-dr`);
-the optional network phase is `ctm-<env>-network`.
+the optional network phase is `ctm-<env>-network`, the access phase
+`ctm-<env>-access`.
 
-## Phase `network` — optional full network (`bicep/network.bicep`)
+## Phase `network` — optional full network (`network/main.bicep`)
 
 Runs **only** when `network_infrastructure.create: true` (default is
 bring-your-own, where this phase is skipped and nothing below exists). One
-subscription-scope deployment covers both regions. Counts assume the shipped
-PoC vnets list with the flag flipped on.
+subscription-scope deployment covers both regions; the **same template and
+plan** can instead be deployed by the cloud team with the az CLI alone from
+`network/params/<env>.bicepparam` (see `network/README.md`). Counts assume
+the shipped PoC vnets list with the flag flipped on.
 
 | Resource type | Name | Scope / RG | Condition | nonprod | prod primary | prod DR |
 |---|---|---|---|---|---|---|
-| Resource group | `rg-network-prod` (nonprod: `rg-network-nonprod`; DR: `rg-network-prod-dr`) | subscription | deduped from `vnets[].resource_group_name`; location = first VNet naming it | 1 | 1 | 1 |
-| Virtual network | `vnet-prod-utility`, `vnet-ctm-uat`, `vnet-ctm-prod` (nonprod: `vnet-dev-utility`, `vnet-ctm-dev`, `vnet-ctm-qa`; DR: `vnet-dr-utility`, `vnet-ctm-prod-dr`) | network RG | one per `vnets[]` entry | 3 | 3 | 2 |
-| Subnet | per `vnets[].subnets[]`; `data` role carries the `Microsoft.DBforPostgreSQL/flexibleServers` delegation, `pe` role has `privateEndpointNetworkPolicies: Disabled` | inside its VNet | — | 7 | 7 | 5 |
-| Network security group | `<vnet>-<subnet>-nsg`, e.g. `vnet-prod-utility-snet-ctm-em-nsg` | network RG | one per subnet; rules derived from the subnet `role` (see NETWORK-REQUIREMENTS.md Option A) | 7 | 7 | 5 |
-| VNet peering | `<src>-to-<dst>`, e.g. `vnet-ctm-prod-to-vnet-prod-utility` and `vnet-prod-utility-to-vnet-ctm-prod` | each side's RG | two per spoke (both directions); spokes are never peered to each other | 4 | 4 | 2 |
+| Resource group | `rg-network-prod` (nonprod: `rg-network-nonprod`; DR: `rg-network-prod-dr`) | subscription | deduped from `vnets[].resource_group_name`; location = first VNet naming it; `role: external` entries create nothing | 1 | 1 | 1 |
+| Virtual network | `vnet-prod-utility`, `vnet-ctm-uat`, `vnet-ctm-prod`, `vnet-ctm-build` (nonprod: `vnet-dev-utility`, `vnet-ctm-dev`, `vnet-ctm-qa`; DR: `vnet-dr-utility`, `vnet-ctm-prod-dr`) | network RG | one per non-external `vnets[]` entry | 3 | 4 | 2 |
+| Subnet | per `vnets[].subnets[]`; delegations: `data` → `Microsoft.DBforPostgreSQL/flexibleServers`, `func` → `Microsoft.Web/serverFarms`; `pe` has `privateEndpointNetworkPolicies: Disabled`; the `bastion` role is force-named `AzureBastionSubnet` | inside its VNet | — | 9 | 11 | 5 |
+| Network security group | `<vnet>-<subnet>-nsg`, e.g. `vnet-prod-utility-snet-ctm-appgw-nsg` | network RG | one per subnet **except the bastion subnet** (Azure Bastion manages its own data plane); rules derived from the subnet `role` (see NETWORK-REQUIREMENTS.md) | 8 | 10 | 5 |
+| VNet peering | `<src>-to-<dst>`, e.g. `vnet-prod-utility-to-vnet-dr-utility` | each side's RG | two per declared pairing: spoke ⇄ utility, prod-utility ⇄ dr-utility (**global**), build ⇄ each utility. Config-driven prod skips the cross-plan build ⇄ vnet-dev-utility pair (reported in `unresolvedPeerings`); the bicepparam plan's `external` entry emits it, adding 1 more here and 1 into `rg-network-nonprod` | 4 | 8 | 4 |
 
 ## Phase `rg` — resource groups (`bicep/rg.bicep`)
 
@@ -96,7 +99,11 @@ update). Full inventory, consumers and rotation: `docs/KEYVAULT.md`.
 
 Primary: `ctm-prod-compute` (full fleet). DR: `ctm-prod-compute-dr` — **no
 VMs** (DR VMs arrive via Site Recovery), only the warm agent pools of the
-DR-protected Servers; VM backup is forced off in DR.
+DR-protected Servers; VM backup is forced off in DR. Before either ARM
+deployment the phase **uploads `node-scripts/ctm_node_install.py`** to
+`scripts/ctm_node_install.py` in every region's installers container
+(data-plane, python; overwrite) so the installer the nodes fetch at boot is
+always the repo version being deployed.
 
 Prod nodes: `ctm-em-a`, `ctm-em-b`, `ctm-srv-uat-a/b`, `ctm-srv-prod-a/b`
 (6). Nonprod nodes: `ctm-em-a`, `ctm-srv-dev-a`, `ctm-srv-qa-a/b` (4;
@@ -104,12 +111,13 @@ Prod nodes: `ctm-em-a`, `ctm-em-b`, `ctm-srv-uat-a/b`, `ctm-srv-prod-a/b`
 
 | Resource type | Name | Scope / RG | Condition | nonprod | prod primary | prod DR |
 |---|---|---|---|---|---|---|
+| Blob (**data-plane, python**) | `scripts/ctm_node_install.py` — the idempotent node installer every cloud-init shim fetches and runs | `installers` container, primary + DR accounts | uploaded first, every compute run (and by `media upload`) | 1 | 1 | 1 |
 | Network interface | `<node>-nic` (accelerated networking; EM NICs join the LB pool `em-web`) | platform RG → each node's `subnetId` | per node | 4 | 6 | 0 |
 | Managed disk (data) | `<node>-data` (`data_disk_gb`, `disk_type`; ZRS disks are regional, LRS pinned to the zone) | platform RG | per node | 4 | 6 | 0 |
-| Virtual machine (+ OS disk `<node>-osdisk`) | `<node>`, e.g. `ctm-srv-prod-a` — zonal, boots the gallery image, user-assigned identity, `customData` = rendered cloud-init (sent only when the VM is new) | platform RG | per node | 4 | 6 | 0 |
+| Virtual machine (+ OS disk `<node>-osdisk`) | `<node>`, e.g. `ctm-srv-prod-a` — zonal, boots the **base** gallery image (`image.base`, OS only), user-assigned identity, `customData` = rendered cloud-init (sent only when the VM is new) | platform RG | per node | 4 | 6 | 0 |
 | VM extension | `AzureMonitorLinuxAgent` (managed-identity auth) | per VM | per node | 4 | 6 | 0 |
 | DCR association | `<node>-dcra` → `ctm-<env>-dcr-linux` | per VM | per node | 4 | 6 | 0 |
-| VM scale set (Uniform) | `ctm-prod-agents-uat`, `ctm-prod-agents-prod` (DR: `ctm-prod-dr-agents-prod`, min 0 / default `dr.warm_agents`) — zones per config, Spot optional, terminate scheduled events, embedded AMA extension | platform RG → each pool's `subnetId` | one per Server; DR: DR-protected Servers only | 2 | 2 | 1 |
+| VM scale set (Uniform) | `ctm-prod-agents-uat`, `ctm-prod-agents-prod` (DR: `ctm-prod-dr-agents-prod`, min 0 / default `dr.warm_agents`) — zones per config, Spot optional, terminate scheduled events, embedded AMA extension; instances **boot the `ctm-agent` gallery image** (`image.agent` — the Control-M/Agent is BAKED in, unconfigured) and at first boot only configure + start + register it; they carry the shared node identity (Storage Blob Data Reader) to fetch `scripts/ctm_node_install.py` from blob (the fetch fails fast with a clear error on a 403) | platform RG → each pool's `subnetId` | one per Server; DR: DR-protected Servers only | 2 | 2 | 1 |
 | Autoscale setting | `<vmss>-autoscale` (CPU out 5 min / in 15 min, bounds from `agents.min/max`) | platform RG | per pool | 2 | 2 | 1 |
 | DCR association | `<vmss>-dcra` | per VMSS | per pool | 2 | 2 | 1 |
 | Recovery Services vault | `ctm-prod-rsv` (redundancy `backup.storage_mode_type`, cross-region restore per config) | platform RG | `backup.enabled`; never in DR | 1 | 1 | 0 |
@@ -119,6 +127,28 @@ Prod nodes: `ctm-em-a`, `ctm-em-b`, `ctm-srv-uat-a/b`, `ctm-srv-prod-a/b`
 | Backup policy (file share) | `ctm-prod-files-daily` | vault | `backup.include_files_share` | 1 | 1 | 0 |
 | Protected item (file share) | `AzureFileShare;ctm-shared` | vault | `backup.include_files_share` | 1 | 1 | 0 |
 | Metric alert | `ctm-prod-<node>-unavailable` (`VmAvailabilityMetric` < 1, sev 1) | on each VM | `vmAvailabilityAlerts` (always passed true) | 4 | 6 | 0 |
+
+## Phase `access` — Bastion, global gateway, kvsync, build agents (`bicep/access.bicep`)
+
+Subscription-scope deployment `ctm-<env>-access`, after `compute` (it needs
+the foundation LB frontend IPs) and before `dr`. Skipped entirely when
+`access.bastion`/`access.appgw`, `kv_sync` and `build_agents` are all
+disabled. The gateway is **honored on prod only** (it balances the primary
+AND DR internal LBs); nonprod gets Bastion + kvsync.
+
+| Resource type | Name | Scope / RG | Condition | nonprod | prod primary | prod DR |
+|---|---|---|---|---|---|---|
+| Public IP (Standard, static) | `ctm-prod-bastion-pip` — Azure Bastion's own control-plane endpoint, **not** an entry point to any VM | platform RG | `access.bastion.enabled` | 1 | 1 | 0 |
+| Azure Bastion (Standard) | `ctm-prod-bastion` in `AzureBastionSubnet` (native-client tunneling + IP connect on) | platform RG | `access.bastion.enabled` | 1 | 1 | 0 |
+| Application Gateway (Standard_v2, **private-only frontend**) | `ctm-prod-appgw` in `snet-ctm-appgw`: static private frontend IP (first assignable host of the subnet), autoscale 1→2, **layer-4 TCP** listeners 443 + 8443, one backend pool = [primary LB frontend IP, DR LB frontend IP], TCP health probe → healthy-only (automatic primary/DR) routing | platform RG | `access.appgw.enabled` **and prod** | 0 | 1 | 0 |
+| DNS A record | `ctm-global` → the gateway's private frontend IP (TTL 60) | `prod.ctm.internal` zone, platform RG | with the gateway | 0 | 1 | 0 |
+| Storage account (Standard_LRS) | `<compact>func<hash>` (deterministic `uniqueString` suffix) — Functions host state + durable task hub only, no platform data | platform RG | `kv_sync.enabled` | 1 | 1 | 0 |
+| App Service plan (EP1 Linux Elastic Premium) | `ctm-prod-kvsync-plan` (warm instance — billed around the clock; nonprod may disable) | platform RG | `kv_sync.enabled` | 1 | 1 | 0 |
+| Function App (python 3.11, system-assigned MI) | `ctm-prod-kvsync` — VNet-integrated into `snet-ctm-func` (`vnetRouteAllEnabled`); app settings `KEY_VAULT_URI`, `CTM_API_BASE`, `SYNC_SCHEDULE`, `CTM_VERIFY_TLS`; **code arrives separately** via `ctmdeploy kvsync deploy` (zip-deploy, data-plane) | platform RG | `kv_sync.enabled` | 1 | 1 | 0 |
+| Role assignment | Key Vault Secrets User → the Function App's system identity (deterministic GUID name; read-only — the function never writes the vault) | Key Vault scope | `kv_sync.enabled` | 1 | 1 | 0 |
+| Resource group | `ctm-build-rg` | subscription, primary region | `build_agents.enabled` | 0 | 1 | — |
+| User-assigned managed identity | `ctm-build-id` (dedicated to the build agents; **no role grants** — pipeline deployments authenticate via WIF) | `ctm-build-rg` | `build_agents.enabled` | 0 | 1 | — |
+| VM scale set (Uniform) | `ctm-build-agents` — Ubuntu 22.04 Gen2, Manual upgrade, overprovision off, **no autoscale** (the ADO elastic pool owns capacity), ssh-only `ctmops`, cloud-init installs python3.11 + unzip + curl + the pinned checksum-verified bicep CLI | `ctm-build-rg` → `snet-ctm-build` | `build_agents.enabled` | 0 | 1 | — |
 
 ## Phase `dr` — cross-region DR plumbing (`bicep/dr.bicep`, prod only)
 
@@ -159,20 +189,25 @@ manually. Blob names must match `installer_blobs`; layout/mapping rules in
 
 | Resource type | Name | Scope / RG | Condition | nonprod | prod primary | prod DR |
 |---|---|---|---|---|---|---|
-| Blob (**data-plane, python**) | `em/DREM.9.0.21.300_Linux-x86_64.tar.Z`, `em/silent-em-primary.xml`, `em/silent-em-secondary.xml`, `server/DRSRV.9.0.21.300_Linux-x86_64.tar.Z`, `server/silent-server-primary.xml`, `server/silent-server-secondary.xml` | `installers` container of each blob account | DR container only when `dr.enabled` (object replication also copies primary→DR) | 6 | 6 | 6 |
+| Blob (**data-plane, python**) | `em/DREM.9.0.21.300_Linux-x86_64.tar.Z`, `em/silent-em-primary.xml`, `em/silent-em-secondary.xml`, `server/DRSRV.9.0.21.300_Linux-x86_64.tar.Z`, `server/silent-server-primary.xml`, `server/silent-server-secondary.xml` — EM/Server media ONLY (v4.1: agent media feeds the Packer `ctm-agent` image build, never blob) | `installers` container of each blob account | DR container only when `dr.enabled` (object replication also copies primary→DR) | 6 | 6 | 6 |
+| Blob (**data-plane, python**) | `scripts/ctm_node_install.py` (uploaded alongside the media so script and media stay in lock-step; the compute phase uploads it too) | `installers` container of each blob account | — | 1 | 1 | 1 |
 
 ## Golden image (shared across environments)
 
 `python -m ctmdeploy image gallery` ensures the resource group and deploys
 `bicep/images.bicep` (deployment `ctm-images`); Packer publishes the
 versions. These are shared by nonprod and prod — one gallery per
-subscription, not per environment. The image contains the **OS only**; BMC
-software is installed at provision time (see `packer/README.md`).
+subscription, not per environment. v4.1 two-image model: `ctm-rhel9` is the
+**OS only** (EM/Server install at provision time) and `ctm-agent` is the OS
+prep **plus the Control-M/Agent baked in** — silent-installed at image-build
+time from the `control-m-agent` package, unconfigured, never started or
+registered until boot (see `packer/README.md`).
 
 | Resource type | Name | Scope / RG | Condition | Count |
 |---|---|---|---|---|
 | Resource group | `ctm-images-rg` | subscription, primary region | created by `ctmdeploy image gallery` (python `ensure_resource_group`) | 1 |
 | Compute Gallery | `ctmgallery` | `ctm-images-rg` | — | 1 |
-| Gallery image definition | `ctm-rhel9` (Linux, Gen2, x64) | gallery | — | 1 |
-| Gallery image version (**published by Packer**, never Bicep) | `<x.y.z>`, replicated to eastus2 + centralus | image definition | one per `ctmdeploy image build --version` | per build |
+| Gallery image definition | `ctm-rhel9` (Linux, Gen2, x64 — base, OS only) | gallery | — | 1 |
+| Gallery image definition | `ctm-agent` (Linux, Gen2, x64 — agent baked in, unconfigured) | gallery | — | 1 |
+| Gallery image version (**published by Packer**, never Bicep) | `<x.y.z>`, replicated to eastus2 + centralus | either image definition | one per `ctmdeploy image build --image base\|agent --version` | per build |
 | Temporary build RG + VM (**Packer, transient**) | Packer-managed names | subscription | exists only during a build | 0 after build |

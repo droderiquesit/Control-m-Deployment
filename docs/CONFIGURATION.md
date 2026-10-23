@@ -12,7 +12,7 @@ Types and defaults below are the ones enforced by
 `deploy/ctmdeploy/config.py`; a missing key with a default simply takes the
 default, a missing key without one fails the load with a path-qualified
 error. Phases (`--phase`): `network → rg → foundation → secrets → compute →
-dr → replication` (see `docs/SETUP.md`).
+access → dr → replication` (see `docs/SETUP.md`).
 
 ## Top level
 
@@ -26,8 +26,8 @@ dr → replication` (see `docs/SETUP.md`).
 | `tags` | map string→string | `{}` | — | merged into the platform tags on every resource | all phases |
 | `deployer_ip_cidrs` | list of CIDR strings | `[]` | — | public CIDRs allowed through the Key Vault and blob storage firewalls (CI runners, admins) | `foundation` |
 | `key_vault_public_access` | bool | `true` | — | Key Vault `publicNetworkAccess` (still firewall-restricted to `deployer_ip_cidrs`); set `false` when seeding runs from inside the VNets | `foundation` |
-| `ctm_version` | string | `"9.0.21.300"` | — | the media cache directory on the NFS share (`installers/<component>/<version>`) in cloud-init; does **not** change blob names — see `installer_blobs` | `compute` (cloud-init render) |
-| `installer_blobs` | map | `{}` (= all defaults below) | keys limited to the six below | blob names (inside the `installers` container) the nodes download at first boot; also what `ctmdeploy media upload` checks for completeness | `compute` (cloud-init), `media upload` |
+| `ctm_version` | string | `"9.0.21.300"` | — | the media cache directory on the NFS share (`installers/<component>/<version>`) used by the node installer; does **not** change blob names — see `installer_blobs` | `compute` (cloud-init render / node.json) |
+| `installer_blobs` | map | `{}` (= all defaults below) | keys limited to the six below (v4.1: the old `agent_installer`/`agent_silent` keys are rejected — the agent is baked into the ctm-agent image) | blob names (inside the `installers` container) the EM/Server nodes download at first boot; also what `ctmdeploy media upload` checks for completeness | `compute` (cloud-init / node.json), `media upload` |
 
 `installer_blobs` defaults (override any subset):
 
@@ -59,49 +59,103 @@ under `servers.<stage>.network`.
 
 ## `network_infrastructure:` — optional full network ("Option A")
 
-With `create: false` (the default, bring-your-own) this block is **inert
-documentation** of the address plan — only its shape is validated. Flipping
-`create: true` makes `ctmdeploy deploy --env <env> --phase network` provision
-everything in `vnets` (resource groups, VNets, subnets, one NSG per subnet,
-spoke ⇄ utility peering) **and** turns on cross-validation: every VNet/subnet
-the placement blocks reference (`network.utility`, every
-`servers.<stage>.network`, `dr.network.utility`, `dr.server_networks.*`) must
-resolve to a declared entry with the right subnet role, address spaces must
-parse and not overlap (across VNets and inside each VNet), and every spoke
-must `peer_to` a declared utility VNet. See
-`docs/NETWORK-REQUIREMENTS.md` (Option A) for the NSG rule sets each subnet
+With `create: false` (the default, bring-your-own) this block documents the
+address plan — only its shape is validated — **and** still feeds the access
+layer its subnet ids (the bastion/appgw/func subnets are resolved by *role*
+from the utility VNet's entry, created or not). Flipping `create: true` makes
+`ctmdeploy deploy --env <env> --phase network` provision everything in
+`vnets` by deploying **`network/main.bicep`** — the standalone folder the
+cloud team can deploy with the az CLI alone (`network/README.md`; keep
+`network/params/<env>.bicepparam` in sync with this block) — and turns on
+cross-validation: every VNet/subnet the placement blocks reference
+(`network.utility`, every `servers.<stage>.network`, `dr.network.utility`,
+`dr.server_networks.*`, `build_agents.network`) must resolve to a declared
+entry with the right subnet role, address spaces must parse and not overlap
+(across VNets and inside each VNet), and peerings must follow the role rules
+below. See `docs/NETWORK-REQUIREMENTS.md` for the NSG rule sets each subnet
 role derives.
 
 | Key | Type | Default | Allowed values | What it changes | Consumed by |
 |-----|------|---------|----------------|-----------------|-------------|
-| `create` | bool | `false` | — | `true` = the `network` phase deploys `bicep/network.bicep`; `false` = phase skipped, block inert | `network` |
-| `user_access_cidrs` | list of CIDR strings | `[]` | valid CIDRs | NSG allow rule on **em** subnets: TCP 443, 8443 (Control-M Web / Automation API / thick client) from these sources; empty = no user-access rule is created | `network` |
-| `bastion_cidrs` | list of CIDR strings | `[]` | valid CIDRs | NSG allow rule on em/server/agents subnets: TCP 22 (operator SSH); empty = no SSH rule | `network` |
+| `create` | bool | `false` | — | `true` = the `network` phase deploys `network/main.bicep`; `false` = phase skipped, block stays the documented plan (+ access-layer subnet resolution) | `network`, `access` (subnet ids) |
+| `user_access_cidrs` | list of CIDR strings | `[]` | valid CIDRs | NSG allow rule on **em** and **appgw** subnets: TCP 443, 8443 from these sources. Prod must keep the appgw subnet prefix — the gateway's backend connections to both regions' internal LBs ride this rule | `network` |
+| `bastion_cidrs` | list of CIDR strings | `[]` | valid CIDRs | NSG allow rule on em/server/agents/build subnets: TCP 22. Keep the `AzureBastionSubnet` prefixes — Bastion sessions egress from them | `network` |
 | `vnets[].name` | string | — (required) | unique across the list | VNet name (must match the placement blocks when `create: true`) | `network` |
 | `vnets[].resource_group_name` | string | — (required) | — | resource group the VNet lands in (created, deduped across entries) | `network` |
 | `vnets[].location` | string | — (required) | any Azure region | region of the VNet (and of its resource group, taken from the first VNet naming it) — DR VNets carry the DR region | `network` |
-| `vnets[].role` | string | — (required) | `utility`, `spoke` | `utility` hosts em/data/pe subnets; `spoke` hosts a server/agents pair and must set `peer_to` | `network` |
-| `vnets[].peer_to` | string | `""` | name of a declared `utility` VNet; **required** on spokes, forbidden on utility | creates the bidirectional spoke ⇄ utility peering (`<src>-to-<dst>`, both directions) | `network` |
+| `vnets[].role` | string | — (required) | `utility`, `spoke`, `build`, `external` | `utility` hosts em/data/pe (+ bastion/appgw/func) subnets; `spoke` hosts a server/agents pair; `build` hosts the ADO build agents; `external` is **resolution-only** — the name/resource group/address space of a VNet ANOTHER plan deploys (no subnets, no peer_to of its own; nothing is created), so cross-environment peerings resolve — the prod config declares the nonprod `vnet-dev-utility` this way for the build-VNet peering (same semantics as `network/params/*.bicepparam`) | `network` |
+| `vnets[].peer_to` | string **or list** | `""` | spokes: exactly ONE declared `utility` VNet; utility: other `utility` VNets only (the prod ⇄ DR **global** pairing); build: one or more utility VNets — names from the *other* environment's plan are tolerated (cross-environment peering; `network/main.bicep` skips unresolved names and reports them in `unresolvedPeerings`) | bidirectional peerings (`<src>-to-<dst>`, both directions, declared on one side only) | `network` |
 | `vnets[].address_space` | string | — (required) | valid CIDR, non-overlapping with every other entry | the VNet address space; also the source prefix in the derived NSG rules | `network` |
-| `vnets[].subnets[].name` | string | — (required) | unique inside the VNet | subnet name | `network` |
+| `vnets[].subnets[].name` | string | — (required) | unique inside the VNet; a role-`bastion` subnet must be named exactly `AzureBastionSubnet` (validated at load) | subnet name | `network` |
 | `vnets[].subnets[].prefix` | string | — (required) | valid CIDR inside the VNet, non-overlapping with sibling subnets | subnet prefix | `network` |
-| `vnets[].subnets[].role` | string | — (required) | `em`, `data`, `pe`, `server`, `agents` | selects the NSG rule set; `data` additionally gets the PostgreSQL delegation, `pe` gets `privateEndpointNetworkPolicies: Disabled` | `network` |
+| `vnets[].subnets[].role` | string | — (required) | `em`, `data`, `pe`, `server`, `agents`, `bastion`, `appgw`, `func`, `build` | selects the NSG rule set; `data` gets the PostgreSQL delegation, `func` the `Microsoft.Web/serverFarms` delegation, `pe` gets `privateEndpointNetworkPolicies: Disabled`, `bastion` gets **no NSG** | `network`; `bastion`/`appgw`/`func` also resolve the `access` phase's subnet ids |
 
 The shipped config files carry the complete PoC address plan with
 `create: false`, so provisioning the PoC network is a one-flag change (see
 the address plan table in `docs/NETWORK-REQUIREMENTS.md`).
 
-## `image:` — golden image every VM/VMSS boots from
+## `access:` — Bastion and the private Application Gateway
 
-The image contains the **operating system only** (RHEL 9 + OS prep). BMC
-software is never baked in — see `packer/README.md`.
+Deployed by `ctmdeploy deploy --env <env> --phase access`
+(`bicep/access.bicep`), after `compute` and before `dr`.
+
+| Key | Type | Default | Allowed values | What it changes | Consumed by |
+|-----|------|---------|----------------|-----------------|-------------|
+| `bastion.enabled` | bool | `false` | — | Azure Bastion Standard `ctm-<env>-bastion` (+ its required static public IP) in the utility VNet's `AzureBastionSubnet`; private SSH to every node and build agent, DR included via the global peering | `access` |
+| `appgw.enabled` | bool | `false` | parsed everywhere, **honored on prod only** | the PRIVATE Application Gateway Standard_v2 `ctm-<env>-appgw` in `snet-ctm-appgw`: layer-4 TCP 443/8443 listeners, one backend pool holding the **primary and DR internal LB frontend IPs** (healthy-only routing = automatic primary/DR), plus the `ctm-global` A record in the platform DNS zone | `access` |
+
+## `kv_sync:` — Key Vault → Control-M secret sync
+
+The Durable Function (`functions/kvsync/`) that mirrors Key Vault secrets
+tagged `ctm-sync=true` into Control-M through the EM Automation API. The
+`access` phase provisions the infrastructure (EP1 plan, `<name>-kvsync`
+Function App, system-assigned identity with **Key Vault Secrets User**, VNet
+integration into `snet-ctm-func`); `ctmdeploy kvsync deploy --env <env>`
+pushes the code. Tagging convention and runtime details:
+`functions/kvsync/README.md`, `docs/KEYVAULT.md`.
+
+| Key | Type | Default | Allowed values | What it changes | Consumed by |
+|-----|------|---------|----------------|-----------------|-------------|
+| `enabled` | bool | `false` | — | deploy the Function App infrastructure (and let `kvsync deploy` run). COST NOTE: EP1 keeps a warm instance billed around the clock; nonprod may set `false` | `access`, `kvsync deploy` |
+| `schedule` | string | `"0 */15 * * * *"` | a **6-field** NCRONTAB expression (seconds first; validated at load) | the `SYNC_SCHEDULE` app setting — how often the sync orchestration runs | `access` |
+
+## `build_agents:` — Azure DevOps scale-set build agents (prod config)
+
+A uniform VMSS `ctm-build-agents` (Ubuntu 22.04, Manual upgrade, **no
+autoscale** — the ADO elastic pool owns capacity) in its own resource group,
+deployed by the `access` phase. Its VNet peers to the nonprod, prod and DR
+utility VNets so one pool deploys into all three platforms. Post-step
+(documented, never granted by templates): register the VMSS as an ADO
+elastic pool; ADO's service principal needs Virtual Machine Contributor on
+the resource group (`docs/AZURE-DEVOPS.md` §6, `docs/IDENTITY-PERMISSIONS.md`).
+
+| Key | Type | Default | Allowed values | What it changes | Consumed by |
+|-----|------|---------|----------------|-----------------|-------------|
+| `enabled` | bool | `false` | — | deploy the build-agent resource group + VMSS + its dedicated user-assigned identity `ctm-build-id` | `access` |
+| `resource_group` | string | `ctm-build-rg` | — | the dedicated resource group (created by the access phase) | `access` |
+| `vm_size` | string | `Standard_D4s_v5` | — | agent VM size | `access` |
+| `instances` | int | `2` | ≥ 1 when enabled | baseline capacity sent on deploys; the ADO elastic pool scales from there | `access` |
+| `network.vnet_name` | string | — (required when enabled) | the build VNet (`vnet-ctm-build`) | where the scale set lands | `access` |
+| `network.vnet_resource_group_name` | string | — (required when enabled) | — | resource group of that VNet | `access` |
+| `network.subnet_name` | string | — (required when enabled) | — | the build subnet (`snet-ctm-build`) | `access` |
+
+## `image:` — golden images the VMs/VMSS boot from (v4.1 two-image model)
+
+Nested shape: `base` is the **OS-only** `ctm-rhel9` image (EM/Server VMs —
+BMC software is never baked into it) and `agent` is the `ctm-agent` image
+with the **Control-M/Agent baked in, unconfigured** (the agent scale sets;
+boot only configures/starts/registers it). See `packer/README.md`. The
+pre-v4.1 flat keys `image_definition`/`image_version` are **rejected** with
+a pointer to this shape.
 
 | Key | Type | Default | Allowed values | What it changes | Consumed by |
 |-----|------|---------|----------------|-----------------|-------------|
 | `gallery_resource_group` | string | `ctm-images-rg` | — | resource group of the Compute Gallery | `compute`, `image gallery` |
 | `gallery_name` | string | `ctmgallery` | — | Compute Gallery name | `compute`, `image gallery` |
-| `image_definition` | string | `ctm-rhel9` | — | gallery image definition | `compute`, `image gallery` |
-| `image_version` | string | `latest` | `latest` or a published semver such as `"1.0.0"` | the exact gallery image version resolved into the VM/VMSS `imageReference`; pin in prod | `compute` |
+| `base.definition` | string | `ctm-rhel9` | — | gallery image definition of the EM/Server (OS-only) image | `compute` (`imageId`), `image gallery/build` |
+| `base.version` | string | `latest` | `latest` or a published semver such as `"1.0.0"` | the exact base image version resolved into the VM `imageReference`; pin in prod | `compute` |
+| `agent.definition` | string | `ctm-agent` | — | gallery image definition of the agent image (Control-M/Agent baked in) | `compute` (`agentImageId`), `image gallery/build` |
+| `agent.version` | string | `latest` | `latest` or a published semver | the agent VMSS image version — bumping it + a `compute` deploy rolls the VMSS model (new instances boot it; recycle old ones to converge) | `compute` |
 
 ## `em:` — Enterprise Manager tier
 
@@ -147,8 +201,8 @@ default host group `<stage>-agents`. Adding a stage = adding an entry
 | `agents.zones` | list of strings | `["1", "2", "3"]` | zone numbers | zones the scale set balances across | `compute` |
 | `agents.use_spot` | bool | `false` | — | run agents as Spot VMs (evictable; they deregister gracefully) | `compute` |
 | `agents.hostgroup` | string | `""` → `<stage>-agents` | — | Control-M host group the agents join | `compute` (cloud-init) |
-| `agents.provision_image` | string | `Agent.Linux` | an image known to `ctm provision image` | Automation API agent image provisioned at boot | `compute` (cloud-init) |
-| `agents.agent_port` | int | `7006` | — | agent listener port (`ctm provision agent::setup`) | `compute` (cloud-init) |
+| `agents.provision_image` | string | `Agent.Linux` | — | carried in node.json for compatibility; v4.1 bakes the Agent into the ctm-agent golden image — nothing is provisioned or installed at boot | `compute` (node.json) |
+| `agents.agent_port` | int | `7006` | — | agent listener (server → agent) port — written into the baked agent's `CONFIG.dat` at boot by the node installer (the image itself is built with the `silent-agent.xml` placeholder contract) | `compute` (node.json / CONFIG.dat) |
 | `agents.os_user` | string | `ctmagent` | — | agent OS account | `compute` (cloud-init) |
 | `agents.scale_out_cpu` | int | `70` | percent | average CPU (5 min) that adds an instance | `compute` (autoscale) |
 | `agents.scale_in_cpu` | int | `25` | percent | average CPU (15 min) that removes an instance | `compute` (autoscale) |
@@ -218,11 +272,12 @@ default host group `<stage>-agents`. Adding a stage = adding an entry
 
 The BMC EPD archives + silent-install XMLs live as **Universal Packages** in
 an Azure Artifacts feed, never in git and never in the image. The pipeline
-(`publishMedia=true`) downloads the three pinned packages and runs
+(`publishMedia=true`) downloads the four pinned packages and runs
 `ctmdeploy media upload`, which pushes them into the `installers` blob
-container of each platform (primary + DR). This block is validated at load
-time and documents the pins; the pipeline reads its copy of the same pins
-from `pipelines/variables/common.yml` — **keep the two in sync** (setup and
+container of each platform (primary + DR) alongside the node installer
+script. This block is validated at load time and documents the pins; the
+pipeline reads its copy of the same pins from
+`pipelines/variables/common.yml` — **keep the two in sync** (setup and
 layout rules: `docs/AZURE-DEVOPS.md` §5).
 
 | Key | Type | Default | Allowed values | What it changes | Consumed by |
@@ -231,9 +286,10 @@ layout rules: `docs/AZURE-DEVOPS.md` §5).
 | `azure_artifacts.organization` | string | — (required when present) | `https://dev.azure.com/<org>` | the Azure DevOps organization of the feed | docs/pipeline mirror |
 | `azure_artifacts.project` | string | — (required) | — | the project holding the feed | docs/pipeline mirror |
 | `azure_artifacts.feed` | string | — (required) | — | feed name (shipped: `ctm-media`) | docs/pipeline mirror |
-| `azure_artifacts.packages.em` | `{name, version}` | — (required) | exactly the keys `em`, `server`, `silent_xml` | universal package holding the EM EPD archive | docs/pipeline mirror |
+| `azure_artifacts.packages.em` | `{name, version}` | — (required) | exactly the keys `em`, `server`, `agent`, `silent_xml` | universal package holding the EM EPD archive | docs/pipeline mirror |
 | `azure_artifacts.packages.server` | `{name, version}` | — (required) | — | package holding the Server EPD archive | docs/pipeline mirror |
-| `azure_artifacts.packages.silent_xml` | `{name, version}` | — (required) | — | package holding the four silent-install XMLs | docs/pipeline mirror |
+| `azure_artifacts.packages.agent` | `{name, version}` | — (required) | — | package holding the Agent EPD archive — consumed by the pipeline IMAGE stage (`imageKind=agent` → `ctmdeploy image build --image agent`), never uploaded to blob | docs/pipeline mirror |
+| `azure_artifacts.packages.silent_xml` | `{name, version}` | — (required) | — | package holding the five silent-install XMLs: the EM/Server pairs go to blob, `silent-agent.xml` feeds the Packer agent-image build | docs/pipeline mirror |
 
 ## Derived names (not configurable)
 
@@ -243,4 +299,11 @@ The fixed constants (defined in `deploy/ctmdeploy/config.py`): EM hostnames
 `ctm-em-a`/`ctm-em-b`, Server hostnames `ctm-srv-<stage>-a/b`, data mount
 `/ctm`, Automation API user `emuser`, containers `installers`/`backups`, NFS
 share `ctm-shared`, platform DNS zone `<environment>.ctm.internal` with the
-`ctm-web` and `ctm-db` aliases.
+`ctm-web` and `ctm-db` aliases (plus `ctm-global` → the Application Gateway
+on prod). v4 additions: the node installer blob
+`scripts/ctm_node_install.py` (uploaded by the compute phase and `media
+upload`), the kvsync Function App `ctm-<env>-kvsync` (plan
+`ctm-<env>-kvsync-plan`, storage `<compact>func<hash>`), the EM Automation
+API base `https://ctm-web.<env>.ctm.internal:<web_port>/automation-api`
+(`CTM_API_BASE`), Bastion `ctm-<env>-bastion`, gateway `ctm-<env>-appgw`,
+build scale set `ctm-build-agents` with identity `ctm-build-id`.

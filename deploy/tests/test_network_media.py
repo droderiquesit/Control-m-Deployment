@@ -163,15 +163,16 @@ def test_network_infrastructure_valid_config_loads() -> None:
     assert utility is not None and utility.role == "utility"
     assert utility.subnet("snet-data").role == "data"
     spoke = infra.vnet("vnet-dev")
-    assert spoke.peer_to == "vnet-util"
+    assert spoke.peer_to == ("vnet-util",)  # v4: peer_to is a tuple (string or list in YAML)
     assert infra.spoke_address_spaces() == ["10.60.8.0/24"]
 
 
-def test_vnets_param_resolves_peer_and_spoke_address_spaces() -> None:
+def test_vnets_param_is_the_raw_config_shape() -> None:
+    """v4: network/main.bicep resolves peer address spaces ITSELF, so the
+    python-side param is the raw config shape with peer_to as a list."""
     cfg = _load_dict(_config_with_infrastructure())
     items = {item["name"]: item for item in cfg.network_infrastructure.vnets_param()}
     utility, spoke = items["vnet-util"], items["vnet-dev"]
-    # Config shape passed verbatim + the resolved address-space arrays.
     assert set(utility) == {
         "name",
         "resource_group_name",
@@ -180,15 +181,25 @@ def test_vnets_param_resolves_peer_and_spoke_address_spaces() -> None:
         "peer_to",
         "address_space",
         "subnets",
-        "peerAddressSpaces",
-        "spokeAddressSpaces",
     }
-    assert utility["peerAddressSpaces"] == ["10.60.8.0/24"]  # its peering spokes
-    assert utility["spokeAddressSpaces"] == ["10.60.8.0/24"]  # ALL spokes
-    assert spoke["peerAddressSpaces"] == ["10.60.0.0/22"]  # its utility VNet
-    assert spoke["spokeAddressSpaces"] == []
-    assert spoke["peer_to"] == "vnet-util" and utility["peer_to"] == ""
+    assert spoke["peer_to"] == ["vnet-util"] and utility["peer_to"] == []
     assert utility["subnets"][0] == {"name": "snet-em", "prefix": "10.60.0.0/24", "role": "em"}
+    assert spoke["address_space"] == "10.60.8.0/24"
+
+
+def test_peer_to_accepts_string_or_list() -> None:
+    data = _config_with_infrastructure()
+    data["network_infrastructure"]["vnets"][1]["peer_to"] = ["vnet-util"]
+    cfg = _load_dict(data)
+    assert cfg.network_infrastructure.vnet("vnet-dev").peer_to == ("vnet-util",)
+
+    data = _config_with_infrastructure()
+    data["network_infrastructure"]["vnets"][1]["peer_to"] = {"bad": "shape"}
+    _expect_config_error(data, "peer_to", "string or a list")
+
+    data = _config_with_infrastructure()
+    data["network_infrastructure"]["vnets"][1]["peer_to"] = ["vnet-util", "vnet-util"]
+    _expect_config_error(data, "peer_to", "duplicate")
 
 
 def test_create_false_keeps_block_inert() -> None:
@@ -199,7 +210,7 @@ def test_create_false_keeps_block_inert() -> None:
     data["network_infrastructure"]["vnets"][0]["address_space"] = "10.60.0.0/22"
     cfg = _load_dict(data)
     assert cfg.network_infrastructure.create is False
-    assert cfg.network_infrastructure.vnet("vnet-dev").peer_to == "vnet-gone"
+    assert cfg.network_infrastructure.vnet("vnet-dev").peer_to == ("vnet-gone",)
 
 
 def test_vnet_role_and_subnet_role_are_validated_structurally() -> None:
@@ -292,7 +303,7 @@ def test_overlapping_subnets_within_a_vnet_are_rejected() -> None:
 
 
 def test_bad_peer_to_is_rejected() -> None:
-    # Unknown target.
+    # Unknown target (spokes must resolve locally; only 'build' may cross envs).
     data = _config_with_infrastructure()
     data["network_infrastructure"]["vnets"][1]["peer_to"] = "vnet-nope"
     _expect_config_error(data, "peer_to", "vnet-nope", "does not name a VNet")
@@ -300,12 +311,22 @@ def test_bad_peer_to_is_rejected() -> None:
     # Spoke without any peer_to.
     data = _config_with_infrastructure()
     del data["network_infrastructure"]["vnets"][1]["peer_to"]
-    _expect_config_error(data, "vnets[vnet-dev]", "peer_to", "required")
+    _expect_config_error(data, "vnets[vnet-dev]", "peer_to", "exactly ONE")
 
-    # peer_to on a utility VNet.
+    # A spoke with two targets is also rejected (exactly one utility).
+    data = _config_with_infrastructure()
+    data["network_infrastructure"]["vnets"][1]["peer_to"] = ["vnet-util", "vnet-other"]
+    _expect_config_error(data, "vnets[vnet-dev]", "peer_to", "exactly ONE")
+
+    # utility peer_to must name ANOTHER utility (spoke target rejected).
     data = _config_with_infrastructure()
     data["network_infrastructure"]["vnets"][0]["peer_to"] = "vnet-dev"
-    _expect_config_error(data, "vnets[vnet-util]", "peer_to", "only valid on 'spoke'")
+    _expect_config_error(data, "vnets[vnet-util]", "peer_to", "utility VNets")
+
+    # utility peering to itself is rejected.
+    data = _config_with_infrastructure()
+    data["network_infrastructure"]["vnets"][0]["peer_to"] = "vnet-util"
+    _expect_config_error(data, "vnets[vnet-util]", "peer_to", "OTHER")
 
     # peer_to pointing at another spoke.
     data = _config_with_infrastructure()
@@ -320,6 +341,140 @@ def test_bad_peer_to_is_rejected() -> None:
     }
     data["network_infrastructure"]["vnets"].append(second)
     _expect_config_error(data, "vnets[vnet-qa]", "peer_to", "utility")
+
+
+def _build_vnet(peer_to) -> dict[str, Any]:
+    return {
+        "name": "vnet-build",
+        "resource_group_name": "rg-net",
+        "location": "eastus2",
+        "role": "build",
+        "peer_to": peer_to,
+        "address_space": "10.90.0.0/24",
+        "subnets": [{"name": "snet-build", "prefix": "10.90.0.0/26", "role": "build"}],
+    }
+
+
+def test_utility_to_utility_global_peering_is_allowed() -> None:
+    data = _config_with_infrastructure()
+    data["network_infrastructure"]["vnets"].append(
+        {
+            "name": "vnet-util-dr",
+            "resource_group_name": "rg-net-dr",
+            "location": "centralus",
+            "role": "utility",
+            "address_space": "10.80.0.0/22",
+            "subnets": [{"name": "snet-em", "prefix": "10.80.0.0/24", "role": "em"}],
+        }
+    )
+    data["network_infrastructure"]["vnets"][0]["peer_to"] = ["vnet-util-dr"]
+    cfg = _load_dict(data)
+    assert cfg.network_infrastructure.vnet("vnet-util").peer_to == ("vnet-util-dr",)
+
+
+def test_build_vnet_peering_rules() -> None:
+    # A build VNet must peer somewhere.
+    data = _config_with_infrastructure()
+    data["network_infrastructure"]["vnets"].append(_build_vnet([]))
+    _expect_config_error(data, "vnets[vnet-build]", "peer_to", "required")
+
+    # Locally-known targets must be utilities (or resolution-only externals).
+    data = _config_with_infrastructure()
+    data["network_infrastructure"]["vnets"].append(_build_vnet(["vnet-dev"]))
+    _expect_config_error(data, "vnets[vnet-build]", "peer_to", "utility")
+
+    # CROSS-ENVIRONMENT names (not declared in this config) are tolerated:
+    # the prod build VNet peers to the NONPROD utility VNet by name.
+    data = _config_with_infrastructure()
+    data["network_infrastructure"]["vnets"].append(
+        _build_vnet(["vnet-util", "vnet-other-env-utility"])
+    )
+    cfg = _load_dict(data)
+    build = cfg.network_infrastructure.vnet("vnet-build")
+    assert build.peer_to == ("vnet-util", "vnet-other-env-utility")
+    # Raw param shape keeps the full list for network/main.bicep to resolve.
+    items = {item["name"]: item for item in cfg.network_infrastructure.vnets_param()}
+    assert items["vnet-build"]["peer_to"] == ["vnet-util", "vnet-other-env-utility"]
+
+
+def _external_vnet(**overrides) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "name": "vnet-other-env-utility",
+        "resource_group_name": "rg-net-other",
+        "location": "eastus2",
+        "role": "external",
+        "address_space": "10.50.0.0/22",
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_external_vnet_entries_are_resolution_only() -> None:
+    """v4.1: role 'external' declares name+rg+address_space of a VNet another
+    plan deploys — no subnets, no peer_to; build peer_to resolves against it."""
+    # Accepted without subnets, and the build peering resolves to it.
+    data = _config_with_infrastructure()
+    data["network_infrastructure"]["vnets"].append(_external_vnet())
+    data["network_infrastructure"]["vnets"].append(
+        _build_vnet(["vnet-util", "vnet-other-env-utility"])
+    )
+    cfg = _load_dict(data)
+    external = cfg.network_infrastructure.vnet("vnet-other-env-utility")
+    assert external is not None and external.role == "external"
+    assert external.subnets == () and external.peer_to == ()
+    # The raw param shape carries the entry for network/main.bicep (which
+    # creates nothing for role 'external' but resolves peerings through it).
+    items = {item["name"]: item for item in cfg.network_infrastructure.vnets_param()}
+    assert items["vnet-other-env-utility"]["role"] == "external"
+    assert items["vnet-other-env-utility"]["subnets"] == []
+
+    # Subnets on an external entry are rejected (nothing is deployed for it).
+    data = _config_with_infrastructure()
+    data["network_infrastructure"]["vnets"].append(
+        _external_vnet(subnets=[{"name": "snet-x", "prefix": "10.50.0.0/26", "role": "em"}])
+    )
+    _expect_config_error(data, "external", "resolution-only")
+
+    # ...and so is a peer_to of its own (the owning plan declares those).
+    data = _config_with_infrastructure()
+    data["network_infrastructure"]["vnets"].append(_external_vnet(peer_to="vnet-util"))
+    _expect_config_error(data, "external", "peer_to")
+
+    # External address spaces still participate in the overlap check.
+    data = _config_with_infrastructure()
+    data["network_infrastructure"]["vnets"].append(
+        _external_vnet(address_space="10.60.0.0/16")  # overlaps vnet-util /22
+    )
+    _expect_config_error(data, "address spaces overlap", "vnet-other-env-utility")
+
+
+def test_bastion_subnet_naming_rule() -> None:
+    # role 'bastion' must be named exactly AzureBastionSubnet (structural).
+    data = _config_with_infrastructure(create=False)
+    data["network_infrastructure"]["vnets"][0]["subnets"].append(
+        {"name": "snet-bastion", "prefix": "10.60.2.0/26", "role": "bastion"}
+    )
+    _expect_config_error(data, "AzureBastionSubnet", "bastion")
+
+    # ...and the name AzureBastionSubnet may only carry role 'bastion'.
+    data = _config_with_infrastructure(create=False)
+    data["network_infrastructure"]["vnets"][0]["subnets"].append(
+        {"name": "AzureBastionSubnet", "prefix": "10.60.2.0/26", "role": "pe"}
+    )
+    _expect_config_error(data, "AzureBastionSubnet", "role 'bastion'")
+
+    # The correct pairing loads (plus appgw/func/build roles).
+    data = _config_with_infrastructure()
+    data["network_infrastructure"]["vnets"][0]["subnets"] += [
+        {"name": "AzureBastionSubnet", "prefix": "10.60.2.0/26", "role": "bastion"},
+        {"name": "snet-appgw", "prefix": "10.60.2.64/26", "role": "appgw"},
+        {"name": "snet-func", "prefix": "10.60.2.128/26", "role": "func"},
+    ]
+    cfg = _load_dict(data)
+    utility = cfg.network_infrastructure.vnet("vnet-util")
+    assert utility.subnet_by_role("bastion").name == "AzureBastionSubnet"
+    assert utility.subnet_by_role("appgw").name == "snet-appgw"
+    assert utility.subnet_by_role("func").name == "snet-func"
 
 
 def test_bad_access_cidrs_are_rejected() -> None:
@@ -396,18 +551,23 @@ def test_dr_placement_is_cross_checked_too() -> None:
     ]
     cfg = _load_dict(data)
     items = {item["name"]: item for item in cfg.network_infrastructure.vnets_param()}
-    assert items["vnet-dev-dr"]["peerAddressSpaces"] == ["10.80.0.0/22"]
-    assert items["vnet-util-dr"]["peerAddressSpaces"] == ["10.80.9.0/24"]
-    # Utility items carry ALL spoke address spaces (both regions).
-    assert items["vnet-util-dr"]["spokeAddressSpaces"] == ["10.60.8.0/24", "10.80.9.0/24"]
-    assert items["vnet-util"]["spokeAddressSpaces"] == ["10.60.8.0/24", "10.80.9.0/24"]
+    # Raw shape only — network/main.bicep resolves peer address spaces itself.
+    assert items["vnet-dev-dr"]["peer_to"] == ["vnet-util-dr"]
+    assert items["vnet-util-dr"]["peer_to"] == []
+    assert items["vnet-util-dr"]["address_space"] == "10.80.0.0/22"
+    assert cfg.network_infrastructure.spoke_address_spaces() == [
+        "10.60.8.0/24",
+        "10.80.9.0/24",
+    ]
 
 
 # ---------------------------------------------------------------------------
 # The committed PoC plan (environments/<env>/config.yaml)
 # ---------------------------------------------------------------------------
 
-#: Binding v3 PoC address plan (non-overlapping across platforms).
+#: Binding PoC address plan (non-overlapping across platforms; v4 adds the
+#: build VNet to prod). Asserted as a SUBSET so the network-plan owner may
+#: extend the block without breaking this suite.
 _POC_PLAN = {
     "nonprod": {
         "vnet-dev-utility": "10.60.0.0/22",
@@ -420,6 +580,10 @@ _POC_PLAN = {
         "vnet-ctm-prod": "10.70.9.0/24",
         "vnet-dr-utility": "10.80.0.0/22",
         "vnet-ctm-prod-dr": "10.80.9.0/24",
+        "vnet-ctm-build": "10.90.0.0/24",
+        # v4.1: resolution-only external entry (created by the NONPROD plan)
+        # so the build <-> dev-utility peering resolves on the ctmdeploy path.
+        "vnet-dev-utility": "10.60.0.0/22",
     },
 }
 
@@ -458,28 +622,75 @@ def test_poc_network_plan_ships_disabled() -> None:
 def test_poc_network_plan_validates_nonprod() -> None:
     cfg = _poc_config("nonprod")
     infra = cfg.network_infrastructure
-    assert {v.name: v.address_space for v in infra.vnets} == _POC_PLAN["nonprod"]
+    declared = {v.name: v.address_space for v in infra.vnets}
+    for name, space in _POC_PLAN["nonprod"].items():
+        assert declared.get(name) == space, (name, declared)
     assert {v.name for v in infra.vnets if v.role == "utility"} == {"vnet-dev-utility"}
     for name in ("vnet-ctm-dev", "vnet-ctm-qa"):
-        assert infra.vnet(name).peer_to == "vnet-dev-utility"
-    items = {item["name"]: item for item in infra.vnets_param()}
-    assert items["vnet-dev-utility"]["spokeAddressSpaces"] == ["10.60.8.0/24", "10.60.9.0/24"]
-    assert items["vnet-ctm-qa"]["peerAddressSpaces"] == ["10.60.0.0/22"]
+        assert infra.vnet(name).peer_to == ("vnet-dev-utility",)
+    assert cfg.network_infrastructure.spoke_address_spaces() == [
+        "10.60.8.0/24",
+        "10.60.9.0/24",
+    ]
+    # v4 access-layer subnets in the utility VNet (bastion + func).
+    utility = infra.vnet("vnet-dev-utility")
+    bastion = utility.subnet_by_role("bastion")
+    assert bastion is not None and bastion.name == "AzureBastionSubnet"
+    assert bastion.prefix == "10.60.2.0/26"
+    func = utility.subnet_by_role("func")
+    assert func is not None and func.prefix == "10.60.2.64/26"
+    # ...and the placement helpers resolve subnet ids from the plan.
+    assert cfg.bastion_subnet_id().endswith(
+        "/virtualNetworks/vnet-dev-utility/subnets/AzureBastionSubnet"
+    )
+    assert cfg.func_subnet_id().endswith("/subnets/snet-ctm-func")
 
 
 def test_poc_network_plan_validates_prod() -> None:
     cfg = _poc_config("prod")
     infra = cfg.network_infrastructure
-    assert {v.name: v.address_space for v in infra.vnets} == _POC_PLAN["prod"]
-    assert infra.vnet("vnet-ctm-prod-dr").peer_to == "vnet-dr-utility"
-    assert infra.vnet("vnet-ctm-uat").peer_to == "vnet-prod-utility"
-    # The utility subnets follow the PoC split (em /24, postgres /27, pe /26).
+    declared = {v.name: v.address_space for v in infra.vnets}
+    for name, space in _POC_PLAN["prod"].items():
+        assert declared.get(name) == space, (name, declared)
+    assert infra.vnet("vnet-ctm-prod-dr").peer_to == ("vnet-dr-utility",)
+    assert infra.vnet("vnet-ctm-uat").peer_to == ("vnet-prod-utility",)
+    # The utility subnets follow the PoC split (em /24, postgres /27, pe /26)
+    # plus the v4 access-layer additions (bastion /26, appgw /26, func /26).
     utility = infra.vnet("vnet-prod-utility")
-    assert {s.role: s.prefix for s in utility.subnets} == {
-        "em": "10.70.0.0/24",
-        "data": "10.70.1.0/27",
-        "pe": "10.70.1.64/26",
+    roles = {s.role: s.prefix for s in utility.subnets}
+    assert roles["em"] == "10.70.0.0/24"
+    assert roles["data"] == "10.70.1.0/27"
+    assert roles["pe"] == "10.70.1.64/26"
+    assert roles["bastion"] == "10.70.2.0/26"
+    assert roles["appgw"] == "10.70.2.64/26"
+    assert roles["func"] == "10.70.2.128/26"
+    assert utility.subnet_by_role("bastion").name == "AzureBastionSubnet"
+    # Utility <-> utility GLOBAL peering (appgw -> DR LB, bastion -> DR).
+    assert "vnet-dr-utility" in infra.vnet("vnet-prod-utility").peer_to
+    # The build VNet peers to ALL THREE utility VNets; vnet-dev-utility is
+    # CREATED by the nonprod plan but declared here as a resolution-only
+    # role-'external' entry, so the build <-> dev-utility pair resolves (and
+    # is emitted) on the ctmdeploy path too — not just via the bicepparams.
+    build = infra.vnet("vnet-ctm-build")
+    assert build is not None and build.role == "build"
+    assert set(build.peer_to) == {
+        "vnet-dev-utility",
+        "vnet-prod-utility",
+        "vnet-dr-utility",
     }
+    assert build.subnet_by_role("build") is not None
+    external = infra.vnet("vnet-dev-utility")
+    assert external is not None and external.role == "external"
+    assert external.resource_group_name == "rg-network-nonprod"
+    assert external.address_space == "10.60.0.0/22"
+    assert external.subnets == () and external.peer_to == ()
+    # Placement helpers used by the access phase resolve against this plan.
+    assert cfg.appgw_subnet_id().endswith(
+        "/virtualNetworks/vnet-prod-utility/subnets/snet-ctm-appgw"
+    )
+    assert cfg.build_agents_subnet_id().endswith(
+        "/virtualNetworks/vnet-ctm-build/subnets/snet-ctm-build"
+    )
 
 
 def test_poc_media_block_parses() -> None:
@@ -511,6 +722,7 @@ def _media_block() -> dict[str, Any]:
             "packages": {
                 "em": {"name": "control-m-em", "version": "9.0.21.300"},
                 "server": {"name": "control-m-server", "version": "9.0.21.300"},
+                "agent": {"name": "control-m-agent", "version": "9.0.21.300"},
                 "silent_xml": {"name": "control-m-silent-xml", "version": "1.0.0"},
             },
         }
@@ -525,20 +737,23 @@ def test_media_block_parses_synthetic() -> None:
     assert artifacts.organization == "https://dev.azure.com/example"
     assert artifacts.project == "platform"
     assert artifacts.packages["silent_xml"].version == "1.0.0"
+    assert artifacts.packages["agent"].name == "control-m-agent"  # v4
 
 
-def test_media_block_requires_all_three_packages() -> None:
-    data = _base_config()
-    data["media"] = _media_block()
-    del data["media"]["azure_artifacts"]["packages"]["silent_xml"]
-    _expect_config_error(data, "media.azure_artifacts.packages", "silent_xml")
+def test_media_block_requires_all_four_packages() -> None:
+    assert cfgmod.MEDIA_PACKAGE_KEYS == ("em", "server", "agent", "silent_xml")
+    for missing in cfgmod.MEDIA_PACKAGE_KEYS:
+        data = _base_config()
+        data["media"] = _media_block()
+        del data["media"]["azure_artifacts"]["packages"][missing]
+        _expect_config_error(data, "media.azure_artifacts.packages", missing)
 
 
 def test_media_block_rejects_unknown_packages() -> None:
     data = _base_config()
     data["media"] = _media_block()
-    data["media"]["azure_artifacts"]["packages"]["agent"] = {"name": "x", "version": "1"}
-    _expect_config_error(data, "media.azure_artifacts.packages", "unknown keys", "agent")
+    data["media"]["azure_artifacts"]["packages"]["plugin"] = {"name": "x", "version": "1"}
+    _expect_config_error(data, "media.azure_artifacts.packages", "unknown keys", "plugin")
 
 
 # ---------------------------------------------------------------------------
@@ -668,7 +883,9 @@ def test_network_phase_is_first_and_skips_when_create_false() -> None:
 
 
 def test_network_phase_params_match_bicep_contract() -> None:
-    """The exact parameter names phase_network hands bicep/network.bicep."""
+    """The exact parameter names phase_network hands network/main.bicep (v4:
+    the standalone network/ folder supersedes bicep/network.bicep and takes
+    the RAW vnets shape)."""
     from ctmdeploy import deploy as deploymod
 
     cfg = _load_dict(_config_with_infrastructure())
@@ -684,7 +901,7 @@ def test_network_phase_params_match_bicep_contract() -> None:
     from ctmdeploy.azure import SubscriptionScope
 
     assert captured["name"] == "ctm-nonprod-network"
-    assert captured["template"] == "network.bicep"
+    assert captured["template"] == "network/main.bicep"
     assert captured["scope"] == SubscriptionScope("eastus2")
     params = captured["params"]
     assert set(params) == {"vnets", "userAccessCidrs", "bastionCidrs", "tags"}
@@ -692,6 +909,12 @@ def test_network_phase_params_match_bicep_contract() -> None:
     assert params["bastionCidrs"] == ["203.0.113.0/28"]
     assert params["tags"]["managedBy"] == "bicep"
     assert [item["name"] for item in params["vnets"]] == ["vnet-util", "vnet-dev"]
+    # Raw config shape: peer_to normalized to a list, no python-side resolution.
+    assert params["vnets"][1]["peer_to"] == ["vnet-util"]
+    assert "peerAddressSpaces" not in params["vnets"][0]
+    # ...and the template path resolves from the repo root, not bicep/.
+    assert engine._bicep("network/main.bicep") == REPO_ROOT / "network" / "main.bicep"
+    assert engine._bicep("access.bicep") == REPO_ROOT / "bicep" / "access.bicep"
 
 
 # ---------------------------------------------------------------------------

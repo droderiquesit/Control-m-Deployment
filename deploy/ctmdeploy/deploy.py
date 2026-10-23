@@ -1,20 +1,30 @@
 # ---------------------------------------------------------------------------
 # Phase engine: network(optional) -> rg -> foundation(primary[,dr]) ->
-# secrets -> compute -> dr -> replication, passing each deployment's outputs
-# to the next. v2: per-node/per-pool subnet placement (utility VNet + one
-# VNet per server); v3: optional full-network provisioning (bicep/
-# network.bicep, only when network_infrastructure.create). Idempotency
-# pre-reads (existing VMs/VMSS -> isNew, promoted replica, object-replication
-# policy ids, live PG zones). Azure SDK imports are guarded inside the
-# functions that need them.
+# secrets -> compute -> access -> dr -> replication, passing each
+# deployment's outputs to the next. v2: per-node/per-pool subnet placement
+# (utility VNet + one VNet per server); v3/v4: optional full-network
+# provisioning (network/main.bicep, only when network_infrastructure.create)
+# and the access layer (Bastion, private Application Gateway over both
+# regional LBs, kvsync Function, ADO build agents). The compute phase first
+# uploads node-scripts/ctm_node_install.py to the installers container so
+# nodes always run the repo's script version. Idempotency pre-reads
+# (existing VMs/VMSS -> isNew, promoted replica, object-replication policy
+# ids, live PG zones). Azure SDK imports are guarded inside the functions
+# that need them.
 # ---------------------------------------------------------------------------
 """Python-orchestrated Bicep deployments for one Control-M environment.
 
 ``python -m ctmdeploy deploy --env prod [--phase all|network|rg|foundation|
-secrets|compute|dr|replication]`` runs the phases; ``whatif`` runs the same
-ARM deployments in what-if mode (the pre-apply change preview). The
+secrets|compute|access|dr|replication]`` runs the phases; ``whatif`` runs the
+same ARM deployments in what-if mode (the pre-apply change preview). The
 ``network`` phase runs first and only when ``network_infrastructure.create``
-is true (the default is bring-your-own networking, where it is skipped).
+is true (the default is bring-your-own networking, where it is skipped); it
+deploys network/main.bicep, the standalone folder the cloud team can also
+deploy with nothing but the az CLI. The ``access`` phase (after compute,
+before dr) deploys bicep/access.bicep: Bastion (+ the kvsync Function when
+kv_sync.enabled) everywhere it is enabled, and on prod additionally the
+PRIVATE Application Gateway balancing the primary and DR internal load
+balancers plus the Azure DevOps build-agent scale set.
 Deployment names are ``ctm-<env>-<phase>[-dr]``; later phases re-read the
 earlier phases' recorded outputs so each phase can run standalone.
 
@@ -55,7 +65,7 @@ from ctmdeploy.config import (
 if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime Azure import
     from azure.core.credentials import TokenCredential
 
-PHASES = ("network", "rg", "foundation", "secrets", "compute", "dr", "replication")
+PHASES = ("network", "rg", "foundation", "secrets", "compute", "access", "dr", "replication")
 
 #: Used by `ctmdeploy render` when no live foundation outputs are available.
 PLACEHOLDER_IDENTITY_CLIENT_ID = "00000000-0000-0000-0000-000000000000"
@@ -197,6 +207,8 @@ def agent_custom_data(
         dns_zone=view.dns_zone,
         attach_data_disk=False,
     )
+    # v4.1: the agent software is BAKED into the ctm-agent image, so the
+    # tokens carry configuration + registration inputs only (no media blobs).
     tokens |= render.agent_tokens(
         agent_user=server.agents.os_user,
         em_api_endpoint=f"https://{cfg.web_alias}:{cfg.em.web_port}/automation-api",
@@ -205,6 +217,7 @@ def agent_custom_data(
         hostgroup=server.hostgroup,
         agent_port=server.agents.agent_port,
         provision_image=server.agents.provision_image,
+        server_primary_host=server.primary_host,
     )
     return render.render("agent", tokens, template_dir)
 
@@ -240,6 +253,10 @@ class Engine:
     # -- shared helpers ------------------------------------------------------
 
     def _bicep(self, name: str) -> Path:
+        """Template path: bare names live in bicep/; a name carrying a '/'
+        (e.g. network/main.bicep) is resolved from the repository root."""
+        if "/" in name:
+            return self.repo_root / name
         return self.repo_root / "bicep" / name
 
     def _template_dir(self) -> Path:
@@ -306,13 +323,17 @@ class Engine:
     # -- phases --------------------------------------------------------------
 
     def phase_network(self, what_if: bool = False) -> list[DeploymentResult]:
-        """Subscription deployment of bicep/network.bicep (optional full network).
+        """Subscription deployment of network/main.bicep (optional full network).
 
         Runs only when ``network_infrastructure.create`` is true; the default
         (false) is bring-your-own networking, where the placement blocks
         reference pre-existing VNets and this phase is skipped. The single
         subscription-scope deployment covers BOTH regions (each vnets entry
-        carries its own resource group + location, DR VNets included).
+        carries its own resource group + location, DR VNets included). The
+        template lives in the standalone network/ folder so the cloud team
+        can deploy the SAME plan with just the az CLI — the vnets param is
+        the raw config shape (peer_to normalized to a list) and main.bicep
+        resolves all peer address spaces itself.
         """
         cfg = self.cfg
         infra = cfg.network_infrastructure
@@ -320,15 +341,15 @@ class Engine:
             print("    network: skipped (network_infrastructure.create is false; bring-your-own)")
             return []
         params = {
-            # Config-shaped vnets with the peer/spoke address spaces resolved
-            # by python (bicep derives the per-subnet NSG rules from them).
             "vnets": infra.vnets_param(),
             "userAccessCidrs": list(infra.user_access_cidrs),
             "bastionCidrs": list(infra.bastion_cidrs),
             "tags": cfg.platform_tags("network"),
         }
         scope = SubscriptionScope(cfg.location)
-        return [self._deploy(scope, f"{cfg.name}-network", "network.bicep", params, what_if)]
+        return [
+            self._deploy(scope, f"{cfg.name}-network", "network/main.bicep", params, what_if)
+        ]
 
     def phase_rg(self, what_if: bool = False) -> list[DeploymentResult]:
         """Subscription deployment of bicep/rg.bicep (primary RG + DR RG)."""
@@ -491,7 +512,11 @@ class Engine:
         return {
             "name": cfg.name if primary else cfg.dr_name,
             "location": cfg.location if primary else cfg.dr.location,
-            "imageId": cfg.image_id(),
+            # v4.1 two-image model: EM/Server VMs boot the base (OS-only)
+            # image, the agent scale sets boot the ctm-agent image with the
+            # Control-M/Agent baked in (configured + registered at boot).
+            "imageId": cfg.image_id("base"),
+            "agentImageId": cfg.image_id("agent"),
             "sshPublicKey": self._ssh_public_key(),
             "identityId": outputs["identityId"],
             "dataCollectionRuleId": outputs["dataCollectionRuleId"],
@@ -507,9 +532,41 @@ class Engine:
             "tags": cfg.platform_tags(role),
         }
 
-    def phase_compute(self, what_if: bool = False) -> list[DeploymentResult]:
-        """RG deployments of bicep/compute.bicep: full primary, warm-pool DR."""
+    def _upload_node_script(self) -> None:
+        """Push node-scripts/ctm_node_install.py to the installers container
+        of every region (scripts/ctm_node_install.py, overwrite) so the
+        script version the nodes fetch at boot == the repo version being
+        deployed. `ctmdeploy media upload` uploads it too.
+        """
+        script = self.repo_root / "node-scripts" / "ctm_node_install.py"
+        if not script.is_file():
+            raise DeployError(f"node installer not found: {script}")
+        from azure.storage.blob import BlobServiceClient
+
+        from ctmdeploy.config import INSTALLERS_CONTAINER
+
         cfg = self.cfg
+        accounts = [cfg.blob_account_name]
+        if cfg.dr.enabled:
+            accounts.append(cfg.dr_blob_account_name)
+        data = script.read_bytes()
+        for account in accounts:
+            client = BlobServiceClient(
+                account_url=f"https://{account}.blob.core.windows.net",
+                credential=self.deployer.credential,
+            ).get_blob_client(INSTALLERS_CONTAINER, render.NODE_SCRIPT_BLOB)
+            client.upload_blob(data, overwrite=True)
+            print(f"    uploaded {render.NODE_SCRIPT_BLOB} -> {account}/{INSTALLERS_CONTAINER}")
+
+    def phase_compute(self, what_if: bool = False) -> list[DeploymentResult]:
+        """RG deployments of bicep/compute.bicep: full primary, warm-pool DR.
+
+        The node installer script is uploaded FIRST (both regions), because
+        the cloud-init shim baked into customData fetches it at boot.
+        """
+        cfg = self.cfg
+        if not what_if:
+            self._upload_node_script()
         results = [
             self._deploy(
                 ResourceGroupScope(cfg.resource_group_name),
@@ -530,6 +587,78 @@ class Engine:
                 )
             )
         return results
+
+    # -- access layer (v4) -----------------------------------------------------
+
+    def _access_params(self) -> dict[str, Any] | None:
+        """Parameters of bicep/access.bicep, or None when nothing is enabled.
+
+        nonprod: Bastion (+ the kvsync Function when kv_sync.enabled).
+        prod: Bastion + the PRIVATE Application Gateway whose single backend
+        pool holds BOTH internal LB frontend IPs (primary + DR — healthy-only
+        routing gives automatic primary/DR behavior) + kvsync + the Azure
+        DevOps build-agent scale set. Subnet ids are built from config and
+        the network plan; backend IPs come from the two foundation outputs.
+        """
+        cfg = self.cfg
+        bastion_enabled = cfg.access.bastion_enabled
+        # The gateway balances the primary and DR LBs: honored on prod only.
+        appgw_enabled = cfg.access.appgw_enabled and cfg.environment == "prod"
+        kvsync_enabled = cfg.kv_sync.enabled
+        build_enabled = cfg.build_agents.enabled
+        if not (bastion_enabled or appgw_enabled or kvsync_enabled or build_enabled):
+            return None
+
+        appgw_backend_ips: list[str] = []
+        if appgw_enabled:
+            primary = self._foundation_outputs("primary")
+            appgw_backend_ips.append(str(primary["lbFrontendIp"]))
+            if cfg.dr.enabled:
+                dr = self._foundation_outputs("dr")
+                appgw_backend_ips.append(str(dr["lbFrontendIp"]))
+        build_agents = {
+            "enabled": build_enabled,
+            "resourceGroupName": cfg.build_agents.resource_group,
+            "vmSize": cfg.build_agents.vm_size,
+            "instances": cfg.build_agents.instances,
+            "subnetId": cfg.build_agents_subnet_id() if build_enabled else "",
+            "sshPublicKey": self._ssh_public_key() if build_enabled else "",
+        }
+        return {
+            "name": cfg.name,
+            "location": cfg.location,
+            "platformRgName": cfg.resource_group_name,
+            "bastionEnabled": bastion_enabled,
+            "bastionSubnetId": cfg.bastion_subnet_id() if bastion_enabled else "",
+            "appgwEnabled": appgw_enabled,
+            "appgwSubnetId": cfg.appgw_subnet_id() if appgw_enabled else "",
+            "appgwBackendIps": appgw_backend_ips,
+            "dnsZoneName": cfg.private_dns_zone_name,
+            "kvSyncEnabled": kvsync_enabled,
+            "funcSubnetId": cfg.func_subnet_id() if kvsync_enabled else "",
+            "keyVaultId": cfg.key_vault_id,
+            "keyVaultUri": cfg.key_vault_uri,
+            "ctmApiBase": cfg.ctm_api_base,
+            "syncSchedule": cfg.kv_sync.schedule,
+            "buildAgents": build_agents,
+            "tags": cfg.platform_tags("access"),
+        }
+
+    def phase_access(self, what_if: bool = False) -> list[DeploymentResult]:
+        """Subscription deployment of bicep/access.bicep (Bastion, private
+        Application Gateway over both regional LBs, kvsync Function, build
+        agents). Runs after compute (it needs the foundation LB IPs) and
+        before dr."""
+        cfg = self.cfg
+        params = self._access_params()
+        if params is None:
+            print(
+                "    access: skipped (access.bastion/appgw, kv_sync and "
+                "build_agents are all disabled)"
+            )
+            return []
+        scope = SubscriptionScope(cfg.location)
+        return [self._deploy(scope, f"{cfg.name}-access", "access.bicep", params, what_if)]
 
     #: PG replication roles that mean 'still a replica' (safe to re-assert).
     _REPLICA_ROLES = frozenset({"asyncreplica", "geoasyncreplica"})
@@ -705,6 +834,8 @@ class Engine:
                     self.phase_secrets()
             elif current == "compute":
                 results += self._maybe_skip_whatif(self.phase_compute, what_if, "compute")
+            elif current == "access":
+                results += self._maybe_skip_whatif(self.phase_access, what_if, "access")
             elif current == "dr":
                 results += self._maybe_skip_whatif(self.phase_dr, what_if, "dr")
             elif current == "replication":

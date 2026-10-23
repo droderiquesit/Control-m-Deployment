@@ -1,11 +1,15 @@
-# Installer media publish: downloads the three BMC media Universal Packages
-# (EM + Server EPD archives, silent-install XMLs) from the Azure Artifacts
-# feed and pushes them into each platform's installers blob container with
-# `ctmdeploy media upload` (primary + DR when dr.enabled). The VMs are never
-# touched — nodes still download from blob via managed identity at first boot.
-# Manual: run the pipeline with publishMedia=true on main. Feed/package pins
-# live in pipelines/variables/common.yml (keep them in sync with the media:
-# block of environments/<env>/config.yaml); feed setup: docs/AZURE-DEVOPS.md.
+# Installer media publish: downloads the three EM/Server BMC media Universal
+# Packages (EM + Server EPD archives, silent-install XMLs) from the Azure
+# Artifacts feed and pushes them into each platform's installers blob
+# container with `ctmdeploy media upload` (primary + DR when dr.enabled),
+# alongside the node installer script. The VMs are never touched — EM/Server
+# nodes download from blob via managed identity at first boot. The AGENT
+# media (control-m-agent package) is deliberately NOT handled here: v4.1
+# bakes the Control-M/Agent into the ctm-agent golden image, so that package
+# feeds the IMAGE stage (stage-image.yml, imageKind=agent) instead. Manual:
+# run the pipeline with publishMedia=true on main. Feed/package pins live in
+# pipelines/variables/common.yml (keep them in sync with the media: block of
+# environments/<env>/config.yaml); setup: docs/AZURE-DEVOPS.md.
 parameters:
   - name: enabled
     type: boolean
@@ -18,6 +22,10 @@ parameters:
   - name: dependsOn
     type: object
     default: [validate]
+  # '' = Microsoft-hosted ubuntu-latest; a name = the self-hosted scale-set pool.
+  - name: agentPool
+    type: string
+    default: ""
 
 stages:
   - stage: media
@@ -38,6 +46,11 @@ stages:
           - job: media_${{ env.name }}
             displayName: media upload (${{ env.name }})
             timeoutInMinutes: 120 # EPD archives are multi-GB
+            pool:
+              ${{ if eq(parameters.agentPool, '') }}:
+                vmImage: ubuntu-latest
+              ${{ else }}:
+                name: ${{ parameters.agentPool }}
             steps:
               - checkout: self
                 fetchDepth: 1
@@ -61,10 +74,12 @@ stages:
               # upload` uploads an already-prefixed em/ or server/ tree
               # verbatim); the silent_xml package's files are mapped by
               # filename instead (silent-em-* → em/, silent-server-* →
-              # server/). The task authenticates with the job access token;
-              # the pipeline identity needs Feed Reader on the feed
-              # (docs/AZURE-DEVOPS.md). Feeds in another organization need
-              # feedsToUse: external plus a service connection instead.
+              # server/; silent-agent.xml is skipped with a warning — it is
+              # consumed by the Packer agent-image build, not by blob). The
+              # task authenticates with the job access token; the pipeline
+              # identity needs Feed Reader on the feed (docs/AZURE-DEVOPS.md).
+              # Feeds in another organization need feedsToUse: external plus
+              # a service connection instead.
               - task: UniversalPackages@0
                 displayName: Download $(mediaEmPackage) $(mediaEmVersion)
                 inputs:

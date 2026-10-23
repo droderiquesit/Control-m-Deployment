@@ -22,21 +22,40 @@ utility VNet, never with each other, so stages are isolated at the network
 layer). The DR region mirrors this with a DR utility VNet plus one DR VNet
 per DR-protected Server. Networking comes in two flavors
 (`docs/NETWORK-REQUIREMENTS.md`): **bring-your-own** (the default — VNets,
-subnets, peering and NSGs pre-exist, the toolchain only selects them) or
-**Option A**, where flipping `network_infrastructure.create: true` makes a
-separate `--phase network` deployment (`bicep/network.bicep`) provision the
-full PoC network — resource groups, VNets, subnets, one NSG per subnet and
-the spoke ⇄ utility peerings — from the address plan shipped in the config
-files.
+subnets, peering and NSGs pre-exist, the toolchain only selects them) or the
+standalone **`network/` folder** — self-contained Bicep the **cloud team**
+deploys with nothing but the az CLI (`network/README.md`), covering resource
+groups, VNets, subnets (bastion/appgw/func included), one NSG per subnet and
+every peering: spoke ⇄ utility, the prod ⇄ DR **global** utility pairing and
+the build VNet into all three utilities. The platform pipeline can deploy
+the same plan itself (`network_infrastructure.create: true` →
+`--phase network`).
 
-**How the software gets onto the machines**: the Packer image is the
-**operating system only** — BMC software is never baked in. EM and
-Control-M/Server are silently installed at provision time by cloud-init from
-media in the `installers` blob container, and agents provision themselves
-through the EM Automation API. The installer media (BMC EPD archives +
-silent XMLs) is stored as **Universal Packages in an Azure Artifacts feed**;
-the pipeline's media stage (or `ctmdeploy media upload`) moves it into each
-platform's blob container — primary and DR (`docs/AZURE-DEVOPS.md` §5).
+An **access layer** completes the platform (`--phase access`): **Azure
+Bastion** for private SSH to every node (no VM ever has a public IP; DR
+reachable over the global peering), a **private Application Gateway** (prod)
+whose layer-4 TCP frontend publishes **`ctm-global`** — one alias balanced
+across the primary and DR internal load balancers, following whichever EM is
+healthy — a **Key Vault → Control-M sync Durable Function** (`kv_sync`,
+mirrors `ctm-sync`-tagged secrets into Control-M through the Automation
+API), and the **`ctm-build-agents`** scale set: Azure DevOps elastic-pool
+build agents that deploy into nonprod, prod and DR.
+
+**How the software gets onto the machines** (v4.1 two-image model): the
+**base** Packer image (`ctm-rhel9`) is the **operating system only** — BMC
+software is never baked into it — while the **agent** image (`ctm-agent`)
+additionally embeds the **Control-M/Agent, silent-installed but
+unconfigured**. A thin cloud-init shim fetches **one idempotent, stdlib-only
+python installer** (`node-scripts/ctm_node_install.py`) from blob and runs
+it: EM and Control-M/Server are silently installed from media in the
+`installers` blob container, and the agent scale-set instances only
+**configure, start and register** their baked-in agent through the EM
+Automation API REST. The EM/Server installer media (EPD archives + silent
+XMLs) is stored as **Universal Packages in an Azure Artifacts feed**; the
+pipeline's media stage (or `ctmdeploy media upload`) moves it into each
+platform's blob container — primary and DR — while the `control-m-agent`
+package feeds the **Packer agent-image build** instead
+(`docs/AZURE-DEVOPS.md` §5).
 
 ## Toolchain
 
@@ -44,7 +63,7 @@ platform's blob container — primary and DR (`docs/AZURE-DEVOPS.md` §5).
 |------|------|
 | **Bicep** (`bicep/`) | every Azure resource, compiled and submitted as ARM deployments |
 | **Python** (`deploy/`, package `ctmdeploy`) | the orchestrator: loads `environments/<env>/config.yaml`, generates/seeds Key Vault secrets, renders cloud-init, runs the phased deployments, enables Site Recovery replication, drives DR failover |
-| **Packer** (`packer/`) | builds the **ctm-rhel9** golden image (RHEL 9 + Control-M OS prep — the **OS only**, no BMC software) and publishes it to an Azure Compute Gallery; every VM and scale-set instance boots from it, then installs EM/Server from blob media (agents: via the EM Automation API) at first boot |
+| **Packer** (`packer/`) | builds the two golden images and publishes them to an Azure Compute Gallery: **ctm-rhel9** (RHEL 9 + Control-M OS prep — the **OS only**, no BMC software; EM/Server VMs install from blob media at first boot) and **ctm-agent** (the same OS prep + the **Control-M/Agent baked in, unconfigured**; the agent scale sets boot it and only configure/start/register at boot) |
 
 **Deployments are stateless.** Bicep/ARM deployments compare the template to
 what exists in Azure on every run — there is no state file, no state backend
@@ -54,36 +73,54 @@ the apply re-runs the same deployments.
 ```
 bicep/
   rg.bicep                  subscription scope: resource groups + optional locks
-  network.bicep             subscription scope, OPTIONAL: full network (Option A) —
-                            RGs, VNets, per-subnet NSGs, spoke<->utility peering
   foundation.bicep          one region's foundation (role primary|dr)
   compute.bicep             EM/Server VMs + agent VMSS + backup + VM alerts
+  access.bicep              subscription scope: Bastion, private Application Gateway
+                            (ctm-global), kvsync Function infra, ADO build agents
   dr.bicep                  PG replica, ASR vault, blob object replication, Traffic Manager
-  images.bicep              Compute Gallery + ctm-rhel9 image definition
-  modules/                  network, vnet, vnet-peering, dns, security, storage,
-                            database, load-balancer, node, agent-pool,
-                            observability, backup, ...
+  images.bicep              Compute Gallery + ctm-rhel9/ctm-agent image definitions
+  modules/                  network, dns, security, storage, database, load-balancer,
+                            node, agent-pool, bastion, appgw, function-kvsync,
+                            build-agents, observability, backup, ...
+network/                    CLOUD-TEAM-OWNED full network: main.bicep + vnet/peering
+  params/*.bicepparam       modules + per-env params — az CLI only, no python
+identity/
+  deployer-role.bicep       custom role "Control-M Platform Deployer" (everything
+                            except VNet/subnet/NSG/peering writes) + README
 environments/
   nonprod/config.yaml       single source of truth per platform (python reads it;
   prod/config.yaml          bicep gets params derived from it)
-cloud-init/                 boot-time templates (__TOKEN__ placeholders) for EM,
-                            Server and Agent nodes — environment-specific work only
+cloud-init/                 thin boot shims (__TOKEN__ placeholders): OS plumbing +
+                            node.json, then fetch & run the python node installer
+node-scripts/
+  ctm_node_install.py       ONE idempotent stdlib-only installer for EM/Server/Agent
+                            (stage machine, safe to re-run; uploaded to blob)
+functions/
+  kvsync/                   Key Vault -> Control-M secret sync (Durable Function;
+                            tagged ctm-sync=true secrets -> EM Automation API)
 packer/
-  ctm-rhel9.pkr.hcl         golden image build (marketplace RHEL 9 -> Compute Gallery)
-  scripts/                  baked OS prep: packages, tuning, Node.js 20, deprovision
-                            (OS only — BMC software is never baked in)
+  ctm-rhel9.pkr.hcl         BASE golden image (marketplace RHEL 9 -> Compute Gallery;
+                            OS only — never any BMC software)
+  ctm-agent.pkr.hcl         AGENT golden image (same OS prep + Control-M/Agent
+                            silent-installed from the control-m-agent package,
+                            unconfigured — configured/registered at boot)
+  scripts/                  baked OS prep: packages, tuning, Node.js 20,
+                            30-agent-install.sh (agent image only), deprovision
 deploy/
   pyproject.toml            pip install -e deploy/
   ctmdeploy/                cli, config, azure, secrets, render, deploy, media,
-                            replication, failover
-  tests/                    pure-python tests (config, network/media, rendering)
+                            kvsync, replication, failover
+  tests/                    pure-python tests (config, network/media, rendering,
+                            installer access)
 pipelines/                  Azure DevOps stage/step templates and variables
 azure-pipelines.yml         ADO pipeline (Checkmarx One + Delinea DSV + gated applies
-                            + media stage: Azure Artifacts feed -> installers blob)
+                            + media stage: Azure Artifacts feed -> installers blob;
+                            agentPoolName flips every stage onto scale-set agents)
 .github/workflows/deploy.yml  equivalent GitHub Actions pipeline
 scripts/silent-install/     placeholder contract for BMC silent-install XML files
 docs/                       setup, configuration, resources, architecture, network,
-                            key vault, Azure DevOps, DR runbook, operations
+                            identity permissions, key vault, Azure DevOps,
+                            DR runbook, operations
 Makefile                    make whatif/deploy/image/failover/fmt/lint/test
 ```
 
@@ -91,16 +128,19 @@ Makefile                    make whatif/deploy/image/failover/fmt/lint/test
 
 | Doc | What it answers |
 |-----|-----------------|
-| `docs/SETUP.md` | **start here** — the numbered end-to-end setup (prereqs → config → network → media feed → image → deploy → media → verify → pipeline → DR drill) |
+| `docs/SETUP.md` | **start here** — the numbered end-to-end setup (prereqs → config → deployer identity → network → media feed → image → deploy → media → verify → pipeline/agent pool → DR drill) |
 | `docs/CONFIGURATION.md` | every `config.yaml` variable: type, default, allowed values, what it changes, which phase consumes it |
 | `docs/RESOURCES.md` | the full inventory of deployed resources per phase, with concrete names, conditions and per-environment counts (python data-plane items marked) |
 | `docs/ARCHITECTURE.md` | diagrams and design decisions, including the image/install model |
-| `docs/NETWORK-REQUIREMENTS.md` | Option A (repo-created network + PoC address plan) and the BYO contract; private-endpoint and DNS zone/link inventory |
-| `docs/KEYVAULT.md` | what is in each Key Vault, who consumes each secret and when, rotation, RBAC/firewall posture |
-| `docs/AZURE-DEVOPS.md` | pipeline setup: WIF, Delinea DSV, Checkmarx One, environments/approvals, the Azure Artifacts media feed |
-| `docs/OPERATIONS.md` | scaling, patching, image revisions, secret rotation, backup/restore |
+| `docs/NETWORK-REQUIREMENTS.md` | the full network requirements list: the cloud-team `network/` folder, PoC address plan, BYO contract, flow/port matrix, private-endpoint and DNS zone/link inventory |
+| `docs/IDENTITY-PERMISSIONS.md` | per-phase permission matrix: the deployer custom role (`identity/`), data-plane roles, the cloud-team and Azure DevOps identities, built-in fallback |
+| `docs/KEYVAULT.md` | what is in each Key Vault, who consumes each secret and when, rotation, RBAC/firewall posture, the kvsync tagging convention |
+| `docs/AZURE-DEVOPS.md` | pipeline setup: WIF, Delinea DSV, Checkmarx One, environments/approvals, the Azure Artifacts media feed, the scale-set agent pool |
+| `docs/OPERATIONS.md` | scaling, patching, image revisions, secret rotation, kvsync/Bastion/build-agent operations, backup/restore |
 | `docs/DR-RUNBOOK.md` | regional failover and failback |
-| `packer/README.md` | golden image lifecycle (OS only — no BMC software) |
+| `network/README.md` | the cloud-team network folder: quickstart, plan, subnet-role table |
+| `functions/kvsync/README.md` | the Key Vault → Control-M sync function |
+| `packer/README.md` | golden image lifecycle: base ctm-rhel9 (OS only — never BMC software) + ctm-agent (agent baked in) |
 
 ## Architecture (per platform)
 
@@ -109,16 +149,20 @@ Makefile                    make whatif/deploy/image/failover/fmt/lint/test
 | Network placement | utility VNet (`network.utility`): EM, LB, PostgreSQL, private endpoints; one VNet per Server (`servers.<stage>.network`): Server VMs + agent VMSS | server VNets peer to the utility VNet only — never to each other (stage isolation) | config-driven per component; agents relocatable via `agents_vnet_name` |
 | Control-M/Enterprise Manager | 2 zonal VMs (`ctm-em-a` zone 1, `ctm-em-b` zone 2) in the utility VNet's em subnet, persistent data disk, shared DB | EM primary/secondary; LB health probe follows the active node | vertical (VM size) |
 | Control-M/Server (one per stage) | 2 zonal VMs per Server (`ctm-srv-<stage>-a/b`) in the stage's own VNet, persistent data disk, own database | Server primary/secondary via Configuration Agent failover | vertical; add a stage by adding a map entry |
-| Control-M/Agents (one pool per Server) | VM Scale Set across 3 zones in the stage's VNet, registered to the Server's host group | zone balanced, self-healing | autoscale on CPU, min/max per stage, Spot optional |
+| Control-M/Agents (one pool per Server) | VM Scale Set across 3 zones in the stage's VNet, booting the **ctm-agent** image (agent baked in; configured + registered at boot), registered to the Server's host group | zone balanced, self-healing | autoscale on CPU, min/max per stage, Spot optional; agent upgrades roll via image-version bumps (VMSS model update) |
 | Database | Azure Database for PostgreSQL Flexible Server | **ZoneRedundant** standby, automatic failover | SKU/storage per env, auto-grow |
 | Shared filesystem | Azure Files Premium, **NFS 4.1**, ZRS | zone redundant | quota per env |
 | Media/backups | Blob storage, RA-GZRS | geo redundant | — |
 | Entry point | Standard Load Balancer (zone-redundant frontend) `ctm-web.<env>.ctm.internal` → 8443 | probes `/ControlM/` on both EM nodes | — |
+| Global entry point (prod) | private Application Gateway (L4 TCP 443/8443) `ctm-global.prod.ctm.internal` — backend pool = primary **and** DR internal LBs | TCP health probe keeps only answering regions in rotation (automatic primary/DR) | autoscale 1–2 |
+| Operator access | Azure Bastion (Standard) in the utility VNet — SSH to every node and build agent, DR included via the global peering; no VM has a public IP | — | — |
+| Secret sync | `ctm-<env>-kvsync` Durable Function (EP1, VNet-integrated): Key Vault secrets tagged `ctm-sync=true` → Control-M secret store via the Automation API | — | schedule per `kv_sync.schedule` |
+| Build agents (prod) | `ctm-build-agents` VMSS in `vnet-ctm-build` (peered to all three utility VNets) — Azure DevOps elastic pool | — | capacity owned by the ADO pool |
 | Secrets | Key Vault (RBAC, private endpoint), VM managed identity | — | — |
 | Monitoring | Log Analytics + Azure Monitor Agent, metric alerts, Service Health | — | — |
 | Backup | Recovery Services vault (GRS + cross-region restore in prod), daily VM + file share | — | — |
 | DR (prod platform) | second region: PostgreSQL cross-region replica, **Site Recovery** replication of the EM VMs + the VMs of Servers opted in via `dr.server_networks` (shipped config: CTM_PROD only), replicated installers, warm agent scale set per DR-protected Server, optional Traffic Manager | — | — |
-| Golden image | **ctm-rhel9** in Compute Gallery `ctmgallery` (`ctm-images-rg`), versions replicated to both regions | — | rebuild with Packer, bump `image.image_version` |
+| Golden images | **ctm-rhel9** (base, OS only) + **ctm-agent** (agent baked in) in Compute Gallery `ctmgallery` (`ctm-images-rg`), versions replicated to both regions | — | rebuild with Packer, bump `image.base.version` / `image.agent.version` (agent revisions roll via VMSS model update) |
 
 Node identity is stable: hostnames, persistent `/ctm` data disks and the
 `ctm-db` / `ctm-web` DNS aliases are identical in the primary and DR regions,
@@ -146,29 +190,35 @@ environment with one Server).
 
 ## Prerequisites
 
-1. **Networks** in each region (see `docs/NETWORK-REQUIREMENTS.md`): either
-   bring your own — a utility VNet (`network.utility`) with an em subnet, a
-   subnet delegated to `Microsoft.DBforPostgreSQL/flexibleServers` and a
-   private-endpoint subnet, plus **one VNet per Control-M/Server**
-   (`servers.<stage>.network`) with a server subnet and (optionally separate)
-   agents subnet, each peered to the utility VNet, and the DR equivalents
-   (`dr.network.utility`, `dr.server_networks`) where DR is enabled — **or**
-   flip `network_infrastructure.create: true` and let
-   `ctmdeploy deploy --phase network` provision all of it from the address
-   plan shipped in the config files (Option A). Hub-managed private DNS zones
-   can be passed in; missing ones are created in the platform resource group
-   and linked to every platform VNet.
-2. **BMC media** (EPD download) for Control-M/EM and Control-M/Server, plus the four
-   silent-install XML files described in `scripts/silent-install/README.md` —
-   published as Universal Packages to the `ctm-media` Azure Artifacts feed
-   (`docs/AZURE-DEVOPS.md` §5), or staged in a local directory for a manual
-   `ctmdeploy media upload`.
-3. **Azure identity** running the deployment with `Contributor` + `User Access
-   Administrator` (role assignments) on the subscription; `Key Vault Secrets
-   Officer` is granted automatically to the deployer object id you pass.
+1. **Networks** in each region (the full requirements list:
+   `docs/NETWORK-REQUIREMENTS.md`): either bring your own — a utility VNet
+   (`network.utility`) with em/data/pe subnets plus the access-layer subnets
+   (`AzureBastionSubnet`, `snet-ctm-appgw` on prod, `snet-ctm-func`), **one
+   VNet per Control-M/Server** (`servers.<stage>.network`) peered to the
+   utility VNet, the DR equivalents (`dr.network.utility`,
+   `dr.server_networks`), the prod ⇄ DR **global** utility peering and the
+   build VNet — **or** have the cloud team deploy exactly that from the
+   standalone **`network/` folder** with the az CLI alone
+   (`network/README.md`); the pipeline can also deploy the same plan via
+   `network_infrastructure.create: true` → `--phase network`. Hub-managed
+   private DNS zones can be passed in; missing ones are created in the
+   platform resource group and linked to every platform VNet.
+2. **BMC media** (EPD download) for Control-M/EM, Control-M/Server **and
+   Control-M/Agent**, plus the five silent-install XML files described in
+   `scripts/silent-install/README.md` — published as Universal Packages to
+   the `ctm-media` Azure Artifacts feed (`docs/AZURE-DEVOPS.md` §5), or
+   staged in a local directory for a manual `ctmdeploy media upload`.
+3. **Azure identity** running the deployment with the **Control-M Platform
+   Deployer** custom role (`identity/deployer-role.bicep` — everything except
+   network writes) plus the data-plane pair Key Vault Secrets Officer /
+   Storage Blob Data Contributor, or the broader built-in fallback
+   `Contributor` + `User Access Administrator`. Per-phase matrix:
+   `docs/IDENTITY-PERMISSIONS.md`. The network deployment itself needs the
+   cloud team's identity (Network Contributor on `rg-network-*`).
 4. **Tools**: Python ≥ 3.11, the Bicep CLI, Azure CLI (login only), Packer ≥ 1.10
    for image builds; (optional) pre-commit.
-   `pip install -e deploy/` installs `ctmdeploy`.
+   `pip install -e deploy/` installs `ctmdeploy`. The **nodes** need nothing:
+   the installer is stdlib-only python on the image's system python3.
 
 ## Deploy
 
@@ -192,17 +242,23 @@ python -m ctmdeploy image build  --env prod --version 1.0.0
 # 3. what-if, then deploy the phases
 python -m ctmdeploy whatif --env nonprod
 python -m ctmdeploy deploy --env nonprod --phase all
-#    phases, in order: network -> rg -> foundation -> secrets -> compute -> dr -> replication
-#    (network only when network_infrastructure.create; dr/replication only where
-#     dr.enabled; any phase can be re-run alone)
+#    phases, in order: network -> rg -> foundation -> secrets -> compute ->
+#    access -> dr -> replication (network only when
+#    network_infrastructure.create; dr/replication only where dr.enabled; any
+#    phase can be re-run alone). compute uploads the node installer to blob
+#    first; access adds Bastion, ctm-global (prod), kvsync infra, build agents.
+python -m ctmdeploy kvsync deploy --env nonprod   # push the sync function code
 
 # 4. publish media + silent XMLs into the installers container(s):
 #    pipeline (publishMedia=true), or from a staged directory:
 python -m ctmdeploy media upload --env nonprod --path ./media
 #    (prod uploads to the primary AND DR containers; warns about missing blobs)
 
-# 5. the EM/Server VMs are already booting and retry the download; follow with
-az serial-console connect ... # or: ssh via Bastion, then tail -f /var/log/ctm-bootstrap.log
+# 5. the VMs are already booting and retry the download; follow with
+az network bastion ssh --name ctm-nonprod-bastion -g ctm-nonprod-rg \
+  --target-ip-address <node IP> --auth-type ssh-key --username ctmops --ssh-key ./ctmops.pem
+tail -f /var/log/ctm-bootstrap.log   # idempotent installer; re-run any time:
+                                     # systemctl start ctm-install.service
 ```
 
 There is no state backend and no bootstrap step: every deployment is a
@@ -244,6 +300,12 @@ orchestrator guards the few properties ARM cannot converge on its own:
   swap after an HA failover is not fought.
 * **Secrets** are seeded only when absent (or explicitly overridden) — never
   rotated silently.
+* **The node install itself** is idempotent, not just the deployments: the
+  stdlib-only installer is a stage machine (`/var/lib/ctm/install-state.json`
+  + real-state markers such as `.ctm_installed` on the persistent disk and
+  `.extracted` on the shared media cache, with an flock around extraction),
+  so re-running it — or rebooting mid-install — converges
+  (`systemctl start ctm-install.service`).
 
 The one thing re-running does **not** do is remove drift: Incremental
 deployments never delete resources, so anything renamed in config or created
@@ -261,11 +323,13 @@ what a run would change.
 * **Promote job definitions** between stages with the Automation API
   (`ctm deploy` against the stage's Server) or Workload Change Manager; the
   infrastructure pipeline only promotes platform changes.
-* **Certificates**: EM ships a self-signed certificate; replace it and remove
-  the `-k` / `NODE_TLS_REJECT_UNAUTHORIZED=0` shortcuts in
-  `cloud-init/agent.sh.tmpl`.
-* **Validate CLI syntax** of the `ctm provision` / `ctm config` commands in the
-  agent template against `ctm provision -h` for your Control-M release.
+* **Certificates**: EM ships a self-signed certificate; replace it, then set
+  the kvsync app setting `CTM_VERIFY_TLS=true` and remove the flagged
+  unverified-TLS contexts in `node-scripts/ctm_node_install.py` (the agent
+  registration calls — the same posture as the old `-k`).
+* **Validate the Automation API endpoints** the installer and the kvsync
+  function call (`/session/login`, host-group add/deregister, `run/secret`)
+  against your Control-M release — paths follow 9.0.21.
 * **DR drills** (`python -m ctmdeploy failover --env prod --test`) at least
   quarterly.
 

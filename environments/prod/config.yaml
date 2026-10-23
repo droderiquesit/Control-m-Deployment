@@ -42,27 +42,55 @@ network:
 
 # Optional full network ("Option A" in docs/NETWORK-REQUIREMENTS.md): every
 # VNet the placement blocks above (and dr: below) reference, provisioned by
-# `ctmdeploy deploy --env prod --phase network` (bicep/network.bicep:
-# resource groups, VNets, subnets, one NSG per subnet, spoke <-> utility
-# peering — DR VNets included, in the DR region). Default stays bring-your-own
+# `ctmdeploy deploy --env prod --phase network` (network/main.bicep:
+# resource groups, VNets, subnets, one NSG per subnet — bastion subnet
+# excepted — and every peering, both directions: spoke <-> utility per region,
+# prod-utility <-> dr-utility GLOBAL, build <-> all three utility VNets; DR
+# VNets included, in the DR region). Default stays bring-your-own
 # (create: false); the vnets list below is the complete PoC address plan, so
-# flipping the one flag provisions it. Address spaces are non-overlapping
-# across all platforms AND between primary and DR (required for DR/failback
+# flipping the one flag provisions it. The cloud team can deploy the SAME plan
+# with az alone from network/params/prod.bicepparam (keep the two in sync; see
+# network/README.md; deploy the NONPROD plan first — the build VNet peers into
+# vnet-dev-utility). Address spaces are non-overlapping across all platforms
+# AND between primary and DR (required for DR/failback and build-agent
 # peering).
 network_infrastructure:
   create: false            # true = ctmdeploy provisions the full network below
-  user_access_cidrs: []    # CIDRs allowed to reach Control-M Web/API (NSG rule)
-  bastion_cidrs: []        # CIDRs allowed SSH 22 to nodes
+  user_access_cidrs:       # CIDRs allowed to reach Control-M Web/API (NSG rule).
+    - "10.70.2.64/26"      # Keep the snet-ctm-appgw prefix: the Application
+                           # Gateway's backend connections to the EM internal
+                           # LBs of BOTH regions ride this rule. Append
+                           # operator CIDRs as needed.
+  bastion_cidrs:           # CIDRs allowed SSH 22 to nodes/build agents. Keep
+    - "10.70.2.0/26"       # the AzureBastionSubnet prefix: Bastion sessions
+                           # egress from it (DR reach over the global peering
+                           # included) and the agents/build subnets only allow
+                           # SSH from these CIDRs. Append operator CIDRs as
+                           # needed.
   vnets:                   # every VNet referenced by the placement blocks above
     - name: vnet-prod-utility
       resource_group_name: rg-network-prod
       location: eastus2
-      role: utility        # utility | spoke
+      role: utility        # utility | spoke | build | external (network/README.md)
+      # Utility <-> utility GLOBAL peering: the Application Gateway reaches the
+      # DR internal LB and Azure Bastion reaches the DR utility VNet. peer_to
+      # takes a name or a list; declare each pairing on ONE side only (both
+      # directions are emitted automatically).
+      peer_to: [vnet-dr-utility]
       address_space: 10.70.0.0/22
       subnets:
         - {name: snet-ctm-em,       prefix: 10.70.0.0/24,  role: em}
         - {name: snet-ctm-postgres, prefix: 10.70.1.0/27,  role: data}
         - {name: snet-ctm-pe,       prefix: 10.70.1.64/26, role: pe}
+        # Azure Bastion (access.bastion.enabled) — the literal subnet name is
+        # an Azure requirement; no NSG (Azure Bastion manages its own plane).
+        - {name: AzureBastionSubnet, prefix: 10.70.2.0/26, role: bastion}
+        # Application Gateway Standard_v2 private frontend (access.appgw.enabled):
+        # balances ctm-global across the primary and DR internal LBs.
+        - {name: snet-ctm-appgw,    prefix: 10.70.2.64/26, role: appgw}
+        # kvsync Function App VNet integration (kv_sync.enabled); delegated
+        # to Microsoft.Web/serverFarms.
+        - {name: snet-ctm-func,     prefix: 10.70.2.128/26, role: func}
     - name: vnet-ctm-uat
       resource_group_name: rg-network-prod
       location: eastus2
@@ -99,6 +127,32 @@ network_infrastructure:
       subnets:
         - {name: snet-ctm-server, prefix: 10.80.9.0/26,  role: server}
         - {name: snet-ctm-agents, prefix: 10.80.9.64/26, role: agents}
+    # Azure DevOps scale-set build agents (build_agents block below): peered
+    # to ALL THREE utility VNets so pipeline deployments reach nonprod, prod
+    # AND DR. vnet-dev-utility belongs to the NONPROD plan — the peering
+    # crosses environment configs by VNet name and resolves through the
+    # `role: external` entry below, so `ctmdeploy deploy --phase network`
+    # emits the build <-> vnet-dev-utility pair too (both directions, the
+    # nonprod side landing in rg-network-nonprod), exactly like the cloud
+    # team's network/params/prod.bicepparam. Deploy the NONPROD plan first.
+    # See network/README.md.
+    - name: vnet-ctm-build
+      resource_group_name: rg-network-prod
+      location: eastus2
+      role: build
+      peer_to: [vnet-dev-utility, vnet-prod-utility, vnet-dr-utility]
+      address_space: 10.90.0.0/24
+      subnets:
+        - {name: snet-ctm-build, prefix: 10.90.0.0/26, role: build}
+    # RESOLUTION-ONLY (role external): vnet-dev-utility is created by the
+    # NONPROD plan; declaring its name + resource group + address space here
+    # lets the build-VNet peering above resolve (and its space feed the NSG
+    # rules). Nothing is created for this entry — no subnets, no peer_to.
+    - name: vnet-dev-utility
+      resource_group_name: rg-network-nonprod
+      location: eastus2
+      role: external
+      address_space: 10.60.0.0/22
 
 deployer_ip_cidrs:
   - "203.0.113.10/32"
@@ -107,17 +161,59 @@ key_vault_public_access: true
 
 ctm_version: "9.0.21.300"
 
-# Blob-name overrides for installers / silent XMLs; {} keeps the defaults
-# (same blob names as before the toolchain migration).
+# Blob-name overrides for the EM/Server installers / silent XMLs; {} keeps
+# the defaults (same blob names as before the toolchain migration). v4.1:
+# there are NO agent keys — the Control-M/Agent is baked into the ctm-agent
+# golden image, so agent media never reaches the installers container.
 installer_blobs: {}
 
-# Compute Gallery golden image published by Packer (packer/ctm-rhel9.pkr.hcl).
-# All VMs and scale sets boot from this image instead of the marketplace image.
+# Access layer (deployed by `ctmdeploy deploy --env prod --phase access`,
+# after compute and before dr): Azure Bastion into the utility VNet
+# (AzureBastionSubnet) and the PRIVATE Application Gateway (snet-ctm-appgw)
+# whose single backend pool holds BOTH internal LB frontend IPs — primary
+# and DR. Healthy-only routing makes ctm-global.<zone> follow whichever
+# region's EM answers (automatic primary/DR behavior).
+access:
+  bastion: {enabled: true}
+  appgw: {enabled: true}
+
+# Key Vault -> Control-M secret sync (functions/kvsync Durable Function,
+# infra from the access phase, code via `ctmdeploy kvsync deploy`). The
+# function's managed identity only READS tagged secrets (Key Vault Secrets
+# User); see functions/kvsync/README.md for the ctm-sync/ctm-name tags.
+kv_sync:
+  enabled: true
+  schedule: "0 */15 * * * *" # NCRONTAB (6 fields): every 15 minutes
+
+# Azure DevOps scale-set build agents (uniform VMSS ctm-build-agents in its
+# own resource group, Ubuntu 22.04, Manual upgrade, no autoscale — the ADO
+# elastic pool owns capacity). The VNet below is the build VNet from the
+# network plan, peered to the nonprod, prod AND DR utility VNets so one
+# agent pool deploys into all three platforms. After deployment: register
+# the VMSS as an ADO elastic pool; ADO's service principal needs VMSS
+# Contributor on ctm-build-rg (documented in docs/AZURE-DEVOPS.md — not
+# granted here).
+build_agents:
+  enabled: true
+  resource_group: ctm-build-rg
+  vm_size: Standard_D4s_v5
+  instances: 2
+  network:
+    vnet_name: vnet-ctm-build
+    vnet_resource_group_name: rg-network-prod
+    subnet_name: snet-ctm-build
+
+# Compute Gallery golden images published by Packer (v4.1 two-image model):
+# base = ctm-rhel9 (OS only; EM/Server VMs — packer/ctm-rhel9.pkr.hcl),
+# agent = ctm-agent (OS prep + Control-M/Agent silent-installed but
+# UNCONFIGURED; the agent scale sets — packer/ctm-agent.pkr.hcl). Bumping
+# agent.version + a compute deploy rolls the VMSS model: new instances boot
+# the new image.
 image:
   gallery_resource_group: ctm-images-rg
   gallery_name: ctmgallery
-  image_definition: ctm-rhel9
-  image_version: latest # or an explicit version such as "1.0.0"
+  base:  {definition: ctm-rhel9, version: latest} # or a pinned "1.0.0"
+  agent: {definition: ctm-agent, version: latest}
 
 em:
   vm_size: Standard_D16s_v5
@@ -246,4 +342,5 @@ media:
     packages:                 # universal packages holding the BMC EPD files + silent XMLs
       em:         {name: control-m-em,         version: "9.0.21.300"}
       server:     {name: control-m-server,     version: "9.0.21.300"}
+      agent:      {name: control-m-agent,      version: "9.0.21.300"}
       silent_xml: {name: control-m-silent-xml, version: "1.0.0"}

@@ -47,8 +47,10 @@ _GUID_RE = re.compile(
 )
 
 # Default blob names for BMC media, byte-for-byte the old platform-module
-# installer_blobs defaults. They intentionally do NOT
-# track ctm_version — override installer_blobs in config.yaml for other media.
+# installer_blobs defaults. EM/Server only (v4.1): the Control-M/Agent is
+# BAKED into the ctm-agent Packer image, so no agent media ever reaches the
+# platform blob containers. They intentionally do NOT track ctm_version —
+# override installer_blobs in config.yaml for other media.
 DEFAULT_INSTALLER_BLOBS: dict[str, str] = {
     "em_installer": "em/DREM.9.0.21.300_Linux-x86_64.tar.Z",
     "server_installer": "server/DRSRV.9.0.21.300_Linux-x86_64.tar.Z",
@@ -249,21 +251,40 @@ class ServerNetworkConfig:
 
 
 @dataclass(frozen=True)
+class ImageRef:
+    """One gallery image definition + version (the image.base / image.agent shape)."""
+
+    definition: str
+    version: str = "latest"
+
+
+@dataclass(frozen=True)
 class ImageConfig:
-    """Azure Compute Gallery image every VM/VMSS boots from (built by Packer)."""
+    """Azure Compute Gallery images the VMs/VMSS boot from (built by Packer).
+
+    v4.1 two-image model: ``base`` (ctm-rhel9, OS only — EM/Server VMs) and
+    ``agent`` (ctm-agent, OS prep + the Control-M/Agent silent-installed but
+    unconfigured — the agent VM scale sets).
+    """
 
     gallery_resource_group: str = "ctm-images-rg"
     gallery_name: str = "ctmgallery"
-    image_definition: str = "ctm-rhel9"
-    image_version: str = "latest"
+    base: ImageRef = field(default_factory=lambda: ImageRef("ctm-rhel9"))
+    agent: ImageRef = field(default_factory=lambda: ImageRef("ctm-agent"))
 
-    def image_id(self, subscription_id: str) -> str:
+    def ref(self, kind: str) -> ImageRef:
+        if kind not in ("base", "agent"):
+            raise ConfigError(f"image kind must be base or agent, got {kind!r}")
+        return self.base if kind == "base" else self.agent
+
+    def image_id(self, subscription_id: str, kind: str = "base") -> str:
         """Full ARM id of the gallery image version ('latest' is ARM-valid)."""
+        ref = self.ref(kind)
         return (
             f"/subscriptions/{subscription_id}"
             f"/resourceGroups/{self.gallery_resource_group}"
             f"/providers/Microsoft.Compute/galleries/{self.gallery_name}"
-            f"/images/{self.image_definition}/versions/{self.image_version}"
+            f"/images/{ref.definition}/versions/{ref.version}"
         )
 
 
@@ -475,7 +496,11 @@ class DrConfig:
 
 @dataclass(frozen=True)
 class InstallerBlobs:
-    """Blob names (inside the installers container) uploaded from BMC EPD."""
+    """Blob names (inside the installers container) uploaded from BMC EPD.
+
+    EM/Server only — the agent media feeds the ctm-agent Packer build (v4.1)
+    and never reaches the platform blob containers.
+    """
 
     em_installer: str
     server_installer: str
@@ -486,19 +511,82 @@ class InstallerBlobs:
 
 
 # ---------------------------------------------------------------------------
-# v3: optional full-network infrastructure (bicep/network.bicep) — BYO stays
+# v4: access layer (Bastion + private Application Gateway), Key Vault ->
+# Control-M sync function, and the Azure DevOps build-agent scale set.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AccessConfig:
+    """The `access:` block — Bastion and the private Application Gateway.
+
+    `appgw` is parsed for every environment but HONORED on prod only (the
+    gateway balances across the primary + DR internal load balancers, which
+    only prod has).
+    """
+
+    bastion_enabled: bool = False
+    appgw_enabled: bool = False
+
+    @property
+    def any_enabled(self) -> bool:
+        return self.bastion_enabled or self.appgw_enabled
+
+
+@dataclass(frozen=True)
+class KvSyncConfig:
+    """The `kv_sync:` block — the Key Vault -> Control-M Durable Function."""
+
+    enabled: bool = False
+    schedule: str = "0 */15 * * * *"  # NCRONTAB, every 15 minutes
+
+
+@dataclass(frozen=True)
+class BuildAgentsConfig:
+    """The `build_agents:` block — the Azure DevOps build-agent VMSS (prod).
+
+    The scale set lands in its own VNet (vnet-ctm-build), peered to the
+    nonprod, prod and DR utility VNets so one elastic pool can deploy into
+    all three platforms.
+    """
+
+    enabled: bool = False
+    resource_group: str = "ctm-build-rg"
+    vm_size: str = "Standard_D4s_v5"
+    instances: int = 2
+    vnet_name: str = ""
+    vnet_resource_group_name: str = ""
+    subnet_name: str = ""
+
+
+# ---------------------------------------------------------------------------
+# v3/v4: optional full-network infrastructure (network/main.bicep, the
+# standalone folder the cloud team can deploy with az alone) — BYO stays
 # the default (`create: false`); the vnets list then documents the PoC plan.
 # ---------------------------------------------------------------------------
 
-#: Valid `role` values of a network_infrastructure.vnets entry.
-VNET_ROLES = ("utility", "spoke")
+#: Valid `role` values of a network_infrastructure.vnets entry. 'external' is
+#: resolution-only (name + resource group + address space of a VNet ANOTHER
+#: plan deploys — e.g. the prod config declaring the nonprod vnet-dev-utility
+#: so the build VNet peering resolves); nothing is created for it and it
+#: carries no subnets.
+VNET_ROLES = ("utility", "spoke", "build", "external")
 #: Valid `role` values of a subnet inside a vnets entry (drives the NSG rules).
-SUBNET_ROLES = ("em", "data", "pe", "server", "agents")
+SUBNET_ROLES = ("em", "data", "pe", "server", "agents", "bastion", "appgw", "func", "build")
+#: Azure requires the Bastion subnet to carry exactly this name (no NSG here).
+BASTION_SUBNET_NAME = "AzureBastionSubnet"
 
 
 @dataclass(frozen=True)
 class SubnetSpec:
-    """One subnet of a to-be-created VNet; `role` selects its NSG rule set."""
+    """One subnet of a to-be-created VNet; `role` selects its NSG rule set.
+
+    v4 roles: `bastion` (must be named AzureBastionSubnet, gets NO NSG),
+    `appgw` (Application Gateway v2 NSG: GatewayManager 65200-65535 +
+    user-facing 443/8443), `func` (Microsoft.Web/serverFarms delegation for
+    the kvsync Function's VNet integration) and `build` (SSH from bastion/
+    utility only; the ADO build-agent scale set).
+    """
 
     name: str
     prefix: str
@@ -512,9 +600,18 @@ class SubnetSpec:
 class VnetSpec:
     """One VNet of the optional full-network deployment.
 
-    role 'utility' hosts the em/data/pe subnets; role 'spoke' hosts a
-    server/agents pair and MUST name its utility VNet in `peer_to` (the
-    network deployment creates the peering in both directions).
+    role 'utility' hosts the em/data/pe (+ bastion/appgw/func) subnets;
+    role 'spoke' hosts a server/agents pair and MUST name its utility VNet
+    in `peer_to`; role 'build' (v4) hosts the ADO build agents and peers to
+    EVERY utility VNet it lists — peer_to entries may name VNets from the
+    OTHER environment's config (cross-environment peering by VNet name; the
+    network deployment builds the remote id from name + resource group);
+    role 'external' (v4.1) is a RESOLUTION-ONLY entry — the name, resource
+    group and address space of a VNet another plan deploys (no subnets, no
+    peer_to of its own; nothing is created for it), so peer_to names like the
+    prod build VNet -> nonprod vnet-dev-utility resolve on the ctmdeploy path
+    too. `peer_to` accepts a string or a list in YAML; it is normalized to a
+    tuple here.
     """
 
     name: str
@@ -523,10 +620,13 @@ class VnetSpec:
     role: str  # one of VNET_ROLES
     address_space: str
     subnets: tuple[SubnetSpec, ...]
-    peer_to: str = ""  # spokes only: the utility VNet to peer with
+    peer_to: tuple[str, ...] = ()  # spokes: exactly their utility; build: 1+
 
     def subnet(self, name: str) -> SubnetSpec | None:
         return next((s for s in self.subnets if s.name == name), None)
+
+    def subnet_by_role(self, role: str) -> SubnetSpec | None:
+        return next((s for s in self.subnets if s.role == role), None)
 
 
 @dataclass(frozen=True)
@@ -554,42 +654,24 @@ class NetworkInfrastructure:
         return [v.address_space for v in self.vnets if v.role == "spoke"]
 
     def vnets_param(self) -> list[dict[str, Any]]:
-        """Items of the bicep/network.bicep `vnets` param.
-
-        Each item is the config shape verbatim plus the resolved
-        `peerAddressSpaces` (the address spaces of the VNets it is peered
-        with: a spoke's utility, or every spoke peering into a utility) and
-        `spokeAddressSpaces` (utility items: ALL spoke address spaces; empty
-        on spokes).
+        """Items of the network/main.bicep `vnets` param: the RAW config
+        shape, with `peer_to` normalized to a list. All peer/spoke address-
+        space resolution now happens INSIDE network/main.bicep (bicep
+        map/filter), so the cloud team can deploy the folder with nothing
+        but the az CLI — no python required.
         """
-        all_spokes = self.spoke_address_spaces()
-        items: list[dict[str, Any]] = []
-        for vnet in self.vnets:
-            if vnet.role == "utility":
-                peer_spaces = [
-                    s.address_space
-                    for s in self.vnets
-                    if s.role == "spoke" and s.peer_to == vnet.name
-                ]
-                spoke_spaces = list(all_spokes)
-            else:
-                peer = self.vnet(vnet.peer_to)
-                peer_spaces = [peer.address_space] if peer is not None else []
-                spoke_spaces = []
-            items.append(
-                {
-                    "name": vnet.name,
-                    "resource_group_name": vnet.resource_group_name,
-                    "location": vnet.location,
-                    "role": vnet.role,
-                    "peer_to": vnet.peer_to,
-                    "address_space": vnet.address_space,
-                    "subnets": [s.as_param() for s in vnet.subnets],
-                    "peerAddressSpaces": peer_spaces,
-                    "spokeAddressSpaces": spoke_spaces,
-                }
-            )
-        return items
+        return [
+            {
+                "name": vnet.name,
+                "resource_group_name": vnet.resource_group_name,
+                "location": vnet.location,
+                "role": vnet.role,
+                "peer_to": list(vnet.peer_to),
+                "address_space": vnet.address_space,
+                "subnets": [s.as_param() for s in vnet.subnets],
+            }
+            for vnet in self.vnets
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -598,8 +680,11 @@ class NetworkInfrastructure:
 # to the installers blob container of each platform).
 # ---------------------------------------------------------------------------
 
-#: Required package keys under media.azure_artifacts.packages.
-MEDIA_PACKAGE_KEYS = ("em", "server", "silent_xml")
+#: Required package keys under media.azure_artifacts.packages. v4.1: the
+#: `agent` package feeds the PACKER ctm-agent image build (pipeline image
+#: stage), NOT the platform blob containers; em/server/silent_xml are what
+#: `ctmdeploy media upload` publishes to blob.
+MEDIA_PACKAGE_KEYS = ("em", "server", "agent", "silent_xml")
 
 
 @dataclass(frozen=True)
@@ -747,6 +832,10 @@ class EnvironmentConfig:
     # v3 optional blocks (absent from config.yaml -> inert defaults).
     network_infrastructure: NetworkInfrastructure = field(default_factory=NetworkInfrastructure)
     media: MediaConfig = field(default_factory=MediaConfig)
+    # v4 optional blocks: access layer, KV->Control-M sync, ADO build agents.
+    access: AccessConfig = field(default_factory=AccessConfig)
+    kv_sync: KvSyncConfig = field(default_factory=KvSyncConfig)
+    build_agents: BuildAgentsConfig = field(default_factory=BuildAgentsConfig)
 
     # ---- names -----------------------------------------------------------
     @property
@@ -858,9 +947,10 @@ class EnvironmentConfig:
         """DR replica SKU: dr.replica_sku_name, falling back to the primary SKU."""
         return self.dr.replica_sku_name or self.database.sku_name
 
-    def image_id(self) -> str:
-        """ARM id of the gallery image version all nodes boot from."""
-        return self.image.image_id(self.subscription_id)
+    def image_id(self, kind: str = "base") -> str:
+        """ARM id of a gallery image version: 'base' (EM/Server VMs) or
+        'agent' (the agent VM scale sets — the ctm-agent Packer image)."""
+        return self.image.image_id(self.subscription_id, kind)
 
     def dr_agent_pool_name(self, stage: str) -> str:
         return f"{self.dr_name}-agents-{stage}"
@@ -931,6 +1021,71 @@ class EnvironmentConfig:
         """Agent VMSS -> the server's agents subnet (same VNet unless relocated)."""
         net = self.server_network(key, role)
         return self.subnet_id(net.agents_vnet_resource_group, net.agents_vnet, net.agents_subnet)
+
+    # ---- v4 access-layer placement (utility VNet subnets by ROLE, resolved
+    # through the network_infrastructure plan — the plan documents the same
+    # subnets whether networking is created by network/ or brought-your-own).
+
+    def _utility_role_subnet(self, subnet_role: str, region: str = "primary") -> tuple[str, str, str]:
+        """(resource group, vnet, subnet name) of the region's utility subnet
+        carrying `subnet_role` in the network_infrastructure plan."""
+        utility = self.region_network(region).utility
+        plan = self.network_infrastructure.vnet(utility.vnet_name)
+        if plan is None:
+            raise ConfigError(
+                f"network_infrastructure.vnets has no entry for the {region} utility VNet "
+                f"{utility.vnet_name!r}; the access layer derives its subnet ids from that "
+                "plan (add the VNet with its bastion/appgw/func subnets)"
+            )
+        subnet = plan.subnet_by_role(subnet_role)
+        if subnet is None:
+            raise ConfigError(
+                f"network_infrastructure.vnets[{utility.vnet_name}] has no role-"
+                f"{subnet_role!r} subnet; add it to the plan (see docs/NETWORK-REQUIREMENTS.md)"
+            )
+        return (utility.vnet_resource_group_name, utility.vnet_name, subnet.name)
+
+    def bastion_subnet_id(self, region: str = "primary") -> str:
+        """AzureBastionSubnet in the region's utility VNet."""
+        rg, vnet, subnet = self._utility_role_subnet("bastion", region)
+        return self.subnet_id(rg, vnet, subnet)
+
+    def appgw_subnet_id(self, region: str = "primary") -> str:
+        """The Application Gateway subnet in the region's utility VNet."""
+        rg, vnet, subnet = self._utility_role_subnet("appgw", region)
+        return self.subnet_id(rg, vnet, subnet)
+
+    def func_subnet_id(self, region: str = "primary") -> str:
+        """The delegated Function-integration subnet in the utility VNet."""
+        rg, vnet, subnet = self._utility_role_subnet("func", region)
+        return self.subnet_id(rg, vnet, subnet)
+
+    def build_agents_subnet_id(self) -> str:
+        """The build-agent VMSS subnet (from the build_agents.network block)."""
+        ba = self.build_agents
+        if not (ba.vnet_name and ba.vnet_resource_group_name and ba.subnet_name):
+            raise ConfigError(
+                "build_agents.network is incomplete: vnet_name, "
+                "vnet_resource_group_name and subnet_name are all required"
+            )
+        return self.subnet_id(ba.vnet_resource_group_name, ba.vnet_name, ba.subnet_name)
+
+    @property
+    def key_vault_id(self) -> str:
+        """ARM id of the primary Key Vault (names are deterministic)."""
+        return (
+            f"/subscriptions/{self.subscription_id}/resourceGroups/{self.resource_group_name}"
+            f"/providers/Microsoft.KeyVault/vaults/{self.key_vault_name}"
+        )
+
+    @property
+    def ctm_api_base(self) -> str:
+        """EM Automation API base URL through the internal load balancer."""
+        return f"https://{self.web_alias}:{self.em.web_port}/automation-api"
+
+    @property
+    def kvsync_function_app_name(self) -> str:
+        return f"{self.name}-kvsync"
 
     def all_vnets(self, role: str = "primary") -> list[dict[str, str]]:
         """Deduped `{name, resourceGroupName}` list of EVERY VNet in a region:
@@ -1264,7 +1419,36 @@ def _parse_subnet_spec(raw: Any, path: str) -> SubnetSpec:
     )
     if spec.role not in SUBNET_ROLES:
         raise ConfigError(f"{path}.role: must be one of {SUBNET_ROLES}, got {spec.role!r}")
+    # Azure hard-codes the Bastion subnet name; catch the drift at load time.
+    if spec.role == "bastion" and spec.name != BASTION_SUBNET_NAME:
+        raise ConfigError(
+            f"{path}.name: a role-'bastion' subnet must be named exactly "
+            f"{BASTION_SUBNET_NAME!r} (Azure requirement), got {spec.name!r}"
+        )
+    if spec.name == BASTION_SUBNET_NAME and spec.role != "bastion":
+        raise ConfigError(
+            f"{path}.role: subnet {BASTION_SUBNET_NAME!r} must carry role 'bastion', "
+            f"got {spec.role!r}"
+        )
     return spec
+
+
+def _parse_peer_to(data: Mapping[str, Any], path: str) -> tuple[str, ...]:
+    """`peer_to` is a string OR a list of strings (v4); '' / absent -> ()."""
+    value = data.get("peer_to")
+    if value is None or value == "":
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, (list, tuple)):
+        items = tuple(str(item) for item in value)
+        if len(set(items)) != len(items):
+            raise ConfigError(f"{path}.peer_to: duplicate entries in {list(items)}")
+        return items
+    raise ConfigError(
+        f"{path}.peer_to: expected a string or a list of strings, "
+        f"got {type(value).__name__}"
+    )
 
 
 def _parse_vnet_spec(raw: Any, path: str) -> VnetSpec:
@@ -1273,7 +1457,24 @@ def _parse_vnet_spec(raw: Any, path: str) -> VnetSpec:
     if role not in VNET_ROLES:
         raise ConfigError(f"{path}.role: must be one of {VNET_ROLES}, got {role!r}")
     subnets_raw = data.get("subnets")
-    if not isinstance(subnets_raw, (list, tuple)) or not subnets_raw:
+    if role == "external":
+        # Resolution-only: name + resource group + address space; another
+        # plan deploys the VNet, so declaring subnets or peer_to here would
+        # silently do nothing — reject the drift instead.
+        if subnets_raw:
+            raise ConfigError(
+                f"{path}.subnets: a role-'external' entry is resolution-only "
+                "(name, resource_group_name, location, address_space) and "
+                "must not declare subnets — the plan that OWNS the VNet does"
+            )
+        if data.get("peer_to"):
+            raise ConfigError(
+                f"{path}.peer_to: a role-'external' entry declares no peerings "
+                "of its own; the peering is declared on the local VNet that "
+                "names this entry in ITS peer_to"
+            )
+        subnets_raw = []
+    elif not isinstance(subnets_raw, (list, tuple)) or not subnets_raw:
         raise ConfigError(f"{path}.subnets: expected a non-empty list of subnets")
     return VnetSpec(
         name=_str(data, "name", path),
@@ -1284,7 +1485,7 @@ def _parse_vnet_spec(raw: Any, path: str) -> VnetSpec:
         subnets=tuple(
             _parse_subnet_spec(item, f"{path}.subnets[{i}]") for i, item in enumerate(subnets_raw)
         ),
-        peer_to=_opt_str(data, "peer_to", path),
+        peer_to=_parse_peer_to(data, path),
     )
 
 
@@ -1346,6 +1547,120 @@ def _parse_media(raw: Any, path: str) -> MediaConfig:
             packages=packages,
         )
     )
+
+
+def _parse_image(raw: Any, path: str) -> ImageConfig:
+    """The nested v4.1 `image:` block (two-image model).
+
+    Shape::
+
+        image:
+          gallery_resource_group: ctm-images-rg
+          gallery_name: ctmgallery
+          base:  {definition: ctm-rhel9, version: latest}   # EM/Server VMs
+          agent: {definition: ctm-agent, version: latest}   # agent VMSS
+
+    The pre-v4.1 flat keys (image_definition / image_version) are rejected
+    with a pointer to the new shape.
+    """
+    data = _mapping(raw, path)
+    old_keys = sorted(set(data) & {"image_definition", "image_version"})
+    if old_keys:
+        raise ConfigError(
+            f"{path}: the flat keys {old_keys} were replaced by the v4.1 nested "
+            f"shape — use {path}.base {{definition, version}} for the EM/Server "
+            f"image and {path}.agent {{definition, version}} for the agent VMSS "
+            "image (see docs/CONFIGURATION.md)"
+        )
+    unknown = sorted(set(data) - {"gallery_resource_group", "gallery_name", "base", "agent"})
+    if unknown:
+        raise ConfigError(
+            f"{path}: unknown keys {unknown}; expected gallery_resource_group, "
+            "gallery_name, base, agent"
+        )
+
+    def ref(key: str, default_definition: str) -> ImageRef:
+        ref_raw = _mapping(data.get(key), f"{path}.{key}")
+        return ImageRef(
+            definition=_str(ref_raw, "definition", f"{path}.{key}", default=default_definition),
+            version=_str(ref_raw, "version", f"{path}.{key}", default="latest"),
+        )
+
+    return ImageConfig(
+        gallery_resource_group=_str(
+            data, "gallery_resource_group", path, default="ctm-images-rg"
+        ),
+        gallery_name=_str(data, "gallery_name", path, default="ctmgallery"),
+        base=ref("base", "ctm-rhel9"),
+        agent=ref("agent", "ctm-agent"),
+    )
+
+
+def _parse_access(raw: Any, path: str) -> AccessConfig:
+    data = _mapping(raw, path)
+    if not data:
+        return AccessConfig()
+    bastion = _mapping(data.get("bastion"), f"{path}.bastion")
+    appgw = _mapping(data.get("appgw"), f"{path}.appgw")
+    unknown = sorted(set(data) - {"bastion", "appgw"})
+    if unknown:
+        raise ConfigError(f"{path}: unknown keys {unknown}; expected bastion/appgw")
+    return AccessConfig(
+        bastion_enabled=_bool(bastion, "enabled", f"{path}.bastion", False),
+        appgw_enabled=_bool(appgw, "enabled", f"{path}.appgw", False),
+    )
+
+
+def _parse_kv_sync(raw: Any, path: str) -> KvSyncConfig:
+    data = _mapping(raw, path)
+    if not data:
+        return KvSyncConfig()
+    sync = KvSyncConfig(
+        enabled=_bool(data, "enabled", path, False),
+        schedule=_str(data, "schedule", path, default="0 */15 * * * *"),
+    )
+    # NCRONTAB has six fields (seconds first); catch the classic 5-field slip.
+    if sync.enabled and len(sync.schedule.split()) != 6:
+        raise ConfigError(
+            f"{path}.schedule: {sync.schedule!r} is not a 6-field NCRONTAB "
+            "expression (Azure Functions timers include a seconds field)"
+        )
+    return sync
+
+
+def _parse_build_agents(raw: Any, path: str) -> BuildAgentsConfig:
+    data = _mapping(raw, path)
+    if not data:
+        return BuildAgentsConfig()
+    network = _mapping(data.get("network"), f"{path}.network")
+    agents = BuildAgentsConfig(
+        enabled=_bool(data, "enabled", path, False),
+        resource_group=_str(data, "resource_group", path, default="ctm-build-rg"),
+        vm_size=_str(data, "vm_size", path, default="Standard_D4s_v5"),
+        instances=_int(data, "instances", path, default=2),
+        vnet_name=_opt_str(network, "vnet_name", f"{path}.network"),
+        vnet_resource_group_name=_opt_str(
+            network, "vnet_resource_group_name", f"{path}.network"
+        ),
+        subnet_name=_opt_str(network, "subnet_name", f"{path}.network"),
+    )
+    if agents.enabled:
+        if agents.instances < 1:
+            raise ConfigError(f"{path}.instances: must be >= 1 when enabled")
+        missing = [
+            key
+            for key, value in (
+                ("vnet_name", agents.vnet_name),
+                ("vnet_resource_group_name", agents.vnet_resource_group_name),
+                ("subnet_name", agents.subnet_name),
+            )
+            if not value
+        ]
+        if missing:
+            raise ConfigError(
+                f"{path}.network: required keys missing when enabled: {missing}"
+            )
+    return agents
 
 
 # ---------------------------------------------------------------------------
@@ -1463,31 +1778,66 @@ def _validate_network_infrastructure(cfg: EnvironmentConfig) -> None:
                     )
             parsed.append((subnet.name, subnet_net))
 
-    # 3. Peering: every spoke names an existing utility VNet.
+    # 3. Peering rules per role (v4: peer_to is a tuple; utility <-> utility
+    #    global peering and the cross-environment build VNet are allowed;
+    #    v4.1: role 'external' entries resolve build peer_to names locally).
     for vnet in infra.vnets:
         path = f"{top}.vnets[{vnet.name}]"
+        if vnet.role == "external":
+            continue  # resolution-only: no peerings (enforced at parse time)
         if vnet.role == "spoke":
-            if not vnet.peer_to:
+            if len(vnet.peer_to) != 1:
                 raise ConfigError(
-                    f"{path}.peer_to: required for role 'spoke' "
-                    "(the utility VNet this spoke peers with)"
+                    f"{path}.peer_to: a 'spoke' names exactly ONE utility VNet "
+                    f"(got {list(vnet.peer_to)})"
                 )
-            peer = by_name.get(vnet.peer_to)
+            peer = by_name.get(vnet.peer_to[0])
             if peer is None:
                 raise ConfigError(
-                    f"{path}.peer_to: {vnet.peer_to!r} does not name a VNet in "
+                    f"{path}.peer_to: {vnet.peer_to[0]!r} does not name a VNet in "
                     f"{top}.vnets (declared: {sorted(by_name)})"
                 )
             if peer.role != "utility":
                 raise ConfigError(
-                    f"{path}.peer_to: {vnet.peer_to!r} has role {peer.role!r}; "
+                    f"{path}.peer_to: {vnet.peer_to[0]!r} has role {peer.role!r}; "
                     "spokes must peer to a 'utility' VNet"
                 )
-        elif vnet.peer_to:
-            raise ConfigError(
-                f"{path}.peer_to: only valid on 'spoke' VNets "
-                "(utility VNets receive the reverse peering automatically)"
-            )
+        elif vnet.role == "utility":
+            # utility <-> utility global peering (e.g. prod-utility <->
+            # dr-utility for appgw -> DR LB and bastion -> DR reach).
+            for target in vnet.peer_to:
+                peer = by_name.get(target)
+                if peer is None:
+                    raise ConfigError(
+                        f"{path}.peer_to: {target!r} does not name a VNet in "
+                        f"{top}.vnets (declared: {sorted(by_name)})"
+                    )
+                if peer.role != "utility" or peer.name == vnet.name:
+                    raise ConfigError(
+                        f"{path}.peer_to: utility VNets may only peer to OTHER "
+                        f"utility VNets, got {target!r} (role {peer.role!r})"
+                    )
+        else:  # build
+            if not vnet.peer_to:
+                raise ConfigError(
+                    f"{path}.peer_to: required for role 'build' (the utility "
+                    "VNets the build agents deploy through)"
+                )
+            for target in vnet.peer_to:
+                peer = by_name.get(target)
+                if peer is None:
+                    # Cross-ENVIRONMENT peering by VNet name with NO local
+                    # entry: tolerated — network/main.bicep skips names it
+                    # cannot resolve (unresolvedPeerings output). Prefer a
+                    # role-'external' entry so the pair IS emitted (the prod
+                    # config declares vnet-dev-utility that way).
+                    continue
+                if peer.role not in ("utility", "external"):
+                    raise ConfigError(
+                        f"{path}.peer_to: {target!r} has role {peer.role!r}; "
+                        "build VNets peer to 'utility' (or resolution-only "
+                        "'external') VNets only"
+                    )
 
     # 4. Access CIDR lists must parse.
     for key, cidrs in (
@@ -1643,17 +1993,15 @@ def load_config_file(
     blobs = {**DEFAULT_INSTALLER_BLOBS, **_str_map(data, "installer_blobs", top)}
     unknown_blobs = set(blobs) - set(DEFAULT_INSTALLER_BLOBS)
     if unknown_blobs:
-        raise ConfigError(f"{top}.installer_blobs: unknown keys {sorted(unknown_blobs)}")
+        hint = ""
+        if unknown_blobs & {"agent_installer", "agent_silent"}:
+            hint = (
+                " (v4.1: the Control-M/Agent is baked into the ctm-agent Packer "
+                "image — agent media no longer lives in the installers container)"
+            )
+        raise ConfigError(f"{top}.installer_blobs: unknown keys {sorted(unknown_blobs)}{hint}")
 
-    image_raw = _mapping(data.get("image"), f"{top}.image")
-    image = ImageConfig(
-        gallery_resource_group=_str(
-            image_raw, "gallery_resource_group", f"{top}.image", default="ctm-images-rg"
-        ),
-        gallery_name=_str(image_raw, "gallery_name", f"{top}.image", default="ctmgallery"),
-        image_definition=_str(image_raw, "image_definition", f"{top}.image", default="ctm-rhel9"),
-        image_version=_str(image_raw, "image_version", f"{top}.image", default="latest"),
-    )
+    image = _parse_image(data.get("image"), f"{top}.image")
 
     cfg = EnvironmentConfig(
         subscription_id=subscription_id,
@@ -1680,6 +2028,9 @@ def load_config_file(
             data.get("network_infrastructure"), f"{top}.network_infrastructure"
         ),
         media=_parse_media(data.get("media"), f"{top}.media"),
+        access=_parse_access(data.get("access"), f"{top}.access"),
+        kv_sync=_parse_kv_sync(data.get("kv_sync"), f"{top}.kv_sync"),
+        build_agents=_parse_build_agents(data.get("build_agents"), f"{top}.build_agents"),
     )
     # Semantic validation is gated on create: with create false (bring-your-
     # own networking, the default) the vnets list is inert documentation.

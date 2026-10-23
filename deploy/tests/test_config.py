@@ -693,16 +693,60 @@ def test_prod_derived_names() -> None:
 
 
 def test_prod_image_reference() -> None:
+    """v4.1 two-image model: base (ctm-rhel9) + agent (ctm-agent)."""
     cfg = _load("prod")
     assert cfg.image.gallery_resource_group == "ctm-images-rg"
     assert cfg.image.gallery_name == "ctmgallery"
-    assert cfg.image.image_definition == "ctm-rhel9"
-    image_id = cfg.image_id()
-    assert image_id.startswith(f"/subscriptions/{cfg.subscription_id}/resourceGroups/")
-    assert image_id.endswith(
+    assert cfg.image.base.definition == "ctm-rhel9"
+    assert cfg.image.agent.definition == "ctm-agent"
+    base_id = cfg.image_id()  # default kind = base (EM/Server VMs)
+    assert base_id == cfg.image_id("base")
+    assert base_id.startswith(f"/subscriptions/{cfg.subscription_id}/resourceGroups/")
+    assert base_id.endswith(
         "/providers/Microsoft.Compute/galleries/ctmgallery/images/ctm-rhel9/versions/"
-        + cfg.image.image_version
+        + cfg.image.base.version
     )
+    agent_id = cfg.image_id("agent")
+    assert agent_id.endswith(
+        "/providers/Microsoft.Compute/galleries/ctmgallery/images/ctm-agent/versions/"
+        + cfg.image.agent.version
+    )
+    try:
+        cfg.image_id("bogus")
+    except cfgmod.ConfigError as exc:
+        assert "base or agent" in str(exc)
+    else:
+        raise AssertionError("an unknown image kind was accepted")
+
+
+def test_image_block_defaults_and_rejects_old_flat_keys() -> None:
+    # Absent block -> both defaults.
+    cfg = _load_dict(_base_config())
+    assert cfg.image.base == cfgmod.ImageRef("ctm-rhel9", "latest")
+    assert cfg.image.agent == cfgmod.ImageRef("ctm-agent", "latest")
+
+    # Nested shape parses, versions pinned independently.
+    data = _base_config()
+    data["image"] = {
+        "gallery_resource_group": "ctm-images-rg",
+        "gallery_name": "ctmgallery",
+        "base": {"definition": "ctm-rhel9", "version": "1.2.0"},
+        "agent": {"definition": "ctm-agent", "version": "1.0.3"},
+    }
+    cfg = _load_dict(data)
+    assert cfg.image.base.version == "1.2.0"
+    assert cfg.image.agent.version == "1.0.3"
+    assert cfg.image_id("agent").endswith("/images/ctm-agent/versions/1.0.3")
+
+    # The pre-v4.1 FLAT keys are rejected with a pointer to the new shape.
+    data = _base_config()
+    data["image"] = {"image_definition": "ctm-rhel9", "image_version": "latest"}
+    _expect_config_error(data, "config.image", "image_definition", "base", "agent")
+
+    # Unknown keys are rejected too.
+    data = _base_config()
+    data["image"] = {"gallery": "nope"}
+    _expect_config_error(data, "config.image", "unknown keys")
 
 
 def test_bicep_item_shapes() -> None:

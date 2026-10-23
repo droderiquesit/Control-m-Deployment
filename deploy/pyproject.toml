@@ -1,7 +1,10 @@
 # ---------------------------------------------------------------------------
 # ctmdeploy — python orchestrator for the Control-M on Azure platform.
-# Compiles/deploys Bicep, seeds Key Vault secrets, renders cloud-init,
-# enables ASR replication and drives DR failover. Install: pip install -e deploy/
+# Compiles/deploys Bicep, seeds Key Vault secrets, renders cloud-init shims
+# (the real install logic lives in node-scripts/ctm_node_install.py, uploaded
+# to blob by the compute phase), moves installer media, zip-deploys the
+# kvsync Durable Function, enables ASR replication and drives DR failover.
+# Install: pip install -e deploy/
 # ---------------------------------------------------------------------------
 [build-system]
 requires = ["setuptools>=68"]

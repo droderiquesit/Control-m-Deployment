@@ -22,6 +22,11 @@ ROLES = ("em", "server", "agent")
 
 COMMON_TEMPLATE = "common.sh.tmpl"
 
+#: Blob name (inside the installers container) of the idempotent node
+#: installer; deploy.py uploads node-scripts/ctm_node_install.py there on
+#: every compute deployment and the cloud-init shim fetches it at boot.
+NODE_SCRIPT_BLOB = "scripts/ctm_node_install.py"
+
 # Token names (without the __ delimiters) per template, exactly as the
 # cloud-init templates declare them.
 COMMON_TOKENS: tuple[str, ...] = (
@@ -38,6 +43,7 @@ COMMON_TOKENS: tuple[str, ...] = (
     "ATTACH_DATA_DISK",
     "CTM_VERSION",
     "DNS_ZONE",
+    "NODE_SCRIPT_BLOB",
 )
 
 EM_TOKENS: tuple[str, ...] = (
@@ -80,6 +86,9 @@ AGENT_TOKENS: tuple[str, ...] = (
     "HOSTGROUP",
     "AGENT_PORT",
     "PROVISION_IMAGE",
+    # v4.1: the agent is BAKED into the ctm-agent image — boot only
+    # configures, starts and registers it (no media blob tokens).
+    "SERVER_PRIMARY_HOST",
 )
 
 ROLE_TOKENS: dict[str, tuple[str, ...]] = {
@@ -171,6 +180,7 @@ def common_tokens(
     installers_container: str = "installers",
     backups_container: str = "backups",
     data_mount: str = "/ctm",
+    node_script_blob: str = NODE_SCRIPT_BLOB,
 ) -> dict[str, str]:
     """Tokens of common.sh.tmpl. `role` is the composite value, e.g. em-primary."""
     return {
@@ -187,6 +197,7 @@ def common_tokens(
         "ATTACH_DATA_DISK": "true" if attach_data_disk else "false",
         "CTM_VERSION": ctm_version,
         "DNS_ZONE": dns_zone,
+        "NODE_SCRIPT_BLOB": node_script_blob,
     }
 
 
@@ -267,8 +278,10 @@ def agent_tokens(
     hostgroup: str,
     agent_port: int,
     provision_image: str,
+    server_primary_host: str,
 ) -> dict[str, str]:
-    """Tokens of agent.sh.tmpl."""
+    """Tokens of agent.sh.tmpl (v4.1: the agent is baked into the ctm-agent
+    image; boot only configures, starts and registers it via REST)."""
     return {
         "AGENT_USER": agent_user,
         "EM_API_ENDPOINT": em_api_endpoint,
@@ -277,4 +290,5 @@ def agent_tokens(
         "HOSTGROUP": hostgroup,
         "AGENT_PORT": str(agent_port),
         "PROVISION_IMAGE": provision_image,
+        "SERVER_PRIMARY_HOST": server_primary_host,
     }

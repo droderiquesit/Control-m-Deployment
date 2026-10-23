@@ -20,6 +20,8 @@ for the exact re-run guarantees).
 | Database compute | `database.sku_name` | scale with brief failover to standby (zone-redundant HA) |
 | Database storage | `database.storage_mb` | online grow (auto-grow is on) |
 | Shared share | `storage.shared_share_quota_gb` | online |
+| Secret-sync cadence | `kv_sync.schedule` (6-field NCRONTAB) | `--phase access` updates the app setting; next tick uses it |
+| Bigger/more build agents | `build_agents.vm_size` / `instances` | `--phase access`; capacity itself is owned by the ADO elastic pool — never resize the VMSS by hand |
 
 > **PostgreSQL zones after an HA failover.** After an Azure HA failover the
 > primary and standby swap availability zones. `ctmdeploy` reads the live
@@ -36,27 +38,91 @@ EM/Server VMs use `patch_mode = AutomaticByPlatform`; schedule a maintenance
 configuration in Azure Update Manager for the EM/Server pair so that the
 secondary patches first and a Control-M failover happens before the primary.
 
-OS-level content (packages, tuning, Node.js) is **baked** into the ctm-rhel9
-golden image, so OS drift is fixed by revving the image, not by touching
-nodes:
+OS-level content (packages, tuning, Node.js) is **baked** into the two
+golden images (v4.1: `ctm-rhel9` for EM/Server, `ctm-agent` — which also
+embeds the Control-M/Agent — for the scale sets), so OS drift is fixed by
+revving the images, not by touching nodes:
 
 1. Change `packer/scripts/*` if needed (a plain rebuild picks up newer RHEL
-   package content anyway).
-2. `python -m ctmdeploy image build --env prod --version <x.y.z>` — publishes
-   an immutable gallery version replicated to both regions (or run the
-   pipeline with `runImageBuild=true`).
-3. Bump `image.image_version` in `environments/<env>/config.yaml`
-   (keep `latest` in nonprod if you prefer; pin prod).
+   package content anyway). An **agent software upgrade** is the same flow
+   with a new `control-m-agent` package version feeding the agent build.
+2. `python -m ctmdeploy image build --env prod --version <x.y.z>` (base) and
+   `… --image agent --media-path <dir> --version <x.y.z>` (agent) — each
+   publishes an immutable gallery version replicated to both regions (or run
+   the pipeline with `runImageBuild=true` + `imageKind`).
+3. Bump `image.base.version` / `image.agent.version` in
+   `environments/<env>/config.yaml` (keep `latest` in nonprod if you prefer;
+   pin prod).
 4. `python -m ctmdeploy whatif --env <env>` then
    `deploy --env <env> --phase compute`. EM/Server VMs are re-created on the
-   new image and reattach their persistent data disks; agent scale set
-   instances are replaced rather than patched (`az vmss update-instances`
-   rolls them onto the new model).
+   new base image and reattach their persistent data disks. **Agent image
+   revisions roll via the VMSS model update**: the deployment updates each
+   scale set's model to the new `ctm-agent` version, new/scaled-out
+   instances boot it immediately, and existing instances keep the old one
+   until recycled — `az vmss update-instances --instance-ids '*'` (or
+   scale-in/out; agents deregister gracefully) converges the fleet.
+
+## Operator access (Bastion + ctm-global)
+
+* **SSH**: no VM has a public IP; sessions go through Azure Bastion
+  (`access.bastion.enabled`, the access phase):
+
+  ```bash
+  az keyvault secret show --vault-name ctm-<env>-kv-<suffix> \
+    --name ssh-private-key --query value -o tsv > ctmops.pem && chmod 600 ctmops.pem
+  az network bastion ssh --name ctm-<env>-bastion -g ctm-<env>-rg \
+    --target-ip-address <private IP> --auth-type ssh-key --username ctmops \
+    --ssh-key ./ctmops.pem
+  ```
+
+  DR nodes and the build agents are reachable through the same Bastion (the
+  prod ⇄ DR global peering and the build peerings carry the session; the
+  NSGs admit SSH only from `bastion_cidrs`).
+* **Control-M Web / Automation API**: `ctm-web.<env>.ctm.internal` is the
+  region-local entry; on prod, **`ctm-global.prod.ctm.internal`** (the
+  private Application Gateway) follows whichever region's EM answers the TCP
+  health probe — use it as the client-facing default so a DR failover needs
+  no client change. The gateway is layer-4: TLS stays end-to-end, so
+  certificate work happens on the EM web tier only.
+
+## Key Vault → Control-M sync (kvsync)
+
+* **Add a job secret**: tag it (`az keyvault secret set ... --tags
+  ctm-sync=true [ctm-name=<CTM name>]`); it appears in Control-M within one
+  `kv_sync.schedule` tick (default 15 min). Rotation = set a new value, wait
+  one tick. Deleting in Key Vault does **not** delete in Control-M.
+* **Change the cadence**: edit `kv_sync.schedule`, run `--phase access`.
+* **Ship function-code changes**: `python -m ctmdeploy kvsync deploy --env
+  <env>` (idempotent zip-deploy; infra untouched).
+* **Watch it**: Application Insights is not wired by default — use the
+  Function App's log stream / `report` activity summaries (adds/updates/
+  failures; never values). Failures usually mean the EM API is down or
+  `em-admin-password` rotated in EM but not in the vault.
+* **Cost**: the EP1 plan bills a warm instance around the clock; disable
+  `kv_sync.enabled` in nonprod if the rehearsal is not worth it.
+
+## Build agents (Azure DevOps elastic pool)
+
+* Capacity is owned by the elastic pool (Organization settings → Agent
+  pools); the deployment ships Manual upgrade/no autoscale on purpose. The
+  pool recreates instances from the current VMSS model. Note that re-running
+  `--phase access` re-sends `build_agents.instances` as `sku.capacity` and
+  resets the live instance count to that baseline (the pool then re-scales);
+  avoid re-runs during build-heavy windows.
+* **Tooling updates** (python/bicep pins in the cloud-init of
+  `bicep/modules/build-agents.bicep`): deploy `--phase access`, then let the
+  pool recycle instances (or reimage them) — existing instances keep the old
+  bootstrap.
+* Switching the pipeline on/off the pool is one variable:
+  `agentPoolName` in `pipelines/variables/common.yml`
+  (`docs/AZURE-DEVOPS.md` §6).
 
 ## Secrets rotation
 
 Passwords live in Key Vault and in the database/EM. Seeding is idempotent —
-`ctmdeploy` never rotates an existing secret silently. To rotate:
+`ctmdeploy` never rotates an existing secret silently. (Job secrets tagged
+`ctm-sync` are simpler: set the new value in Key Vault and the kvsync
+function propagates it — see above.) To rotate the platform secrets:
 
 1. Write the new value into **every region's** Key Vault. Either directly
    (`az keyvault secret set --vault-name <kv> --name <secret> --value ...` in
@@ -108,10 +174,16 @@ python -m ctmdeploy deploy --env <env> --phase compute
 ```
 
 The deployment re-creates the VM from the current gallery image and attaches
-the same `ctm-srv-qa-b-data` disk (attach, not create); bootstrap detects
-`/ctm/<user>/.ctm_installed` and only recreates the systemd units. The same
-flow rebuilds a node onto a new image version after a bump of
-`image.image_version`.
+the same `ctm-srv-qa-b-data` disk (attach, not create); the node installer
+detects `/ctm/<user>/.ctm_installed` and only recreates the systemd units —
+no secrets are re-read, nothing is reinstalled. The same flow rebuilds a node
+onto a new image version after a bump of `image.base.version`.
+
+A node that got stuck mid-install needs no rebuild at all: the installer is
+an idempotent stage machine (`/var/lib/ctm/install-state.json` + real-state
+checks), so fix the cause (missing media blob, closed port) and re-run it —
+`systemctl start ctm-install.service` — then watch
+`/var/log/ctm-bootstrap.log`.
 
 ## Destroying an environment
 
@@ -119,6 +191,8 @@ Prod has a `CanNotDelete` lock and Key Vault purge protection. Remove the lock
 first (`resource_lock: false` in config, then
 `python -m ctmdeploy deploy --env prod --phase rg`). There is no destroy
 command in a stateless toolchain — delete the resource groups explicitly:
-`az group delete -n ctm-<env>-rg` (and `ctm-<env>-dr-rg` where DR is enabled).
+`az group delete -n ctm-<env>-rg` (and `ctm-<env>-dr-rg` where DR is
+enabled, plus `ctm-build-rg` on prod — remove the ADO elastic pool first so
+Azure DevOps stops recreating instances).
 Soft-deleted Key Vaults and Recovery Services vaults with backup items must be
 cleaned up manually.

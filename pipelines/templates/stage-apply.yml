@@ -10,6 +10,12 @@ parameters:
   - name: enabled
     type: boolean
     default: true
+  # '' = Microsoft-hosted ubuntu-latest; a name = the self-hosted scale-set
+  # pool (ctm-build-agents VMSS — its build VNet peers to the nonprod, prod
+  # AND DR utility VNets, so the same pool applies every environment).
+  - name: agentPool
+    type: string
+    default: ""
 
 stages:
   - stage: apply_${{ parameters.environment }}
@@ -44,6 +50,11 @@ stages:
         displayName: ctmdeploy deploy (${{ parameters.environment }})
         environment: ctm-${{ parameters.environment }}
         timeoutInMinutes: 180
+        pool:
+          ${{ if eq(parameters.agentPool, '') }}:
+            vmImage: ubuntu-latest
+          ${{ else }}:
+            name: ${{ parameters.agentPool }}
         strategy:
           runOnce:
             deploy:

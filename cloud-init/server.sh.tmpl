@@ -1,109 +1,40 @@
 # ---------------------------------------------------------------------------
-# Control-M/Server node (__SERVER_ROLE__). Appended to the common section by
-# ctmdeploy render.py. Primary runs the scheduler (ctm) + Configuration Agent
-# (ca). Secondary runs only the CA and waits for failover (same database).
+# Control-M/Server node (__SERVER_ROLE__) — THIN role stub appended to the
+# common shim by ctmdeploy render.py. Writes /etc/ctm/node.json (names/ids
+# ONLY, never secrets) and runs the idempotent python installer, which waits
+# for the primary (secondary nodes), pulls secrets from Key Vault in-memory,
+# caches the media on NFS, renders the silent XML, runs setup.sh and installs
+# the controlm-server.service unit (primary: start_ca; start_ctm — secondary:
+# start_ca only).
 # ---------------------------------------------------------------------------
-SERVER_ROLE="__SERVER_ROLE__"
-CTM_USER="__CTM_USER__"
-CTM_HOME="$DATA_MOUNT/$CTM_USER"
-SERVER_INSTALLER_BLOB="__SERVER_INSTALLER_BLOB__"
-SERVER_SILENT_BLOB="__SERVER_SILENT_BLOB__"
-DB_HOST="__DB_HOST__"
-DB_PORT="__DB_PORT__"
-CTM_DB_NAME="__CTM_DB_NAME__"
-CTM_DB_USER="__CTM_DB_USER__"
-CTM_DB_SECRET_NAME="__CTM_DB_SECRET_NAME__"
-DB_ADMIN_USER="__DB_ADMIN_USER__"
-CTM_SERVER_NAME="__CTM_SERVER_NAME__"
-SERVER_PRIMARY_HOST="__SERVER_PRIMARY_HOST__"
-SERVER_SECONDARY_HOST="__SERVER_SECONDARY_HOST__"
-EM_HOST="__EM_HOST__"
-
-id -u "$CTM_USER" >/dev/null 2>&1 || useradd -m -d "$CTM_HOME" -s /bin/bash "$CTM_USER"
-mkdir -p "$CTM_HOME" && chown "$CTM_USER":"$CTM_USER" "$CTM_HOME"
-
-if [ -f "$CTM_HOME/.ctm_installed" ]; then
-  echo "Control-M/Server already installed on persistent disk; starting services only"
-else
-  DB_ADMIN_PASSWORD=$(kv_secret db-admin-password)
-  CTM_DB_PASSWORD=$(kv_secret "$CTM_DB_SECRET_NAME")
-
-  if [ "$SERVER_ROLE" = "secondary" ]; then
-    echo "== secondary: waiting for primary Control-M/Server ($SERVER_PRIMARY_HOST) Configuration Agent (2369)"
-    wait_for 7200 bash -c "exec 3<>/dev/tcp/$SERVER_PRIMARY_HOST/2369"
-  fi
-
-  INSTALL_SRC="$SHARED_MOUNT/installers/server/$CTM_VERSION"
-  if [ ! -f "$INSTALL_SRC/.extracted" ]; then
-    mkdir -p "$INSTALL_SRC"
-    blob_get "$SERVER_INSTALLER_BLOB" /tmp/server-installer.bin
-    tar -xf /tmp/server-installer.bin -C "$INSTALL_SRC"
-    rm -f /tmp/server-installer.bin
-    touch "$INSTALL_SRC/.extracted"
-  fi
-  chown -R "$CTM_USER":"$CTM_USER" "$INSTALL_SRC"
-
-  # Silent-install XML placeholders are substituted here. U builds the XML's
-  # two-underscore placeholders at runtime so they never look like render
-  # tokens (the renderer rejects leftover token-shaped text).
-  U='__'
-  blob_get "$SERVER_SILENT_BLOB" /tmp/server-silent.xml
-  sed -i \
-    -e "s|${U}DB_HOST${U}|$DB_HOST|g" \
-    -e "s|${U}DB_PORT${U}|$DB_PORT|g" \
-    -e "s|${U}DB_NAME${U}|$CTM_DB_NAME|g" \
-    -e "s|${U}DB_ADMIN_USER${U}|$DB_ADMIN_USER|g" \
-    -e "s|${U}DB_ADMIN_PASSWORD${U}|$DB_ADMIN_PASSWORD|g" \
-    -e "s|${U}CTM_DB_USER${U}|$CTM_DB_USER|g" \
-    -e "s|${U}CTM_DB_PASSWORD${U}|$CTM_DB_PASSWORD|g" \
-    -e "s|${U}CTM_HOME${U}|$CTM_HOME|g" \
-    -e "s|${U}CTM_USER${U}|$CTM_USER|g" \
-    -e "s|${U}CTM_SERVER_NAME${U}|$CTM_SERVER_NAME|g" \
-    -e "s|${U}HOSTNAME${U}|$(hostname -s)|g" \
-    -e "s|${U}PRIMARY_HOST${U}|$SERVER_PRIMARY_HOST|g" \
-    -e "s|${U}SECONDARY_HOST${U}|$SERVER_SECONDARY_HOST|g" \
-    -e "s|${U}EM_HOST${U}|$EM_HOST|g" \
-    /tmp/server-silent.xml
-  chown "$CTM_USER":"$CTM_USER" /tmp/server-silent.xml && chmod 600 /tmp/server-silent.xml
-
-  SETUP=$(find "$INSTALL_SRC" -maxdepth 2 -name setup.sh | head -n1)
-  [ -n "$SETUP" ] || { echo "setup.sh not found under $INSTALL_SRC"; exit 1; }
-  echo "== installing Control-M/Server ($SERVER_ROLE) from $SETUP"
-  su - "$CTM_USER" -c "$SETUP -silent /tmp/server-silent.xml"
-  rm -f /tmp/server-silent.xml
-  touch "$CTM_HOME/.ctm_installed"
-fi
-
-if [ "$SERVER_ROLE" = "primary" ]; then
-  START_CMD='start_ca; start_ctm'
-  STOP_CMD='shut_ctm; shut_ca'
-else
-  START_CMD='start_ca'
-  STOP_CMD='shut_ca'
-fi
-
-cat > /etc/systemd/system/controlm-server.service <<UNIT
-[Unit]
-Description=Control-M/Server ($SERVER_ROLE)
-After=network-online.target remote-fs.target
-Wants=network-online.target
-
-[Service]
-Type=forking
-User=$CTM_USER
-WorkingDirectory=$CTM_HOME
-ExecStart=/bin/bash -lc '$START_CMD'
-ExecStop=/bin/bash -lc '$STOP_CMD'
-TimeoutStartSec=600
-TimeoutStopSec=300
-Restart=on-failure
-RestartSec=30
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-systemctl daemon-reload
-systemctl enable --now controlm-server.service || true
-
-date -u +%FT%TZ > "$MARKER"
-echo "== Control-M/Server bootstrap finished"
+cat > /etc/ctm/node.json <<'NODEJSON'
+{
+  "role": "__ROLE__",
+  "environment": "__ENVIRONMENT__",
+  "key_vault_name": "__KEY_VAULT_NAME__",
+  "identity_client_id": "__IDENTITY_CLIENT_ID__",
+  "blob_account": "__BLOB_ACCOUNT__",
+  "installers_container": "__INSTALLERS_CONTAINER__",
+  "backups_container": "__BACKUPS_CONTAINER__",
+  "nfs_server": "__NFS_SERVER__",
+  "nfs_export": "__NFS_EXPORT__",
+  "data_mount": "__DATA_MOUNT__",
+  "ctm_version": "__CTM_VERSION__",
+  "dns_zone": "__DNS_ZONE__",
+  "server_role": "__SERVER_ROLE__",
+  "ctm_user": "__CTM_USER__",
+  "server_installer_blob": "__SERVER_INSTALLER_BLOB__",
+  "server_silent_blob": "__SERVER_SILENT_BLOB__",
+  "db_host": "__DB_HOST__",
+  "db_port": "__DB_PORT__",
+  "ctm_db_name": "__CTM_DB_NAME__",
+  "ctm_db_user": "__CTM_DB_USER__",
+  "ctm_db_secret_name": "__CTM_DB_SECRET_NAME__",
+  "db_admin_user": "__DB_ADMIN_USER__",
+  "ctm_server_name": "__CTM_SERVER_NAME__",
+  "server_primary_host": "__SERVER_PRIMARY_HOST__",
+  "server_secondary_host": "__SERVER_SECONDARY_HOST__",
+  "em_host": "__EM_HOST__"
+}
+NODEJSON
+run_node_installer

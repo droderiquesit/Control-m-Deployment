@@ -20,7 +20,16 @@ docs/AZURE-DEVOPS.md):
   (the pipeline may download each package into such a directory);
 * otherwise the file maps by its name: ``DREM*`` and ``silent-em-*`` go to
   the ``em/`` prefix, ``DRSRV*`` and ``silent-server-*`` to ``server/``;
-* anything else is skipped with a warning (never uploaded).
+* anything else is skipped with a warning (never uploaded). That includes
+  all AGENT media (``DRKAI*``, ``silent-agent*``): v4.1 bakes the
+  Control-M/Agent into the ctm-agent Packer image, so agent media feeds
+  ``ctmdeploy image build --image agent`` and never reaches blob.
+
+When the repository root is known (the CLI passes it), the upload also
+pushes ``node-scripts/ctm_node_install.py`` to ``scripts/
+ctm_node_install.py`` — the idempotent node installer the cloud-init shims
+fetch at boot — so a media refresh keeps script and media in lock-step
+(deploy.py uploads it on every compute deployment too).
 
 After the uploads a manifest is printed and every ``installer_blobs`` name
 still missing from the container is reported as a WARNING, so a partial
@@ -45,6 +54,13 @@ ROLES = ("primary", "dr", "both")
 _EM_FILE_PREFIXES = ("DREM", "silent-em-")
 #: Filename prefixes mapped to the `server/` blob prefix.
 _SERVER_FILE_PREFIXES = ("DRSRV", "silent-server-")
+# NOTE (v4.1): there is deliberately NO agent mapping — DRKAI*/silent-agent*
+# files are skipped. The agent is baked into the ctm-agent Packer image.
+
+#: Blob name of the idempotent node installer (matches render.NODE_SCRIPT_BLOB).
+NODE_SCRIPT_BLOB = "scripts/ctm_node_install.py"
+#: Repo-relative path of the node installer uploaded alongside the media.
+NODE_SCRIPT_SOURCE = Path("node-scripts") / "ctm_node_install.py"
 
 
 class MediaError(RuntimeError):
@@ -71,7 +87,9 @@ def blob_name_for(relative_path: str) -> str | None:
     if parts[0] in ("em", "server") and len(parts) > 1:
         return "/".join(parts)
     # Flat files (or files under any other directory, e.g. silent_xml/) map
-    # by filename to their component prefix.
+    # by filename to their component prefix. Agent media (DRKAI*,
+    # silent-agent*) intentionally maps to nothing: it feeds the Packer
+    # ctm-agent image build, never the platform blob containers (v4.1).
     name = parts[-1]
     if name.startswith(_EM_FILE_PREFIXES):
         return f"em/{name}"
@@ -153,13 +171,16 @@ def upload(
     *,
     role: str | None = None,
     credential: "TokenCredential | None" = None,
+    repo_root: str | Path | None = None,
 ) -> int:
     """Upload the media under ``path`` to each target installers container.
 
     Uses managed identity / az login (DefaultAzureCredential) and always
-    overwrites, so re-publishing a fixed media set converges. Prints the
-    manifest and warns about every ``installer_blobs`` name still missing
-    from a container after the run. Returns a process exit code (0).
+    overwrites, so re-publishing a fixed media set converges. When
+    ``repo_root`` is given, ``node-scripts/ctm_node_install.py`` is uploaded
+    to ``scripts/ctm_node_install.py`` as well. Prints the manifest and
+    warns about every ``installer_blobs`` name still missing from a
+    container after the run. Returns a process exit code (0).
     """
     root = Path(path)
     if not root.is_dir():
@@ -168,15 +189,25 @@ def upload(
     if not uploads:
         raise MediaError(
             f"no uploadable media found under {root} (expected EPD files/silent XMLs "
-            "named DREM*/DRSRV*/silent-em-*/silent-server-*, or an em/ + server/ tree)"
+            "named DREM*/DRSRV*/silent-em-*/silent-server-*, or an em/ + server/ "
+            "tree; agent media feeds `ctmdeploy image build --image agent`, not blob)"
         )
+    if repo_root is not None:
+        node_script = Path(repo_root) / NODE_SCRIPT_SOURCE
+        if node_script.is_file():
+            uploads.append((node_script, NODE_SCRIPT_BLOB))
+        else:
+            print(f"    WARNING: {node_script} not found; scripts/ upload skipped")
     targets = resolve_targets(cfg, role)
 
-    print(f"Upload manifest ({len(uploads)} file(s) from {root}):")
+    print(f"Upload manifest ({len(uploads)} file(s)):")
     for local, blob in uploads:
-        print(f"    {blob}  <-  {local.relative_to(root)}  ({_human_size(local.stat().st_size)})")
+        print(f"    {blob}  <-  {local}  ({_human_size(local.stat().st_size)})")
     for local in skipped:
-        print(f"    WARNING: skipped {local.relative_to(root)} (no em/server prefix mapping)")
+        print(
+            f"    WARNING: skipped {local.relative_to(root)} "
+            "(no em/server prefix mapping; agent media is image-baked, not uploaded)"
+        )
 
     if credential is None:
         from ctmdeploy.azure import get_credential

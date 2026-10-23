@@ -4,6 +4,15 @@
 variables:
   agentImage: ubuntu-latest
 
+  # Which pool runs every job. '' (the default) = Microsoft-hosted agents
+  # using the agentImage above. Set it to the name of the Azure DevOps
+  # scale-set (elastic) pool backed by the ctm-build-agents VMSS — deployed
+  # by `ctmdeploy deploy --env prod --phase access`, registered per
+  # docs/AZURE-DEVOPS.md §6 — to run jobs on self-hosted agents inside the
+  # build VNet (peered to the nonprod, prod AND DR utility VNets, so one pool
+  # deploys into all three platforms). Evaluated at compile time.
+  agentPoolName: ""
+
   # Bicep CLI (bicep-linux-x64 asset of https://github.com/Azure/bicep/releases).
   # The sha256 is of that exact release asset; bump both together.
   bicepVersion: "0.30.23"
@@ -36,6 +45,13 @@ variables:
   mediaEmVersion: "9.0.21.300"
   mediaServerPackage: control-m-server
   mediaServerVersion: "9.0.21.300"
+  # The agent package feeds the IMAGE stage (stage-image.yml, imageKind=agent:
+  # the Control-M/Agent is baked into the ctm-agent golden image), NOT the
+  # media stage — agent media never reaches the installers blob containers.
+  mediaAgentPackage: control-m-agent
+  mediaAgentVersion: "9.0.21.300"
+  # silent_xml is shared: silent-em-*/silent-server-* go to blob via the media
+  # stage; silent-agent.xml is consumed by the Packer agent-image build.
   mediaXmlPackage: control-m-silent-xml
   mediaXmlVersion: "1.0.0"
 

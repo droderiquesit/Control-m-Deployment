@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- EXAMPLE ONLY: regenerate with the BMC installer for your release and keep the placeholders. -->
+<AutomatedInstallation>
+  <Product name="Control-M/Agent" installType="agent"/>
+  <Parameters>
+    <Parameter name="INSTALL_DIR"            value="__AGENT_HOME__"/>
+    <Parameter name="OS_USER"                value="__AGENT_USER__"/>
+    <Parameter name="HOST_NAME"              value="__HOSTNAME__"/>
+    <Parameter name="CTM_SERVER_NAME"        value="__CTM_SERVER_NAME__"/>
+    <Parameter name="AUTHORIZED_SERVER_HOST" value="__PRIMARY_HOST__"/>
+    <Parameter name="AGENT_TO_SERVER_PORT"   value="__AGENT_TO_SERVER_PORT__"/>
+    <Parameter name="SERVER_TO_AGENT_PORT"   value="__SERVER_TO_AGENT_PORT__"/>
+    <Parameter name="START_AGENT"            value="yes"/>
+  </Parameters>
+</AutomatedInstallation>

@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------------------
-# argparse CLI: ctmdeploy {deploy,whatif,failover,image,media,render,secrets}.
-# Pure-python commands (render) work without the Azure SDKs; the others
-# import them lazily inside the handlers. Entry point: ctmdeploy.cli:main.
+# argparse CLI: ctmdeploy {deploy,whatif,failover,image,media,kvsync,render,
+# secrets}. Pure-python commands (render) work without the Azure SDKs; the
+# others import them lazily inside the handlers. Entry point: ctmdeploy.cli:main.
 # ---------------------------------------------------------------------------
 """Command line interface for the Control-M deployment toolchain.
 
@@ -9,8 +9,11 @@ Examples:
     python -m ctmdeploy deploy --env prod --phase all --yes
     python -m ctmdeploy whatif --env nonprod            # prints has_changes=...
     python -m ctmdeploy failover --env prod --test
-    python -m ctmdeploy image build --env prod --version 1.0.0
+    python -m ctmdeploy image build --env prod --version 1.0.0                 # base (ctm-rhel9)
+    python -m ctmdeploy image build --env prod --version 1.0.0 \
+        --image agent --media-path ./agent-media                               # ctm-agent
     python -m ctmdeploy media upload --env prod --path ./downloaded-media
+    python -m ctmdeploy kvsync deploy --env prod        # zip-deploy functions/kvsync
     python -m ctmdeploy render --env nonprod --role server --stage qa
     python -m ctmdeploy secrets --env prod
 
@@ -64,9 +67,20 @@ def build_parser() -> argparse.ArgumentParser:
     deploy_p.add_argument(
         "--phase",
         default="all",
-        choices=("all", "network", "rg", "foundation", "secrets", "compute", "dr", "replication"),
+        choices=(
+            "all",
+            "network",
+            "rg",
+            "foundation",
+            "secrets",
+            "compute",
+            "access",
+            "dr",
+            "replication",
+        ),
         help="phase to run (default: all; network runs only when "
-        "network_infrastructure.create is true)",
+        "network_infrastructure.create is true; access deploys Bastion/"
+        "AppGW/kvsync/build agents after compute)",
     )
     deploy_p.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     deploy_p.add_argument(
@@ -86,7 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     whatif_p.add_argument(
         "--phase",
         default="all",
-        choices=("all", "network", "rg", "foundation", "compute", "dr"),
+        choices=("all", "network", "rg", "foundation", "compute", "access", "dr"),
         help="phase to analyze (default: all ARM phases)",
     )
     whatif_p.add_argument(
@@ -109,10 +123,29 @@ def build_parser() -> argparse.ArgumentParser:
     image_sub = image_p.add_subparsers(dest="image_command", required=True)
 
     image_build_p = image_sub.add_parser(
-        "build", help="build the ctm-rhel9 golden image with Packer (requires packer on PATH)"
+        "build",
+        help="build a golden image with Packer (requires packer on PATH): "
+        "--image base = ctm-rhel9 (OS only), --image agent = ctm-agent "
+        "(agent baked in; needs --media-path)",
     )
     _add_common_args(image_build_p)
     image_build_p.add_argument("--version", required=True, help="image version, e.g. 1.0.0")
+    image_build_p.add_argument(
+        "--image",
+        default="base",
+        choices=("base", "agent"),
+        help="which image to build: base = packer/ctm-rhel9.pkr.hcl (OS only), "
+        "agent = packer/ctm-agent.pkr.hcl (Control-M/Agent silent-installed, "
+        "unconfigured; default: base)",
+    )
+    image_build_p.add_argument(
+        "--media-path",
+        default=None,
+        metavar="DIR",
+        help="directory holding the downloaded control-m-agent package media "
+        "(DRKAI* EPD archive + silent-agent*.xml). REQUIRED with --image agent, "
+        "forbidden with --image base",
+    )
     image_build_p.add_argument(
         "--var",
         action="append",
@@ -122,7 +155,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     image_gallery_p = image_sub.add_parser(
-        "gallery", help="deploy bicep/images.bicep (Compute Gallery + image definition)"
+        "gallery",
+        help="deploy bicep/images.bicep (Compute Gallery + the ctm-rhel9 and "
+        "ctm-agent image definitions)",
     )
     _add_common_args(image_gallery_p)
 
@@ -144,8 +179,20 @@ def build_parser() -> argparse.ArgumentParser:
     media_upload_p.add_argument(
         "--path",
         required=True,
-        help="directory holding the downloaded media (flat files or an em/ + server/ tree)",
+        help="directory holding the downloaded media (flat files or an "
+        "em/ + server/ tree; agent media feeds `image build --image agent` "
+        "instead)",
     )
+
+    kvsync_p = sub.add_parser(
+        "kvsync", help="Key Vault -> Control-M sync function operations"
+    )
+    kvsync_sub = kvsync_p.add_subparsers(dest="kvsync_command", required=True)
+    kvsync_deploy_p = kvsync_sub.add_parser(
+        "deploy",
+        help="zip functions/kvsync and push it to the <name>-kvsync Function App",
+    )
+    _add_common_args(kvsync_deploy_p)
 
     render_p = sub.add_parser("render", help="debug: print a rendered cloud-init script")
     _add_common_args(render_p)
@@ -251,13 +298,56 @@ def _resolve_packer_bin() -> str:
     return candidate
 
 
+#: Packer template per --image kind (v4.1 two-image model).
+PACKER_TEMPLATES = {"base": "ctm-rhel9.pkr.hcl", "agent": "ctm-agent.pkr.hcl"}
+
+
+def validate_agent_media(path: str | Path) -> Path:
+    """Fail fast on an unusable --media-path for the agent image build.
+
+    The directory must exist and hold the Agent EPD archive (``DRKAI*`` /
+    ``Agent*``) plus a ``silent-agent*.xml`` answer file (both come from the
+    Azure Artifacts ``control-m-agent`` + ``control-m-silent-xml`` packages).
+    """
+    root = Path(path)
+    if not root.is_dir():
+        raise ConfigError(f"--media-path {root} is not a directory")
+    files = [p.name for p in root.rglob("*") if p.is_file()]
+    if not any(name.startswith(("DRKAI", "Agent")) for name in files):
+        raise ConfigError(
+            f"--media-path {root} holds no Agent EPD archive (DRKAI*/Agent*); "
+            "download the control-m-agent universal package into it first"
+        )
+    if not any(name.startswith("silent-agent") and name.endswith(".xml") for name in files):
+        raise ConfigError(
+            f"--media-path {root} holds no silent-agent*.xml answer file; copy it "
+            "from the control-m-silent-xml package (or scripts/silent-install/)"
+        )
+    return root
+
+
 def cmd_image_build(args: argparse.Namespace) -> int:
     cfg, root = _load(args, allow_placeholders=True)
     packer = _resolve_packer_bin()
     packer_dir = root / "packer"
-    template = packer_dir / "ctm-rhel9.pkr.hcl"
+    template = packer_dir / PACKER_TEMPLATES[args.image]
     if not template.is_file():
         raise ConfigError(f"packer template not found: {template}")
+
+    media_vars: list[str] = []
+    if args.image == "agent":
+        if not args.media_path:
+            raise ConfigError(
+                "--media-path DIR is required with --image agent (the directory "
+                "holding the downloaded control-m-agent media; the agent is baked "
+                "into the image, never installed at boot)"
+            )
+        media_vars = ["-var", f"media_path={validate_agent_media(args.media_path).resolve()}"]
+    elif args.media_path:
+        raise ConfigError(
+            "--media-path is only valid with --image agent (the base image "
+            "NEVER contains BMC software)"
+        )
 
     extra_vars: list[str] = []
     for item in args.var:
@@ -272,13 +362,15 @@ def cmd_image_build(args: argparse.Namespace) -> int:
         "build",
         "-var",
         f"image_version={args.version}",
+        *media_vars,
         *extra_vars,
         str(template.name),
     ]
     print(f"==> {' '.join(build_cmd)}")
     subprocess.run(build_cmd, cwd=packer_dir, check=True)
+    definition = cfg.image.ref(args.image).definition
     print(
-        f"image {cfg.image.image_definition} version {args.version} published to gallery "
+        f"image {definition} version {args.version} published to gallery "
         f"{cfg.image.gallery_name} ({cfg.image.gallery_resource_group})"
     )
     return 0
@@ -298,7 +390,8 @@ def cmd_image_gallery(args: argparse.Namespace) -> int:
         {
             "location": cfg.location,
             "galleryName": cfg.image.gallery_name,
-            "imageDefinition": cfg.image.image_definition,
+            "imageDefinition": cfg.image.base.definition,
+            "agentImageDefinition": cfg.image.agent.definition,
             "tags": dict(cfg.tags),
         },
     )
@@ -309,8 +402,15 @@ def cmd_image_gallery(args: argparse.Namespace) -> int:
 def cmd_media_upload(args: argparse.Namespace) -> int:
     from ctmdeploy import media
 
-    cfg, _ = _load(args)
-    return media.upload(cfg, args.path, role=args.role)
+    cfg, root = _load(args)
+    return media.upload(cfg, args.path, role=args.role, repo_root=root)
+
+
+def cmd_kvsync_deploy(args: argparse.Namespace) -> int:
+    from ctmdeploy import kvsync
+
+    cfg, root = _load(args)
+    return kvsync.deploy(cfg, root)
 
 
 def cmd_render(args: argparse.Namespace) -> int:
@@ -382,6 +482,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_image_gallery(args)
         if args.command == "media":
             return cmd_media_upload(args)
+        if args.command == "kvsync":
+            return cmd_kvsync_deploy(args)
         return handlers[args.command](args)
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)

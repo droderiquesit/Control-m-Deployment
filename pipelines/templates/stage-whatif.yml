@@ -6,6 +6,10 @@
 parameters:
   - name: environment
     type: string
+  # '' = Microsoft-hosted ubuntu-latest; a name = the self-hosted scale-set pool.
+  - name: agentPool
+    type: string
+    default: ""
 
 stages:
   - stage: whatif_${{ parameters.environment }}
@@ -20,6 +24,11 @@ stages:
     jobs:
       - job: whatif
         displayName: ctmdeploy whatif (${{ parameters.environment }})
+        pool:
+          ${{ if eq(parameters.agentPool, '') }}:
+            vmImage: ubuntu-latest
+          ${{ else }}:
+            name: ${{ parameters.agentPool }}
         steps:
           - checkout: self
             fetchDepth: 1

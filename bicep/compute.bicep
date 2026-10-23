@@ -12,8 +12,11 @@ param name string
 @description('Region of this resource group.')
 param location string
 
-@description('Compute Gallery image id (.../galleries/<g>/images/<def>/versions/<v>), resolved by the orchestrator from config.yaml image settings.')
+@description('Compute Gallery BASE image id (.../galleries/<g>/images/<def>/versions/<v>) the EM/Server VMs boot from — OS only, resolved by the orchestrator from config.yaml image.base.')
 param imageId string
+
+@description('Compute Gallery AGENT image id the agent scale sets boot from — ctm-agent, with the Control-M/Agent baked in (configured + registered at boot); resolved from config.yaml image.agent.')
+param agentImageId string
 
 @description('OpenSSH public key for the ctmops admin user (derived from the Key Vault ssh-private-key secret).')
 param sshPublicKey string
@@ -87,7 +90,7 @@ module pools 'modules/agent-pool.bicep' = [for p in agentPools: {
     location: location
     subnetId: p.subnetId
     vmSize: p.vmSize
-    imageId: imageId
+    imageId: agentImageId
     sshPublicKey: sshPublicKey
     customData: p.customData
     isNew: p.isNew

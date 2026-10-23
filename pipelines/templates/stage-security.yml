@@ -15,6 +15,10 @@ parameters:
   - name: dependsOn
     type: object
     default: []
+  # '' = Microsoft-hosted ubuntu-latest; a name = the self-hosted scale-set pool.
+  - name: agentPool
+    type: string
+    default: ""
 
 stages:
   - stage: security
@@ -24,6 +28,11 @@ stages:
     jobs:
       - job: checkmarx
         displayName: Checkmarx One scan
+        pool:
+          ${{ if eq(parameters.agentPool, '') }}:
+            vmImage: ubuntu-latest
+          ${{ else }}:
+            name: ${{ parameters.agentPool }}
         steps:
           - checkout: self
             fetchDepth: 0 # full history lets Checkmarx attribute findings to commits

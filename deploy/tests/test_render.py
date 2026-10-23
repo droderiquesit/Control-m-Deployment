@@ -46,7 +46,9 @@ def test_common_token_set_matches_contract() -> None:
         "ATTACH_DATA_DISK",
         "CTM_VERSION",
         "DNS_ZONE",
+        "NODE_SCRIPT_BLOB",  # v4: the shim fetches the python node installer
     )
+    assert render.NODE_SCRIPT_BLOB == "scripts/ctm_node_install.py"
 
 
 def test_role_token_sets_match_contract() -> None:
@@ -88,6 +90,9 @@ def test_role_token_sets_match_contract() -> None:
         "HOSTGROUP",
         "AGENT_PORT",
         "PROVISION_IMAGE",
+        # v4.1: the agent is BAKED into the ctm-agent image — no media
+        # blob tokens; boot only configures, starts and registers it.
+        "SERVER_PRIMARY_HOST",
     )
 
 
@@ -193,6 +198,7 @@ def _dummy_agent() -> dict[str, str]:
         hostgroup="prod-agents",
         agent_port=7006,
         provision_image="Agent.Linux",
+        server_primary_host="ctm-srv-prod-a",
     )
 
 

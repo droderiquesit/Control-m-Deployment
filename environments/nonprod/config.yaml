@@ -34,26 +34,37 @@ network:
 
 # Optional full network ("Option A" in docs/NETWORK-REQUIREMENTS.md): every
 # VNet the placement blocks above reference, provisioned by
-# `ctmdeploy deploy --env nonprod --phase network` (bicep/network.bicep:
-# resource groups, VNets, subnets, one NSG per subnet, spoke <-> utility
-# peering). Default stays bring-your-own (create: false); the vnets list below
-# is the complete PoC address plan, so flipping the one flag provisions it.
-# Address spaces are non-overlapping across all platforms (required for
-# DR/failback peering).
+# `ctmdeploy deploy --env nonprod --phase network` (network/main.bicep:
+# resource groups, VNets, subnets, one NSG per subnet — bastion subnet
+# excepted — and every peering, both directions). Default stays bring-your-own
+# (create: false); the vnets list below is the complete PoC address plan, so
+# flipping the one flag provisions it. The cloud team can deploy the SAME plan
+# with az alone from network/params/nonprod.bicepparam (keep the two in sync;
+# see network/README.md). Address spaces are non-overlapping across all
+# platforms (required for DR/failback and build-agent peering).
 network_infrastructure:
   create: false            # true = ctmdeploy provisions the full network below
   user_access_cidrs: []    # CIDRs allowed to reach Control-M Web/API (NSG rule)
-  bastion_cidrs: []        # CIDRs allowed SSH 22 to nodes
+  bastion_cidrs:           # CIDRs allowed SSH 22 to nodes. Keep the
+    - "10.60.2.0/26"       # AzureBastionSubnet prefix: Bastion sessions egress
+                           # from it and the agents subnets only allow SSH from
+                           # these CIDRs. Append operator/jump CIDRs as needed.
   vnets:                   # every VNet referenced by the placement blocks above
     - name: vnet-dev-utility
       resource_group_name: rg-network-nonprod
       location: eastus2
-      role: utility        # utility | spoke
+      role: utility        # utility | spoke | build | external (network/README.md)
       address_space: 10.60.0.0/22
       subnets:
         - {name: snet-ctm-em,       prefix: 10.60.0.0/24,  role: em}
         - {name: snet-ctm-postgres, prefix: 10.60.1.0/27,  role: data}
         - {name: snet-ctm-pe,       prefix: 10.60.1.64/26, role: pe}
+        # Azure Bastion (access.bastion.enabled) — the literal subnet name is
+        # an Azure requirement; no NSG (Azure Bastion manages its own plane).
+        - {name: AzureBastionSubnet, prefix: 10.60.2.0/26, role: bastion}
+        # kvsync Function App VNet integration (kv_sync.enabled); delegated
+        # to Microsoft.Web/serverFarms.
+        - {name: snet-ctm-func,     prefix: 10.60.2.64/26, role: func}
     - name: vnet-ctm-dev
       resource_group_name: rg-network-nonprod
       location: eastus2
@@ -80,17 +91,40 @@ key_vault_public_access: true
 
 ctm_version: "9.0.21.300"
 
-# Blob-name overrides for installers / silent XMLs; {} keeps the defaults
-# (same blob names as before the toolchain migration).
+# Blob-name overrides for the EM/Server installers / silent XMLs; {} keeps
+# the defaults (same blob names as before the toolchain migration). v4.1:
+# there are NO agent keys — the Control-M/Agent is baked into the ctm-agent
+# golden image, so agent media never reaches the installers container.
 installer_blobs: {}
 
-# Compute Gallery golden image published by Packer (packer/ctm-rhel9.pkr.hcl).
-# All VMs and scale sets boot from this image instead of the marketplace image.
+# Access layer (deployed by `ctmdeploy deploy --env nonprod --phase access`):
+# Azure Bastion into the utility VNet (AzureBastionSubnet in the network
+# plan). appgw is parsed everywhere but HONORED ON PROD ONLY — the private
+# Application Gateway balances the primary and DR internal load balancers,
+# which nonprod does not have.
+access:
+  bastion: {enabled: true}
+  appgw: {enabled: true} # ignored on nonprod (prod-only feature)
+
+# Key Vault -> Control-M secret sync (functions/kvsync Durable Function,
+# infra from the access phase, code via `ctmdeploy kvsync deploy`).
+# COST NOTE: the EP1 Elastic Premium plan keeps a warm instance running;
+# set enabled: false in nonprod if that cost is not worth the rehearsal.
+kv_sync:
+  enabled: true
+  schedule: "0 */15 * * * *" # NCRONTAB (6 fields): every 15 minutes
+
+# Compute Gallery golden images published by Packer (v4.1 two-image model):
+# base = ctm-rhel9 (OS only; EM/Server VMs — packer/ctm-rhel9.pkr.hcl),
+# agent = ctm-agent (OS prep + Control-M/Agent silent-installed but
+# UNCONFIGURED; the agent scale sets — packer/ctm-agent.pkr.hcl). Bumping
+# agent.version + a compute deploy rolls the VMSS model: new instances boot
+# the new image.
 image:
   gallery_resource_group: ctm-images-rg
   gallery_name: ctmgallery
-  image_definition: ctm-rhel9
-  image_version: latest # or an explicit version such as "1.0.0"
+  base:  {definition: ctm-rhel9, version: latest} # or a pinned "1.0.0"
+  agent: {definition: ctm-agent, version: latest}
 
 em:
   vm_size: Standard_D4s_v5
@@ -190,4 +224,5 @@ media:
     packages:                 # universal packages holding the BMC EPD files + silent XMLs
       em:         {name: control-m-em,         version: "9.0.21.300"}
       server:     {name: control-m-server,     version: "9.0.21.300"}
+      agent:      {name: control-m-agent,      version: "9.0.21.300"}
       silent_xml: {name: control-m-silent-xml, version: "1.0.0"}
