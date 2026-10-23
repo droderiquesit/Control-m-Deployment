@@ -23,6 +23,9 @@ dependencies = [
     # Reads existing object-replication policy/rule ids so DR re-deploys
     # converge instead of creating duplicate policies (idempotency).
     "azure-mgmt-storage>=21.2",
+    # `ctmdeploy media upload`: pushes the BMC installer media into the
+    # installers blob container of each platform (primary + DR).
+    "azure-storage-blob>=12.19",
     "PyYAML>=6.0",
     "cryptography>=42.0",
 ]

@@ -14,17 +14,29 @@ PostgreSQL host, its own credentials and its own agent scale set / host group.
 Job definitions move dev → qa → uat → prod with the Automation API
 (`ctm deploy`), not by re-deploying infrastructure.
 
-The platform is deployed **into networks you already own**, and the placement
-of every tier is config-driven: the EM and all shared services (LB, database,
-private endpoints) live in a per-platform **utility VNet**, while every
-Control-M/Server runs in its **own VNet** with its agent scale set beside it
-(hub-and-spoke per platform; server VNets peer only with the utility VNet,
-never with each other, so stages are isolated at the network layer). The DR
-region mirrors this with a DR utility VNet plus one DR VNet per DR-protected
-Server. The toolchain creates the Control-M tiers, database, storage, secrets,
-monitoring, backup and DR plumbing — nothing in the network team's domain
-(VNets, subnets, peering and NSGs pre-exist; see
-`docs/NETWORK-REQUIREMENTS.md`).
+The placement of every tier is config-driven: the EM and all shared services
+(LB, database, private endpoints) live in a per-platform **utility VNet**,
+while every Control-M/Server runs in its **own VNet** with its agent scale
+set beside it (hub-and-spoke per platform; server VNets peer only with the
+utility VNet, never with each other, so stages are isolated at the network
+layer). The DR region mirrors this with a DR utility VNet plus one DR VNet
+per DR-protected Server. Networking comes in two flavors
+(`docs/NETWORK-REQUIREMENTS.md`): **bring-your-own** (the default — VNets,
+subnets, peering and NSGs pre-exist, the toolchain only selects them) or
+**Option A**, where flipping `network_infrastructure.create: true` makes a
+separate `--phase network` deployment (`bicep/network.bicep`) provision the
+full PoC network — resource groups, VNets, subnets, one NSG per subnet and
+the spoke ⇄ utility peerings — from the address plan shipped in the config
+files.
+
+**How the software gets onto the machines**: the Packer image is the
+**operating system only** — BMC software is never baked in. EM and
+Control-M/Server are silently installed at provision time by cloud-init from
+media in the `installers` blob container, and agents provision themselves
+through the EM Automation API. The installer media (BMC EPD archives +
+silent XMLs) is stored as **Universal Packages in an Azure Artifacts feed**;
+the pipeline's media stage (or `ctmdeploy media upload`) moves it into each
+platform's blob container — primary and DR (`docs/AZURE-DEVOPS.md` §5).
 
 ## Toolchain
 
@@ -32,7 +44,7 @@ monitoring, backup and DR plumbing — nothing in the network team's domain
 |------|------|
 | **Bicep** (`bicep/`) | every Azure resource, compiled and submitted as ARM deployments |
 | **Python** (`deploy/`, package `ctmdeploy`) | the orchestrator: loads `environments/<env>/config.yaml`, generates/seeds Key Vault secrets, renders cloud-init, runs the phased deployments, enables Site Recovery replication, drives DR failover |
-| **Packer** (`packer/`) | builds the **ctm-rhel9** golden image (RHEL 9 + Control-M OS prep baked in) and publishes it to an Azure Compute Gallery; every VM and scale-set instance boots from it |
+| **Packer** (`packer/`) | builds the **ctm-rhel9** golden image (RHEL 9 + Control-M OS prep — the **OS only**, no BMC software) and publishes it to an Azure Compute Gallery; every VM and scale-set instance boots from it, then installs EM/Server from blob media (agents: via the EM Automation API) at first boot |
 
 **Deployments are stateless.** Bicep/ARM deployments compare the template to
 what exists in Azure on every run — there is no state file, no state backend
@@ -42,12 +54,15 @@ the apply re-runs the same deployments.
 ```
 bicep/
   rg.bicep                  subscription scope: resource groups + optional locks
+  network.bicep             subscription scope, OPTIONAL: full network (Option A) —
+                            RGs, VNets, per-subnet NSGs, spoke<->utility peering
   foundation.bicep          one region's foundation (role primary|dr)
   compute.bicep             EM/Server VMs + agent VMSS + backup + VM alerts
   dr.bicep                  PG replica, ASR vault, blob object replication, Traffic Manager
   images.bicep              Compute Gallery + ctm-rhel9 image definition
-  modules/                  network, dns, security, storage, database, load-balancer,
-                            node, agent-pool, observability, backup, ...
+  modules/                  network, vnet, vnet-peering, dns, security, storage,
+                            database, load-balancer, node, agent-pool,
+                            observability, backup, ...
 environments/
   nonprod/config.yaml       single source of truth per platform (python reads it;
   prod/config.yaml          bicep gets params derived from it)
@@ -56,18 +71,36 @@ cloud-init/                 boot-time templates (__TOKEN__ placeholders) for EM,
 packer/
   ctm-rhel9.pkr.hcl         golden image build (marketplace RHEL 9 -> Compute Gallery)
   scripts/                  baked OS prep: packages, tuning, Node.js 20, deprovision
+                            (OS only — BMC software is never baked in)
 deploy/
   pyproject.toml            pip install -e deploy/
-  ctmdeploy/                cli, config, azure, secrets, render, deploy,
+  ctmdeploy/                cli, config, azure, secrets, render, deploy, media,
                             replication, failover
-  tests/                    pure-python tests (config, node plan, rendering)
+  tests/                    pure-python tests (config, network/media, rendering)
 pipelines/                  Azure DevOps stage/step templates and variables
-azure-pipelines.yml         ADO pipeline (Checkmarx One + Delinea DSV + gated applies)
+azure-pipelines.yml         ADO pipeline (Checkmarx One + Delinea DSV + gated applies
+                            + media stage: Azure Artifacts feed -> installers blob)
 .github/workflows/deploy.yml  equivalent GitHub Actions pipeline
 scripts/silent-install/     placeholder contract for BMC silent-install XML files
-docs/                       architecture, network requirements, DR runbook, operations
+docs/                       setup, configuration, resources, architecture, network,
+                            key vault, Azure DevOps, DR runbook, operations
 Makefile                    make whatif/deploy/image/failover/fmt/lint/test
 ```
+
+## Documentation index
+
+| Doc | What it answers |
+|-----|-----------------|
+| `docs/SETUP.md` | **start here** — the numbered end-to-end setup (prereqs → config → network → media feed → image → deploy → media → verify → pipeline → DR drill) |
+| `docs/CONFIGURATION.md` | every `config.yaml` variable: type, default, allowed values, what it changes, which phase consumes it |
+| `docs/RESOURCES.md` | the full inventory of deployed resources per phase, with concrete names, conditions and per-environment counts (python data-plane items marked) |
+| `docs/ARCHITECTURE.md` | diagrams and design decisions, including the image/install model |
+| `docs/NETWORK-REQUIREMENTS.md` | Option A (repo-created network + PoC address plan) and the BYO contract; private-endpoint and DNS zone/link inventory |
+| `docs/KEYVAULT.md` | what is in each Key Vault, who consumes each secret and when, rotation, RBAC/firewall posture |
+| `docs/AZURE-DEVOPS.md` | pipeline setup: WIF, Delinea DSV, Checkmarx One, environments/approvals, the Azure Artifacts media feed |
+| `docs/OPERATIONS.md` | scaling, patching, image revisions, secret rotation, backup/restore |
+| `docs/DR-RUNBOOK.md` | regional failover and failback |
+| `packer/README.md` | golden image lifecycle (OS only — no BMC software) |
 
 ## Architecture (per platform)
 
@@ -113,17 +146,23 @@ environment with one Server).
 
 ## Prerequisites
 
-1. **Networks** that already exist in each region (see `docs/NETWORK-REQUIREMENTS.md`):
-   a utility VNet (`network.utility`) with an em subnet, a subnet delegated to
-   `Microsoft.DBforPostgreSQL/flexibleServers` and a private-endpoint subnet,
-   plus **one VNet per Control-M/Server** (`servers.<stage>.network`) with a
-   server subnet and (optionally separate) agents subnet, each peered to the
-   utility VNet — and the DR equivalents (`dr.network.utility`,
-   `dr.server_networks`) where DR is enabled. Hub-managed private DNS zones can
-   be passed in; missing ones are created in the platform resource group and
-   linked to every platform VNet.
+1. **Networks** in each region (see `docs/NETWORK-REQUIREMENTS.md`): either
+   bring your own — a utility VNet (`network.utility`) with an em subnet, a
+   subnet delegated to `Microsoft.DBforPostgreSQL/flexibleServers` and a
+   private-endpoint subnet, plus **one VNet per Control-M/Server**
+   (`servers.<stage>.network`) with a server subnet and (optionally separate)
+   agents subnet, each peered to the utility VNet, and the DR equivalents
+   (`dr.network.utility`, `dr.server_networks`) where DR is enabled — **or**
+   flip `network_infrastructure.create: true` and let
+   `ctmdeploy deploy --phase network` provision all of it from the address
+   plan shipped in the config files (Option A). Hub-managed private DNS zones
+   can be passed in; missing ones are created in the platform resource group
+   and linked to every platform VNet.
 2. **BMC media** (EPD download) for Control-M/EM and Control-M/Server, plus the four
-   silent-install XML files described in `scripts/silent-install/README.md`.
+   silent-install XML files described in `scripts/silent-install/README.md` —
+   published as Universal Packages to the `ctm-media` Azure Artifacts feed
+   (`docs/AZURE-DEVOPS.md` §5), or staged in a local directory for a manual
+   `ctmdeploy media upload`.
 3. **Azure identity** running the deployment with `Contributor` + `User Access
    Administrator` (role assignments) on the subscription; `Key Vault Secrets
    Officer` is granted automatically to the deployer object id you pass.
@@ -133,6 +172,9 @@ environment with one Server).
 
 ## Deploy
 
+The complete, numbered walkthrough (including the Azure Artifacts feed and
+the pipeline) is **`docs/SETUP.md`**. The short version:
+
 ```bash
 # 0. install the orchestrator
 pip install -e "deploy/[dev]"
@@ -141,19 +183,23 @@ pip install -e "deploy/[dev]"
 az login
 python -m ctmdeploy image gallery --env prod       # ctm-images-rg / ctmgallery / ctm-rhel9
 python -m ctmdeploy image build  --env prod --version 1.0.0
+#    the image is the OS only — BMC software is installed at provision time
 
 # 2. seed the config: edit environments/nonprod/config.yaml
-#    (subscription id, network names, deployer IPs, alert emails, image version)
+#    (subscription id, network names, deployer IPs, alert emails, image version;
+#     optionally network_infrastructure.create: true to have the network built)
 
 # 3. what-if, then deploy the phases
 python -m ctmdeploy whatif --env nonprod
 python -m ctmdeploy deploy --env nonprod --phase all
-#    phases, in order: rg -> foundation -> secrets -> compute -> dr -> replication
-#    (dr/replication run only where dr.enabled; any phase can be re-run alone)
+#    phases, in order: network -> rg -> foundation -> secrets -> compute -> dr -> replication
+#    (network only when network_infrastructure.create; dr/replication only where
+#     dr.enabled; any phase can be re-run alone)
 
-# 4. upload media + silent XML into the installers container
-az storage blob upload-batch --auth-mode login \
-  --account-name <blob account> --destination installers --source ./media
+# 4. publish media + silent XMLs into the installers container(s):
+#    pipeline (publishMedia=true), or from a staged directory:
+python -m ctmdeploy media upload --env nonprod --path ./media
+#    (prod uploads to the primary AND DR containers; warns about missing blobs)
 
 # 5. the EM/Server VMs are already booting and retry the download; follow with
 az serial-console connect ... # or: ssh via Bastion, then tail -f /var/log/ctm-bootstrap.log
@@ -226,5 +272,7 @@ what a run would change.
 ## Operations
 
 `docs/OPERATIONS.md` covers scaling, patching, image revisions, rotating
-secrets, backups and restoring. `docs/DR-RUNBOOK.md` covers regional failover
-and failback. `packer/README.md` covers the golden image lifecycle.
+secrets, backups and restoring. `docs/KEYVAULT.md` covers the secret
+inventory, consumers and rotation. `docs/DR-RUNBOOK.md` covers regional
+failover and failback. `packer/README.md` covers the golden image lifecycle
+(OS only — BMC software is installed at provision time).

@@ -5,7 +5,9 @@
 ```
 validate ──► security (Checkmarx One) ──► whatif nonprod ──► apply nonprod (CTM_DEV, CTM_QA) ──► apply prod (CTM_UAT, CTM_PROD)
                                       └─► whatif prod ──────────────────────────────────────────────┘
-image (manual, runImageBuild=true) ──► Packer publishes a new ctm-rhel9 gallery version
+image (manual, runImageBuild=true) ──► Packer publishes a new ctm-rhel9 gallery version (OS only — no BMC software)
+media (manual, publishMedia=true)  ──► Azure Artifacts feed (Universal Packages: BMC EPD + silent XMLs)
+                                       └─► ctmdeploy media upload ──► installers blob container (primary + DR)
 ```
 
 * **Pull requests** run validate (bicep build/lint, pytest, shell syntax),
@@ -31,6 +33,13 @@ image (manual, runImageBuild=true) ──► Packer publishes a new ctm-rhel9 ga
   **image** stage: it installs a pinned, checksum-verified Packer, ensures the
   gallery exists (`ctmdeploy image gallery`) and publishes the version
   (`ctmdeploy image build`). Gallery versions are immutable — always bump.
+* The **installer media** (BMC EPD archives + silent-install XMLs) is stored
+  as **Universal Packages in an Azure Artifacts feed**, never in git. A manual
+  run on `main` with `publishMedia=true` adds the **media** stage, which
+  downloads the three pinned packages and runs `ctmdeploy media upload` to
+  push them into each platform's `installers` blob container (primary and,
+  for prod, DR). The VMs are unchanged — nodes pull the media from blob via
+  managed identity at first boot. Setup and package layout: section 5 below.
 
 ## One-time setup
 
@@ -128,7 +137,128 @@ Recommended checks:
 Branch policy on `main`: require the pipeline (build validation), at least one
 reviewer, and linked work items if you use them.
 
-### 5. No state backend
+### 5. Azure Artifacts media feed (installer media)
+
+The BMC installer media lives as **Universal Packages** in the Azure
+Artifacts feed named by `artifactsFeed` in `common.yml` (`ctm-media`). Three
+packages are pinned there (names/versions in `common.yml`, mirrored by the
+`media.azure_artifacts` block of `environments/<env>/config.yaml` — keep both
+in sync):
+
+| Package | Version | Contents (flat, at the package root) | Mapped blob prefix |
+|---------|---------|--------------------------------------|--------------------|
+| `control-m-em` | `9.0.21.300` | `DREM.9.0.21.300_Linux-x86_64.tar.Z` (EM EPD archive) | `em/` |
+| `control-m-server` | `9.0.21.300` | `DRSRV.9.0.21.300_Linux-x86_64.tar.Z` (Server EPD archive) | `server/` |
+| `control-m-silent-xml` | `1.0.0` | `silent-em-primary.xml`, `silent-em-secondary.xml`, `silent-server-primary.xml`, `silent-server-secondary.xml` | by filename (below) |
+
+**Layout / mapping rule** (implemented by `blob_name_for` in
+`deploy/ctmdeploy/media.py`; packages stay **flat**, `ctmdeploy media upload`
+maps each file to its blob name in the `installers` container):
+
+* a path already prefixed `em/...` or `server/...` is uploaded **verbatim**
+  (the pipeline downloads the em and server packages into directories of
+  exactly those names);
+* otherwise the **filename** decides: `DREM*` and `silent-em-*` → `em/`,
+  `DRSRV*` and `silent-server-*` → `server/`;
+* anything else is skipped with a warning — never uploaded.
+
+The resulting blob names must match the `installer_blobs` of the config
+(defaults: `em/DREM.9.0.21.300_Linux-x86_64.tar.Z`,
+`server/DRSRV.9.0.21.300_Linux-x86_64.tar.Z`, `em/silent-em-primary.xml`,
+`em/silent-em-secondary.xml`, `server/silent-server-primary.xml`,
+`server/silent-server-secondary.xml`). After every run `ctmdeploy media
+upload` prints the upload manifest and **warns about any `installer_blobs`
+name still missing** from a container, so an incomplete media set is visible
+before the first VM boots against it.
+
+**Create the feed**: Artifacts → **Create Feed** → name `ctm-media`, scope
+*Project* (the az CLI has no feed-create command; the REST equivalent is
+`POST https://feeds.dev.azure.com/<org>/<project>/_apis/packaging/feeds?api-version=7.1`).
+Upstream sources are unnecessary — the feed only ever holds these packages.
+
+**Publish the packages** (one directory per package, holding exactly the
+files listed above; needs the azure-devops CLI extension and *Feed Publisher*
+on the feed):
+
+```bash
+az extension add --name azure-devops
+az login     # or export AZURE_DEVOPS_EXT_PAT=<PAT with Packaging read+write>
+ORG=https://dev.azure.com/REPLACE_WITH_ORG
+PROJ=REPLACE_WITH_PROJECT
+
+# 1. EM EPD archive — ./epd/em contains only DREM.9.0.21.300_Linux-x86_64.tar.Z
+az artifacts universal publish --organization "$ORG" --project "$PROJ" --scope project \
+  --feed ctm-media --name control-m-em --version 9.0.21.300 \
+  --description "BMC Control-M/EM 9.0.21.300 EPD media" --path ./epd/em
+
+# 2. Server EPD archive — ./epd/server contains only DRSRV.9.0.21.300_Linux-x86_64.tar.Z
+az artifacts universal publish --organization "$ORG" --project "$PROJ" --scope project \
+  --feed ctm-media --name control-m-server --version 9.0.21.300 \
+  --description "BMC Control-M/Server 9.0.21.300 EPD media" --path ./epd/server
+
+# 3. Silent-install XMLs — ./epd/silent-xml contains the four silent-*.xml files
+az artifacts universal publish --organization "$ORG" --project "$PROJ" --scope project \
+  --feed ctm-media --name control-m-silent-xml --version 1.0.0 \
+  --description "Control-M silent-install XMLs" --path ./epd/silent-xml
+```
+
+Universal Package versions must be valid SemVer; if your feed rejects the
+four-part BMC version `9.0.21.300`, publish it as `9.0.21-300` and set that
+same string in `common.yml` (`mediaEmVersion`/`mediaServerVersion`) and in
+`media.azure_artifacts.packages.*.version` of both config files — the package
+version is only a feed coordinate, the blob names and `installer_blobs` are
+untouched. Published versions are **immutable**: fixing a media set means
+publishing a new version and bumping the pins (common.yml + both config
+files) by PR.
+
+**Feed permissions for the pipeline identity**: the `UniversalPackages@0`
+download task authenticates with the job access token, so on the feed
+(Artifacts → ctm-media → gear icon → Permissions) grant the **Feed Reader**
+role to the pipeline's build identity — `<Project> Build Service (<org>)`
+when *Limit job authorization scope to current project* is on (the default),
+otherwise `Project Collection Build Service (<org>)`. The upload side is Azure
+RBAC, not feed RBAC: blob writes are **data-plane**, which subscription
+Contributor does *not* include, so grant the WIF service connection's identity
+(section 1) **Storage Blob Data Contributor** on the platform storage accounts
+(or their resource groups) — for prod that is the primary *and* the DR blob
+account. The feed must be in the organization running the pipeline; a feed
+elsewhere requires `feedsToUse: external` plus a service connection in
+`stage-media.yml`.
+
+**How publishMedia runs are triggered**: a **manual run on `main` with
+`publishMedia=true`**. The media stage depends only on validate and is
+independent of what-if/apply (publishing media is a data-plane blob upload,
+not an ARM deployment — nothing else in the run changes). It runs one job
+per environment: three `UniversalPackages@0` downloads into `em/`, `server/`
+and `silent_xml/` directories, then `python -m ctmdeploy media upload --env
+<env> --path …` inside `AzureCLI@2` (federated login, overwrite enabled —
+re-publishing the same set converges; prod uploads to the primary **and** DR
+containers because `dr.enabled: true`). On a PR or any non-main branch the
+stage never runs, even with the parameter set.
+
+**Manual alternative (local use)** — the same mover runs from a workstation
+with `az login` and **Storage Blob Data Contributor** on the storage
+accounts (a management-plane role such as Contributor is not enough for
+data-plane blob writes); useful before the pipeline exists or for urgent
+fixes:
+
+```bash
+az artifacts universal download --organization "$ORG" --project "$PROJ" --scope project \
+  --feed ctm-media --name control-m-em --version 9.0.21.300 --path ./media/em
+az artifacts universal download --organization "$ORG" --project "$PROJ" --scope project \
+  --feed ctm-media --name control-m-server --version 9.0.21.300 --path ./media/server
+az artifacts universal download --organization "$ORG" --project "$PROJ" --scope project \
+  --feed ctm-media --name control-m-silent-xml --version 1.0.0 --path ./media/silent_xml
+
+python -m ctmdeploy media upload --env nonprod --path ./media
+python -m ctmdeploy media upload --env prod --path ./media   # primary + DR
+```
+
+(Files staged by hand work too — the mapping rule above applies to any
+directory.) `--role primary|dr|both` restricts the target platforms; the
+default is `both` when DR is enabled, else `primary`.
+
+### 6. No state backend
 
 There is nothing else to set up. Bicep deployments are stateless ARM calls —
 no state storage account, no state locks, no backend configuration, no
@@ -145,18 +275,26 @@ names `ctm-<env>-<phase>[-dr]`).
   to stop promotion early; **runCheckmarx=false** skips the scan (what-ifs
   still run, applies still require main).
 * Manual run with **runImageBuild=true** + **imageVersion** to publish a new
-  golden image (then bump `image.image_version` in config via PR).
+  golden image (then bump `image.image_version` in config via PR). The image
+  is the operating system only — BMC software is installed at provision time
+  from the installer media below, never baked in.
+* Manual run on `main` with **publishMedia=true** to publish the installer
+  media: the Azure Artifacts universal packages pinned in `common.yml` are
+  downloaded and `ctmdeploy media upload` pushes them to every platform's
+  installers blob container (section 5). Runs independently of
+  what-if/apply; does nothing on PRs or other branches.
 
 ## Files
 
 | Path | Purpose |
 |------|---------|
 | `azure-pipelines.yml` | entry point, parameters, stage wiring |
-| `pipelines/variables/common.yml` | tool pins (bicep sha256, packer, python), service connection, DSV and Checkmarx settings |
+| `pipelines/variables/common.yml` | tool pins (bicep sha256, packer, python), service connection, Azure Artifacts media feed/package pins, DSV and Checkmarx settings |
 | `pipelines/templates/stage-validate.yml` | bicep build+lint, compileall, pytest, config load, shell syntax |
 | `pipelines/templates/stage-security.yml` | Checkmarx One (task or CLI) |
 | `pipelines/templates/stage-whatif.yml` | DSV secrets + `ctmdeploy whatif` + artifact + hasChanges gate |
 | `pipelines/templates/stage-apply.yml` | gated deployment job running `ctmdeploy deploy --phase all` |
 | `pipelines/templates/stage-image.yml` | pinned Packer + `ctmdeploy image gallery/build` |
+| `pipelines/templates/stage-media.yml` | Azure Artifacts universal-package downloads + `ctmdeploy media upload` (publishMedia=true, main only) |
 | `pipelines/templates/steps-dsv-secrets.yml` | Delinea DSV CLI install + secret read |
 | `pipelines/templates/steps-tools-install.yml` | pinned Bicep (sha256 verified) + `pip install -e deploy/` |

@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# argparse CLI: ctmdeploy {deploy,whatif,failover,image,render,secrets}.
+# argparse CLI: ctmdeploy {deploy,whatif,failover,image,media,render,secrets}.
 # Pure-python commands (render) work without the Azure SDKs; the others
 # import them lazily inside the handlers. Entry point: ctmdeploy.cli:main.
 # ---------------------------------------------------------------------------
@@ -10,6 +10,7 @@ Examples:
     python -m ctmdeploy whatif --env nonprod            # prints has_changes=...
     python -m ctmdeploy failover --env prod --test
     python -m ctmdeploy image build --env prod --version 1.0.0
+    python -m ctmdeploy media upload --env prod --path ./downloaded-media
     python -m ctmdeploy render --env nonprod --role server --stage qa
     python -m ctmdeploy secrets --env prod
 
@@ -63,8 +64,9 @@ def build_parser() -> argparse.ArgumentParser:
     deploy_p.add_argument(
         "--phase",
         default="all",
-        choices=("all", "rg", "foundation", "secrets", "compute", "dr", "replication"),
-        help="phase to run (default: all)",
+        choices=("all", "network", "rg", "foundation", "secrets", "compute", "dr", "replication"),
+        help="phase to run (default: all; network runs only when "
+        "network_infrastructure.create is true)",
     )
     deploy_p.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     deploy_p.add_argument(
@@ -84,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     whatif_p.add_argument(
         "--phase",
         default="all",
-        choices=("all", "rg", "foundation", "compute", "dr"),
+        choices=("all", "network", "rg", "foundation", "compute", "dr"),
         help="phase to analyze (default: all ARM phases)",
     )
     whatif_p.add_argument(
@@ -123,6 +125,27 @@ def build_parser() -> argparse.ArgumentParser:
         "gallery", help="deploy bicep/images.bicep (Compute Gallery + image definition)"
     )
     _add_common_args(image_gallery_p)
+
+    media_p = sub.add_parser(
+        "media", help="installer media operations (Azure Artifacts packages -> blob)"
+    )
+    media_sub = media_p.add_subparsers(dest="media_command", required=True)
+    media_upload_p = media_sub.add_parser(
+        "upload",
+        help="upload downloaded BMC media to the installers container(s) (overwrites)",
+    )
+    _add_common_args(media_upload_p)
+    media_upload_p.add_argument(
+        "--role",
+        default=None,
+        choices=("primary", "dr", "both"),
+        help="target platform(s); default: both when dr.enabled, else primary",
+    )
+    media_upload_p.add_argument(
+        "--path",
+        required=True,
+        help="directory holding the downloaded media (flat files or an em/ + server/ tree)",
+    )
 
     render_p = sub.add_parser("render", help="debug: print a rendered cloud-init script")
     _add_common_args(render_p)
@@ -283,6 +306,13 @@ def cmd_image_gallery(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_media_upload(args: argparse.Namespace) -> int:
+    from ctmdeploy import media
+
+    cfg, _ = _load(args)
+    return media.upload(cfg, args.path, role=args.role)
+
+
 def cmd_render(args: argparse.Namespace) -> int:
     # Rendering is offline by design: placeholder subscription ids are fine.
     from ctmdeploy.config import agent_pools, node_plan
@@ -350,6 +380,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.image_command == "build":
                 return cmd_image_build(args)
             return cmd_image_gallery(args)
+        if args.command == "media":
+            return cmd_media_upload(args)
         return handlers[args.command](args)
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)

@@ -40,6 +40,66 @@ network:
   # extra_dns_vnets: [{vnet_name: ..., vnet_resource_group_name: ...}]
   extra_dns_vnets: []
 
+# Optional full network ("Option A" in docs/NETWORK-REQUIREMENTS.md): every
+# VNet the placement blocks above (and dr: below) reference, provisioned by
+# `ctmdeploy deploy --env prod --phase network` (bicep/network.bicep:
+# resource groups, VNets, subnets, one NSG per subnet, spoke <-> utility
+# peering — DR VNets included, in the DR region). Default stays bring-your-own
+# (create: false); the vnets list below is the complete PoC address plan, so
+# flipping the one flag provisions it. Address spaces are non-overlapping
+# across all platforms AND between primary and DR (required for DR/failback
+# peering).
+network_infrastructure:
+  create: false            # true = ctmdeploy provisions the full network below
+  user_access_cidrs: []    # CIDRs allowed to reach Control-M Web/API (NSG rule)
+  bastion_cidrs: []        # CIDRs allowed SSH 22 to nodes
+  vnets:                   # every VNet referenced by the placement blocks above
+    - name: vnet-prod-utility
+      resource_group_name: rg-network-prod
+      location: eastus2
+      role: utility        # utility | spoke
+      address_space: 10.70.0.0/22
+      subnets:
+        - {name: snet-ctm-em,       prefix: 10.70.0.0/24,  role: em}
+        - {name: snet-ctm-postgres, prefix: 10.70.1.0/27,  role: data}
+        - {name: snet-ctm-pe,       prefix: 10.70.1.64/26, role: pe}
+    - name: vnet-ctm-uat
+      resource_group_name: rg-network-prod
+      location: eastus2
+      role: spoke
+      peer_to: vnet-prod-utility
+      address_space: 10.70.8.0/24
+      subnets:
+        - {name: snet-ctm-server, prefix: 10.70.8.0/26,  role: server}
+        - {name: snet-ctm-agents, prefix: 10.70.8.64/26, role: agents}
+    - name: vnet-ctm-prod
+      resource_group_name: rg-network-prod
+      location: eastus2
+      role: spoke
+      peer_to: vnet-prod-utility
+      address_space: 10.70.9.0/24
+      subnets:
+        - {name: snet-ctm-server, prefix: 10.70.9.0/26,  role: server}
+        - {name: snet-ctm-agents, prefix: 10.70.9.64/26, role: agents}
+    - name: vnet-dr-utility
+      resource_group_name: rg-network-prod-dr
+      location: centralus
+      role: utility
+      address_space: 10.80.0.0/22
+      subnets:
+        - {name: snet-ctm-em,       prefix: 10.80.0.0/24,  role: em}
+        - {name: snet-ctm-postgres, prefix: 10.80.1.0/27,  role: data}
+        - {name: snet-ctm-pe,       prefix: 10.80.1.64/26, role: pe}
+    - name: vnet-ctm-prod-dr
+      resource_group_name: rg-network-prod-dr
+      location: centralus
+      role: spoke
+      peer_to: vnet-dr-utility
+      address_space: 10.80.9.0/24
+      subnets:
+        - {name: snet-ctm-server, prefix: 10.80.9.0/26,  role: server}
+        - {name: snet-ctm-agents, prefix: 10.80.9.64/26, role: agents}
+
 deployer_ip_cidrs:
   - "203.0.113.10/32"
 
@@ -171,3 +231,19 @@ dr:
   replica_sku_name: GP_Standard_D8ds_v5
   enable_site_recovery: true
   traffic_manager: false
+
+# Installer media source of truth: the BMC EPD archives + silent-install XMLs
+# live as Universal Packages in an Azure Artifacts feed. The pipeline (or
+# `ctmdeploy media upload`) moves them into the installers blob containers of
+# BOTH the primary and the DR platform; nodes still download from blob via
+# managed identity at first boot. Replace the REPLACE_WITH_* placeholders with
+# your Azure DevOps organization/project.
+media:
+  azure_artifacts:
+    organization: "https://dev.azure.com/REPLACE_WITH_ORG"
+    project: "REPLACE_WITH_PROJECT"
+    feed: ctm-media
+    packages:                 # universal packages holding the BMC EPD files + silent XMLs
+      em:         {name: control-m-em,         version: "9.0.21.300"}
+      server:     {name: control-m-server,     version: "9.0.21.300"}
+      silent_xml: {name: control-m-silent-xml, version: "1.0.0"}

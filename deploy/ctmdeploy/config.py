@@ -486,6 +486,148 @@ class InstallerBlobs:
 
 
 # ---------------------------------------------------------------------------
+# v3: optional full-network infrastructure (bicep/network.bicep) — BYO stays
+# the default (`create: false`); the vnets list then documents the PoC plan.
+# ---------------------------------------------------------------------------
+
+#: Valid `role` values of a network_infrastructure.vnets entry.
+VNET_ROLES = ("utility", "spoke")
+#: Valid `role` values of a subnet inside a vnets entry (drives the NSG rules).
+SUBNET_ROLES = ("em", "data", "pe", "server", "agents")
+
+
+@dataclass(frozen=True)
+class SubnetSpec:
+    """One subnet of a to-be-created VNet; `role` selects its NSG rule set."""
+
+    name: str
+    prefix: str
+    role: str  # one of SUBNET_ROLES
+
+    def as_param(self) -> dict[str, str]:
+        return {"name": self.name, "prefix": self.prefix, "role": self.role}
+
+
+@dataclass(frozen=True)
+class VnetSpec:
+    """One VNet of the optional full-network deployment.
+
+    role 'utility' hosts the em/data/pe subnets; role 'spoke' hosts a
+    server/agents pair and MUST name its utility VNet in `peer_to` (the
+    network deployment creates the peering in both directions).
+    """
+
+    name: str
+    resource_group_name: str
+    location: str
+    role: str  # one of VNET_ROLES
+    address_space: str
+    subnets: tuple[SubnetSpec, ...]
+    peer_to: str = ""  # spokes only: the utility VNet to peer with
+
+    def subnet(self, name: str) -> SubnetSpec | None:
+        return next((s for s in self.subnets if s.name == name), None)
+
+
+@dataclass(frozen=True)
+class NetworkInfrastructure:
+    """The optional `network_infrastructure:` block.
+
+    `create: false` (the default) means bring-your-own networking: the block
+    is inert documentation of the PoC address plan and nothing is validated
+    beyond its shape. Flipping `create: true` makes `ctmdeploy deploy --phase
+    network` provision every listed VNet — and makes load-time validation
+    cross-check the placement blocks against this list.
+    """
+
+    create: bool = False
+    user_access_cidrs: tuple[str, ...] = ()  # allowed to reach Control-M Web/API
+    bastion_cidrs: tuple[str, ...] = ()  # allowed SSH 22 to nodes
+    vnets: tuple[VnetSpec, ...] = ()
+
+    def vnet(self, name: str) -> VnetSpec | None:
+        return next((v for v in self.vnets if v.name == name), None)
+
+    def spoke_address_spaces(self) -> list[str]:
+        """Address spaces of ALL spoke VNets (the bicep NSG rules allow e.g.
+        postgres 5432 from every spoke, so DR failback keeps working)."""
+        return [v.address_space for v in self.vnets if v.role == "spoke"]
+
+    def vnets_param(self) -> list[dict[str, Any]]:
+        """Items of the bicep/network.bicep `vnets` param.
+
+        Each item is the config shape verbatim plus the resolved
+        `peerAddressSpaces` (the address spaces of the VNets it is peered
+        with: a spoke's utility, or every spoke peering into a utility) and
+        `spokeAddressSpaces` (utility items: ALL spoke address spaces; empty
+        on spokes).
+        """
+        all_spokes = self.spoke_address_spaces()
+        items: list[dict[str, Any]] = []
+        for vnet in self.vnets:
+            if vnet.role == "utility":
+                peer_spaces = [
+                    s.address_space
+                    for s in self.vnets
+                    if s.role == "spoke" and s.peer_to == vnet.name
+                ]
+                spoke_spaces = list(all_spokes)
+            else:
+                peer = self.vnet(vnet.peer_to)
+                peer_spaces = [peer.address_space] if peer is not None else []
+                spoke_spaces = []
+            items.append(
+                {
+                    "name": vnet.name,
+                    "resource_group_name": vnet.resource_group_name,
+                    "location": vnet.location,
+                    "role": vnet.role,
+                    "peer_to": vnet.peer_to,
+                    "address_space": vnet.address_space,
+                    "subnets": [s.as_param() for s in vnet.subnets],
+                    "peerAddressSpaces": peer_spaces,
+                    "spokeAddressSpaces": spoke_spaces,
+                }
+            )
+        return items
+
+
+# ---------------------------------------------------------------------------
+# v3: installer media via Azure Artifacts Universal Packages (optional block;
+# the pipeline downloads the packages, `ctmdeploy media upload` pushes them
+# to the installers blob container of each platform).
+# ---------------------------------------------------------------------------
+
+#: Required package keys under media.azure_artifacts.packages.
+MEDIA_PACKAGE_KEYS = ("em", "server", "silent_xml")
+
+
+@dataclass(frozen=True)
+class MediaPackageConfig:
+    """One Azure Artifacts universal package (name + pinned version)."""
+
+    name: str
+    version: str
+
+
+@dataclass(frozen=True)
+class AzureArtifactsConfig:
+    """The Azure Artifacts feed holding the BMC EPD media packages."""
+
+    organization: str  # e.g. https://dev.azure.com/<org>
+    project: str
+    feed: str
+    packages: dict[str, MediaPackageConfig] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MediaConfig:
+    """The optional `media:` block (absent -> azure_artifacts is None)."""
+
+    azure_artifacts: AzureArtifactsConfig | None = None
+
+
+# ---------------------------------------------------------------------------
 # Plans handed to bicep/compute.bicep
 # ---------------------------------------------------------------------------
 
@@ -602,6 +744,9 @@ class EnvironmentConfig:
     backup: BackupConfig
     observability: ObservabilityConfig
     dr: DrConfig
+    # v3 optional blocks (absent from config.yaml -> inert defaults).
+    network_infrastructure: NetworkInfrastructure = field(default_factory=NetworkInfrastructure)
+    media: MediaConfig = field(default_factory=MediaConfig)
 
     # ---- names -----------------------------------------------------------
     @property
@@ -1110,6 +1255,281 @@ def _parse_dr(raw: Mapping[str, Any], path: str, server_keys: list[str]) -> DrCo
     return dr
 
 
+def _parse_subnet_spec(raw: Any, path: str) -> SubnetSpec:
+    data = _mapping(raw, path)
+    spec = SubnetSpec(
+        name=_str(data, "name", path),
+        prefix=_str(data, "prefix", path),
+        role=_str(data, "role", path),
+    )
+    if spec.role not in SUBNET_ROLES:
+        raise ConfigError(f"{path}.role: must be one of {SUBNET_ROLES}, got {spec.role!r}")
+    return spec
+
+
+def _parse_vnet_spec(raw: Any, path: str) -> VnetSpec:
+    data = _mapping(raw, path)
+    role = _str(data, "role", path)
+    if role not in VNET_ROLES:
+        raise ConfigError(f"{path}.role: must be one of {VNET_ROLES}, got {role!r}")
+    subnets_raw = data.get("subnets")
+    if not isinstance(subnets_raw, (list, tuple)) or not subnets_raw:
+        raise ConfigError(f"{path}.subnets: expected a non-empty list of subnets")
+    return VnetSpec(
+        name=_str(data, "name", path),
+        resource_group_name=_str(data, "resource_group_name", path),
+        location=_str(data, "location", path),
+        role=role,
+        address_space=_str(data, "address_space", path),
+        subnets=tuple(
+            _parse_subnet_spec(item, f"{path}.subnets[{i}]") for i, item in enumerate(subnets_raw)
+        ),
+        peer_to=_opt_str(data, "peer_to", path),
+    )
+
+
+def _parse_network_infrastructure(raw: Any, path: str) -> NetworkInfrastructure:
+    data = _mapping(raw, path)
+    if not data:
+        return NetworkInfrastructure()
+    vnets_raw = data.get("vnets") or []
+    if not isinstance(vnets_raw, (list, tuple)):
+        raise ConfigError(f"{path}.vnets: expected a list, got {type(vnets_raw).__name__}")
+    infra = NetworkInfrastructure(
+        create=_bool(data, "create", path, False),
+        user_access_cidrs=tuple(_str_list(data, "user_access_cidrs", path, [])),
+        bastion_cidrs=tuple(_str_list(data, "bastion_cidrs", path, [])),
+        vnets=tuple(
+            _parse_vnet_spec(item, f"{path}.vnets[{i}]") for i, item in enumerate(vnets_raw)
+        ),
+    )
+    seen: set[str] = set()
+    for vnet in infra.vnets:
+        if vnet.name in seen:
+            raise ConfigError(f"{path}.vnets: duplicate VNet name {vnet.name!r}")
+        seen.add(vnet.name)
+    if infra.create and not infra.vnets:
+        raise ConfigError(
+            f"{path}.vnets: at least one VNet is required when {path}.create is true"
+        )
+    return infra
+
+
+def _parse_media(raw: Any, path: str) -> MediaConfig:
+    data = _mapping(raw, path)
+    if not data or data.get("azure_artifacts") is None:
+        return MediaConfig()
+    aa_path = f"{path}.azure_artifacts"
+    aa = _mapping(data["azure_artifacts"], aa_path)
+    packages_raw = _mapping(aa.get("packages"), f"{aa_path}.packages")
+    packages: dict[str, MediaPackageConfig] = {}
+    for key, value in packages_raw.items():
+        pkg_path = f"{aa_path}.packages.{key}"
+        pkg = _mapping(value, pkg_path)
+        packages[str(key)] = MediaPackageConfig(
+            name=_str(pkg, "name", pkg_path), version=_str(pkg, "version", pkg_path)
+        )
+    unknown = sorted(set(packages) - set(MEDIA_PACKAGE_KEYS))
+    if unknown:
+        raise ConfigError(
+            f"{aa_path}.packages: unknown keys {unknown}; expected a subset of "
+            f"{list(MEDIA_PACKAGE_KEYS)}"
+        )
+    missing = [key for key in MEDIA_PACKAGE_KEYS if key not in packages]
+    if missing:
+        raise ConfigError(f"{aa_path}.packages: missing required packages {missing}")
+    return MediaConfig(
+        azure_artifacts=AzureArtifactsConfig(
+            organization=_str(aa, "organization", aa_path),
+            project=_str(aa, "project", aa_path),
+            feed=_str(aa, "feed", aa_path),
+            packages=packages,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# network_infrastructure validation (runs only when create is true)
+# ---------------------------------------------------------------------------
+
+
+def _placement_refs(cfg: EnvironmentConfig) -> list[tuple[str, str, str, frozenset[str], str]]:
+    """Every (vnet, resource group, subnet, allowed subnet roles, config path)
+    the placement blocks reference: the utility em/data/pe subnets plus each
+    server's server/agents subnets — primary AND DR regions."""
+    refs: list[tuple[str, str, str, frozenset[str], str]] = []
+
+    def add_utility(utility: UtilityNetworkConfig, path: str) -> None:
+        vnet, rg = utility.vnet_name, utility.vnet_resource_group_name
+        refs.append((vnet, rg, utility.em_subnet_name, frozenset({"em"}), f"{path}.em_subnet_name"))
+        refs.append(
+            (vnet, rg, utility.data_subnet_name, frozenset({"data"}), f"{path}.data_subnet_name")
+        )
+        if utility.pe_subnet_name:
+            refs.append(
+                (vnet, rg, utility.pe_subnet_name, frozenset({"pe"}), f"{path}.pe_subnet_name")
+            )
+
+    def add_server(net: ServerNetworkConfig, path: str) -> None:
+        refs.append(
+            (
+                net.vnet_name,
+                net.vnet_resource_group_name,
+                net.server_subnet_name,
+                frozenset({"server"}),
+                f"{path}.server_subnet_name",
+            )
+        )
+        # Agents default into the server subnet, so 'server' stays allowed.
+        refs.append(
+            (
+                net.agents_vnet,
+                net.agents_vnet_resource_group,
+                net.agents_subnet,
+                frozenset({"agents", "server"}),
+                f"{path} (agents placement)",
+            )
+        )
+
+    add_utility(cfg.network.utility, "config.network.utility")
+    for key, server in cfg.servers.items():
+        add_server(server.network, f"config.servers.{key}.network")
+    if cfg.dr.enabled and cfg.dr.network is not None:
+        add_utility(cfg.dr.network.utility, "config.dr.network.utility")
+        for key, net in cfg.dr.server_networks.items():
+            add_server(net, f"config.dr.server_networks.{key}")
+    return refs
+
+
+def _validate_network_infrastructure(cfg: EnvironmentConfig) -> None:
+    """Cross-check the network_infrastructure block (create: true only).
+
+    Enforces: parseable, pairwise non-overlapping VNet address spaces;
+    subnets that parse, sit inside their VNet and do not overlap each other;
+    spokes that peer to an existing utility VNet; parseable access CIDRs;
+    and that EVERY placement reference (utility + each server/agents VNet +
+    subnet, including the DR region) resolves to a declared VNet + subnet.
+    """
+    import ipaddress
+
+    infra = cfg.network_infrastructure
+    top = "config.network_infrastructure"
+    by_name = {vnet.name: vnet for vnet in infra.vnets}
+
+    # 1. VNet address spaces: parse + pairwise overlap detection.
+    networks: dict[str, Any] = {}
+    for vnet in infra.vnets:
+        try:
+            networks[vnet.name] = ipaddress.ip_network(vnet.address_space)
+        except ValueError as exc:
+            raise ConfigError(
+                f"{top}.vnets[{vnet.name}].address_space: {vnet.address_space!r} "
+                f"is not a valid CIDR: {exc}"
+            ) from exc
+    names = list(networks)
+    for i, first in enumerate(names):
+        for second in names[i + 1 :]:
+            a, b = networks[first], networks[second]
+            if a.version == b.version and a.overlaps(b):
+                raise ConfigError(
+                    f"{top}.vnets: address spaces overlap: {first} ({a}) and {second} ({b}) "
+                    "— all platform VNets must be non-overlapping (DR/failback requirement)"
+                )
+
+    # 2. Subnets: parse, containment in the VNet, no intra-VNet overlap.
+    for vnet in infra.vnets:
+        vnet_net = networks[vnet.name]
+        parsed: list[tuple[str, Any]] = []
+        for subnet in vnet.subnets:
+            sub_path = f"{top}.vnets[{vnet.name}].subnets[{subnet.name}]"
+            if any(name == subnet.name for name, _ in parsed):
+                raise ConfigError(f"{sub_path}: duplicate subnet name {subnet.name!r}")
+            try:
+                subnet_net = ipaddress.ip_network(subnet.prefix)
+            except ValueError as exc:
+                raise ConfigError(
+                    f"{sub_path}.prefix: {subnet.prefix!r} is not a valid CIDR: {exc}"
+                ) from exc
+            if subnet_net.version != vnet_net.version or not subnet_net.subnet_of(vnet_net):
+                raise ConfigError(
+                    f"{sub_path}.prefix: {subnet.prefix} is outside the VNet address space "
+                    f"{vnet.address_space}"
+                )
+            for other_name, other_net in parsed:
+                if subnet_net.overlaps(other_net):
+                    raise ConfigError(
+                        f"{sub_path}.prefix: {subnet.prefix} overlaps subnet "
+                        f"{other_name!r} ({other_net}) in VNet {vnet.name!r}"
+                    )
+            parsed.append((subnet.name, subnet_net))
+
+    # 3. Peering: every spoke names an existing utility VNet.
+    for vnet in infra.vnets:
+        path = f"{top}.vnets[{vnet.name}]"
+        if vnet.role == "spoke":
+            if not vnet.peer_to:
+                raise ConfigError(
+                    f"{path}.peer_to: required for role 'spoke' "
+                    "(the utility VNet this spoke peers with)"
+                )
+            peer = by_name.get(vnet.peer_to)
+            if peer is None:
+                raise ConfigError(
+                    f"{path}.peer_to: {vnet.peer_to!r} does not name a VNet in "
+                    f"{top}.vnets (declared: {sorted(by_name)})"
+                )
+            if peer.role != "utility":
+                raise ConfigError(
+                    f"{path}.peer_to: {vnet.peer_to!r} has role {peer.role!r}; "
+                    "spokes must peer to a 'utility' VNet"
+                )
+        elif vnet.peer_to:
+            raise ConfigError(
+                f"{path}.peer_to: only valid on 'spoke' VNets "
+                "(utility VNets receive the reverse peering automatically)"
+            )
+
+    # 4. Access CIDR lists must parse.
+    for key, cidrs in (
+        ("user_access_cidrs", infra.user_access_cidrs),
+        ("bastion_cidrs", infra.bastion_cidrs),
+    ):
+        for cidr in cidrs:
+            try:
+                ipaddress.ip_network(cidr)
+            except ValueError as exc:
+                raise ConfigError(f"{top}.{key}: {cidr!r} is not a valid CIDR: {exc}") from exc
+
+    # 5. Placement cross-check: every referenced VNet/subnet must be created here.
+    for vnet_name, rg, subnet_name, allowed_roles, ref_path in _placement_refs(cfg):
+        vnet = by_name.get(vnet_name)
+        if vnet is None:
+            raise ConfigError(
+                f"{ref_path}: references VNet {vnet_name!r}, which is missing from "
+                f"{top}.vnets — when network_infrastructure.create is true every VNet "
+                f"used by the placement blocks must be declared there "
+                f"(declared: {sorted(by_name)})"
+            )
+        if vnet.resource_group_name != rg:
+            raise ConfigError(
+                f"{ref_path}: VNet {vnet_name!r} is declared in resource group "
+                f"{vnet.resource_group_name!r} but the placement block references "
+                f"resource group {rg!r} (they must match)"
+            )
+        subnet = vnet.subnet(subnet_name)
+        if subnet is None:
+            raise ConfigError(
+                f"{ref_path}: subnet {subnet_name!r} is missing from VNet {vnet_name!r} in "
+                f"{top}.vnets (declared subnets: {[s.name for s in vnet.subnets]})"
+            )
+        if subnet.role not in allowed_roles:
+            raise ConfigError(
+                f"{ref_path}: subnet {subnet_name!r} in VNet {vnet_name!r} has role "
+                f"{subnet.role!r}; this placement requires role "
+                f"{' or '.join(sorted(allowed_roles))}"
+            )
+
+
 def load_config_file(
     path: str | Path, *, env: str | None = None, allow_placeholders: bool = False
 ) -> EnvironmentConfig:
@@ -1235,7 +1655,7 @@ def load_config_file(
         image_version=_str(image_raw, "image_version", f"{top}.image", default="latest"),
     )
 
-    return EnvironmentConfig(
+    cfg = EnvironmentConfig(
         subscription_id=subscription_id,
         environment=environment,
         location=_str(data, "location", top),
@@ -1256,7 +1676,16 @@ def load_config_file(
         backup=backup,
         observability=observability,
         dr=_parse_dr(data.get("dr"), f"{top}.dr", list(servers)),
+        network_infrastructure=_parse_network_infrastructure(
+            data.get("network_infrastructure"), f"{top}.network_infrastructure"
+        ),
+        media=_parse_media(data.get("media"), f"{top}.media"),
     )
+    # Semantic validation is gated on create: with create false (bring-your-
+    # own networking, the default) the vnets list is inert documentation.
+    if cfg.network_infrastructure.create:
+        _validate_network_infrastructure(cfg)
+    return cfg
 
 
 def load_config(

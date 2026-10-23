@@ -21,6 +21,24 @@ variables:
   azureServiceConnection: sc-ctm-platform-wif
   azureServiceConnectionId: 00000000-0000-0000-0000-000000000000
 
+  # Azure Artifacts feed holding the BMC installer media as Universal Packages
+  # (stage-media.yml, publishMedia=true). The REPLACE_WITH_* placeholders match
+  # the media.azure_artifacts block of environments/<env>/config.yaml — keep
+  # the two in sync when filling them in or bumping a package version. The
+  # organization URL is used by the `az artifacts universal publish` examples
+  # in docs/AZURE-DEVOPS.md and by the placeholder check; UniversalPackages@0
+  # downloads from the feed of the organization running the pipeline (a feed
+  # in another organization needs an external service connection instead).
+  artifactsOrganization: "https://dev.azure.com/REPLACE_WITH_ORG"
+  artifactsProject: "REPLACE_WITH_PROJECT"
+  artifactsFeed: ctm-media
+  mediaEmPackage: control-m-em
+  mediaEmVersion: "9.0.21.300"
+  mediaServerPackage: control-m-server
+  mediaServerVersion: "9.0.21.300"
+  mediaXmlPackage: control-m-silent-xml
+  mediaXmlVersion: "1.0.0"
+
   # Delinea DevOps Secrets Vault
   dsvCliVersion: "1.40.5"
   dsvDomain: secretsvaultcloud.com

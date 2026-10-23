@@ -8,9 +8,11 @@ beside it. Server VNets peer only with the utility VNet — never with each
 other — so each server+agent couple is fully isolated at the network layer.
 The DR region mirrors the layout: a DR utility VNet (`dr.network.utility`)
 plus one DR VNet per DR-protected Server (`dr.server_networks.<stage>`; in the
-shipped prod config only CTM_PROD participates). All VNets pre-exist
-(bring-your-own); see `docs/NETWORK-REQUIREMENTS.md` for the required subnets,
-peering and NSGs.
+shipped prod config only CTM_PROD participates). The VNets either pre-exist
+(bring-your-own, the default) or are provisioned by the optional network
+phase (`network_infrastructure.create: true` → `bicep/network.bicep`); see
+`docs/NETWORK-REQUIREMENTS.md` for both options, the PoC address plan and the
+required subnets, peering and NSGs.
 
 ```mermaid
 flowchart TB
@@ -92,7 +94,26 @@ flowchart TB
 
 Every EM/Server VM and agent scale-set instance boots from the **ctm-rhel9**
 golden image in the Azure Compute Gallery — never from the raw marketplace
-image. The image is built by Packer and consumed by the Bicep compute modules:
+image. The image is built by Packer and consumed by the Bicep compute modules.
+
+**The image contains the operating system only.** It is RHEL 9 plus the OS
+prep (packages, firewalld off, SELinux permissive, limits/sysctl tuning,
+Node.js 20, deprovision) — **no BMC software is ever baked into it**. The
+Control-M software is installed at provision time, on each node's first boot:
+
+* **EM and Control-M/Server** — cloud-init downloads the BMC EPD archive and
+  the silent-install XML from the `installers` blob container (via managed
+  identity) and runs the BMC silent installer onto the persistent `/ctm` data
+  disk.
+* **Agents** — cloud-init installs the Automation API CLI served by EM and
+  provisions the agent through the **EM Automation API** (`ctm provision
+  image` / `ctm provision agent::setup`); no installer media is downloaded.
+
+The installer media itself is sourced from an **Azure Artifacts feed**
+(Universal Packages) and moved into the blob containers by the pipeline's
+media stage or `ctmdeploy media upload` — see `docs/AZURE-DEVOPS.md` §5. This
+split means a new BMC version is a media + config change, while a new OS
+patch level is an image version bump; neither requires the other.
 
 ```mermaid
 flowchart LR
@@ -221,4 +242,22 @@ database storage auto-grow.
   environment variable (JSON map, wired to Delinea DSV in the pipeline).
   The SSH private key is available as the `ssh-private-key` secret.
 * No secrets are embedded in cloud-init or in the golden image; nodes fetch
-  them with the IMDS token at boot.
+  them with the IMDS token at boot. The full secret inventory — who creates
+  each one, who consumes it and when, and how to rotate it — is
+  `docs/KEYVAULT.md`.
+
+## Related documents
+
+* `docs/SETUP.md` — end-to-end setup order (network → feed → image → deploy →
+  media → verify → pipeline → DR drill).
+* `docs/CONFIGURATION.md` — every `config.yaml` key, type, default and the
+  phase that consumes it.
+* `docs/RESOURCES.md` — the complete inventory of deployed resources, by
+  phase, including the python-created data-plane items.
+* `docs/KEYVAULT.md` — Key Vault posture and secret handling.
+* `docs/NETWORK-REQUIREMENTS.md` — Option A (repo-created network, PoC
+  address plan) and the BYO contract, plus the private-endpoint and DNS
+  inventory.
+* `docs/AZURE-DEVOPS.md` — pipeline, Delinea DSV, Checkmarx, the Azure
+  Artifacts media feed.
+* `docs/OPERATIONS.md`, `docs/DR-RUNBOOK.md` — day-2 and failover.

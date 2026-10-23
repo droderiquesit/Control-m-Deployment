@@ -1,16 +1,20 @@
 # ---------------------------------------------------------------------------
-# Phase engine: rg -> foundation(primary[,dr]) -> secrets -> compute -> dr ->
-# replication, passing each deployment's outputs to the next. v2: per-node/
-# per-pool subnet placement (utility VNet + one VNet per server) and
-# idempotency pre-reads (existing VMs/VMSS -> isNew, promoted replica,
-# object-replication policy ids, live PG zones). Azure SDK imports are
-# guarded inside the functions that need them.
+# Phase engine: network(optional) -> rg -> foundation(primary[,dr]) ->
+# secrets -> compute -> dr -> replication, passing each deployment's outputs
+# to the next. v2: per-node/per-pool subnet placement (utility VNet + one
+# VNet per server); v3: optional full-network provisioning (bicep/
+# network.bicep, only when network_infrastructure.create). Idempotency
+# pre-reads (existing VMs/VMSS -> isNew, promoted replica, object-replication
+# policy ids, live PG zones). Azure SDK imports are guarded inside the
+# functions that need them.
 # ---------------------------------------------------------------------------
 """Python-orchestrated Bicep deployments for one Control-M environment.
 
-``python -m ctmdeploy deploy --env prod [--phase all|rg|foundation|secrets|
-compute|dr|replication]`` runs the phases; ``whatif`` runs the same ARM
-deployments in what-if mode (the pre-apply change preview).
+``python -m ctmdeploy deploy --env prod [--phase all|network|rg|foundation|
+secrets|compute|dr|replication]`` runs the phases; ``whatif`` runs the same
+ARM deployments in what-if mode (the pre-apply change preview). The
+``network`` phase runs first and only when ``network_infrastructure.create``
+is true (the default is bring-your-own networking, where it is skipped).
 Deployment names are ``ctm-<env>-<phase>[-dr]``; later phases re-read the
 earlier phases' recorded outputs so each phase can run standalone.
 
@@ -51,7 +55,7 @@ from ctmdeploy.config import (
 if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime Azure import
     from azure.core.credentials import TokenCredential
 
-PHASES = ("rg", "foundation", "secrets", "compute", "dr", "replication")
+PHASES = ("network", "rg", "foundation", "secrets", "compute", "dr", "replication")
 
 #: Used by `ctmdeploy render` when no live foundation outputs are available.
 PLACEHOLDER_IDENTITY_CLIENT_ID = "00000000-0000-0000-0000-000000000000"
@@ -300,6 +304,31 @@ class Engine:
         return secrets_mod.ssh_public_key_from_pem(self._resolve_secrets()["ssh-private-key"])
 
     # -- phases --------------------------------------------------------------
+
+    def phase_network(self, what_if: bool = False) -> list[DeploymentResult]:
+        """Subscription deployment of bicep/network.bicep (optional full network).
+
+        Runs only when ``network_infrastructure.create`` is true; the default
+        (false) is bring-your-own networking, where the placement blocks
+        reference pre-existing VNets and this phase is skipped. The single
+        subscription-scope deployment covers BOTH regions (each vnets entry
+        carries its own resource group + location, DR VNets included).
+        """
+        cfg = self.cfg
+        infra = cfg.network_infrastructure
+        if not infra.create:
+            print("    network: skipped (network_infrastructure.create is false; bring-your-own)")
+            return []
+        params = {
+            # Config-shaped vnets with the peer/spoke address spaces resolved
+            # by python (bicep derives the per-subnet NSG rules from them).
+            "vnets": infra.vnets_param(),
+            "userAccessCidrs": list(infra.user_access_cidrs),
+            "bastionCidrs": list(infra.bastion_cidrs),
+            "tags": cfg.platform_tags("network"),
+        }
+        scope = SubscriptionScope(cfg.location)
+        return [self._deploy(scope, f"{cfg.name}-network", "network.bicep", params, what_if)]
 
     def phase_rg(self, what_if: bool = False) -> list[DeploymentResult]:
         """Subscription deployment of bicep/rg.bicep (primary RG + DR RG)."""
@@ -663,7 +692,9 @@ class Engine:
         phases = list(PHASES) if phase == "all" else [phase]
         results: list[DeploymentResult] = []
         for current in phases:
-            if current == "rg":
+            if current == "network":
+                results += self.phase_network(what_if)
+            elif current == "rg":
                 results += self.phase_rg(what_if)
             elif current == "foundation":
                 results += self.phase_foundation(what_if)

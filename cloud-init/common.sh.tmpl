@@ -4,7 +4,9 @@
 # which substitutes the two-underscore token placeholders). Runs once via
 # cloud-init on first boot. Idempotent: guarded by a marker file. OS prep
 # (packages, firewall/SELinux posture, limits, sysctl, Node.js) is baked into
-# the ctm-rhel9 golden image by Packer — see packer/README.md.
+# the ctm-rhel9 golden image by Packer — the image carries NO BMC software:
+# EM/Server are silent-installed HERE from the installers blob container, and
+# agents self-provision via the EM Automation API. See packer/README.md.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 exec > >(tee -a /var/log/ctm-bootstrap.log | logger -t ctm-bootstrap) 2>&1

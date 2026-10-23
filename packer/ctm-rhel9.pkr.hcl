@@ -3,7 +3,11 @@
 # Bakes the OS prep that used to run in cloud-init on each first boot
 # (packages, firewall/SELinux posture, limits/sysctl, Node.js 20) and
 # publishes the result to the ctmgallery Azure Compute Gallery, replicated
-# to eastus2 + centralus. See packer/README.md for the full workflow.
+# to eastus2 + centralus. The image is the OPERATING SYSTEM ONLY — no BMC
+# software (EM, Control-M/Server, agents) is ever baked in; it is installed
+# at provision time by cloud-init (EM/Server: silent install from blob media;
+# agents: ctm CLI provisioning via the EM Automation API).
+# See packer/README.md for the full workflow.
 # ---------------------------------------------------------------------------
 
 packer {

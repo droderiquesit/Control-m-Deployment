@@ -1,15 +1,103 @@
-# Network requirements (bring-your-own VNets)
-
-The platform never creates or modifies a VNet, subnet, NSG, peering, route
-table or firewall — it only **selects** them by name from
-`environments/<env>/config.yaml` and creates private-DNS zone links onto them.
-Everything below must exist before the deployment runs (`ctmdeploy deploy`).
+# Network requirements
 
 Placement is per component and config-driven: the Enterprise Manager and all
 shared services live in a per-platform **utility VNet**; every Control-M/Server
 runs in its **own VNet** with its agent scale set beside it; the DR region
 mirrors the layout with a DR utility VNet plus one DR VNet per DR-protected
 Server.
+
+There are two ways to satisfy this document:
+
+* **Option A — let this repo create the network**: flip
+  `network_infrastructure.create: true` and run the `network` phase (next
+  section). The platform deployments themselves still only *select* networks
+  by name — the network phase is a separate, optional, subscription-scope
+  deployment.
+* **Option B — bring your own (the default)**: the network team provides
+  everything in [the contract below](#required-vnets-and-subnets) before
+  `ctmdeploy deploy` runs. The platform then never creates or modifies a
+  VNet, subnet, NSG, peering, route table or firewall — it only **selects**
+  them by name from `environments/<env>/config.yaml` and creates private-DNS
+  zones/links onto them (inventory [below](#platform-created-private-endpoints-and-dns-inventory)).
+
+## Option A: let this repo create the network
+
+`environments/<env>/config.yaml` carries an optional
+`network_infrastructure:` block (schema: `docs/CONFIGURATION.md`). With
+`create: false` — the shipped default — it is inert documentation of the
+address plan. With `create: true`:
+
+```bash
+python -m ctmdeploy deploy --env <env> --phase network
+```
+
+deploys `bicep/network.bicep` (one subscription-scope deployment,
+`ctm-<env>-network`, covering both regions), which creates:
+
+* the **network resource groups** named by the entries (deduped);
+* every **VNet** in `network_infrastructure.vnets` with its address space;
+* every **subnet**, with the `data` role delegated to
+  `Microsoft.DBforPostgreSQL/flexibleServers` and the `pe` role set to
+  `privateEndpointNetworkPolicies: Disabled`;
+* **one NSG per subnet**, named `<vnet>-<subnet>-nsg`, with rules derived
+  from the subnet `role` — exactly the rule sets of the [NSG guidance
+  below](#nsg-guidance-per-subnet), with the EM ⇄ Server dynamic-port
+  tradeoff resolved in **both directions**: *all TCP from the utility address
+  space into server subnets* and *all TCP from the spoke address spaces into
+  the em subnet* (the latter also covers the agents' 8443 to the Automation
+  API; pin ranges in Control-M and tighten later if required),
+  `user_access_cidrs` as the operator sources for 443/8443 on em subnets,
+  `bastion_cidrs` as the SSH 22 sources, and an explicit deny-all inbound at
+  priority 4096 on every subnet; outbound stays open;
+* the **bidirectional spoke ⇄ utility peerings** (`<src>-to-<dst>`, both
+  directions, forwarded traffic allowed, no gateway transit). Spokes are
+  never peered to each other.
+
+When `create` is true, config loading also **cross-validates** the placement
+blocks: every VNet/subnet referenced by `network.utility`,
+`servers.<stage>.network`, `dr.network.utility` and `dr.server_networks.*`
+must exist in the vnets list with the right subnet role, every address space
+and prefix must parse, VNet spaces must not overlap (pairwise, across both
+regions) and subnets must sit inside their VNet without overlapping each
+other. A reference to a VNet the list does not create fails the load with the
+offending config path.
+
+### PoC address plan (shipped in the config files)
+
+Both config files ship the full plan with `create: false`, so provisioning it
+is a one-flag change. Address spaces are non-overlapping across all platforms
+AND between primary and DR — a hard requirement for DR/failback peering.
+
+| Platform / region | VNet | Role | Address space | Subnets |
+|---|---|---|---|---|
+| nonprod, eastus2 | `vnet-dev-utility` | utility | `10.60.0.0/22` | `snet-ctm-em` `10.60.0.0/24` (em) · `snet-ctm-postgres` `10.60.1.0/27` (data) · `snet-ctm-pe` `10.60.1.64/26` (pe) |
+| nonprod, eastus2 | `vnet-ctm-dev` | spoke → `vnet-dev-utility` | `10.60.8.0/24` | `snet-ctm-server` `10.60.8.0/26` (server) · `snet-ctm-agents` `10.60.8.64/26` (agents) |
+| nonprod, eastus2 | `vnet-ctm-qa` | spoke → `vnet-dev-utility` | `10.60.9.0/24` | `snet-ctm-server` `10.60.9.0/26` (server) · `snet-ctm-agents` `10.60.9.64/26` (agents) |
+| prod, eastus2 | `vnet-prod-utility` | utility | `10.70.0.0/22` | `snet-ctm-em` `10.70.0.0/24` (em) · `snet-ctm-postgres` `10.70.1.0/27` (data) · `snet-ctm-pe` `10.70.1.64/26` (pe) |
+| prod, eastus2 | `vnet-ctm-uat` | spoke → `vnet-prod-utility` | `10.70.8.0/24` | `snet-ctm-server` `10.70.8.0/26` (server) · `snet-ctm-agents` `10.70.8.64/26` (agents) |
+| prod, eastus2 | `vnet-ctm-prod` | spoke → `vnet-prod-utility` | `10.70.9.0/24` | `snet-ctm-server` `10.70.9.0/26` (server) · `snet-ctm-agents` `10.70.9.64/26` (agents) |
+| prod DR, centralus | `vnet-dr-utility` | utility | `10.80.0.0/22` | `snet-ctm-em` `10.80.0.0/24` (em) · `snet-ctm-postgres` `10.80.1.0/27` (data) · `snet-ctm-pe` `10.80.1.64/26` (pe) |
+| prod DR, centralus | `vnet-ctm-prod-dr` | spoke → `vnet-dr-utility` | `10.80.9.0/24` | `snet-ctm-server` `10.80.9.0/26` (server) · `snet-ctm-agents` `10.80.9.64/26` (agents) |
+
+Network resource groups: `rg-network-nonprod`, `rg-network-prod`,
+`rg-network-prod-dr`.
+
+### What stays bring-your-own even in Option A
+
+* **DNS forwarding from custom DNS servers** — if any VNet uses a hub
+  resolver / AD DNS, those servers must forward the platform and privatelink
+  zones to Azure DNS (see [DNS](#dns)); the repo cannot configure your
+  resolver.
+* **On-prem / WAN connectivity** — no gateways, ExpressRoute, VPN or hub
+  peering is created; the NSG rules only *admit* `user_access_cidrs` and
+  `bastion_cidrs`, reaching the VNets is your transit's job.
+* **The bastion / jump host itself** — `bastion_cidrs` opens SSH 22 from it;
+  deploying Azure Bastion or a jump box is outside this repo.
+* **Outbound internet egress** — no NAT Gateway or firewall is deployed;
+  provide one if your subscription disables default outbound access.
+
+The rest of this document is the contract Option A implements and Option B
+must provide.
 
 ## Required VNets and subnets
 
@@ -175,6 +263,60 @@ enforced — the per-source control lives in the outbound rules above.
   servers must forward `*.ctm.internal`, the privatelink zones and
   `*.postgres.database.azure.com` to Azure DNS (`168.63.129.16`) or a DNS
   Private Resolver — otherwise the zone links above are invisible to the VMs.
+
+## Platform-created private endpoints and DNS (inventory)
+
+Exactly what the **foundation** phase drops into your networks (the only
+things it creates network-side, in both options). Names use the prod platform
+(`p01`); nonprod and DR follow the same rules (`ctm-nonprod-*`,
+`ctm-prod-dr-*`, suffix per `unique_suffix`).
+
+### Private endpoints (3 per platform region, all in the utility pe subnet)
+
+| Private endpoint | Target resource | Group id | Private DNS zone wired via zone group |
+|---|---|---|---|
+| `ctm-prod-kv-pe` | Key Vault `ctm-prod-kv-p01` | `vault` | `privatelink.vaultcore.azure.net` |
+| `ctm-prod-blob-pe` | Storage `ctmprodblobp01` (installers/backups) | `blob` | `privatelink.blob.core.windows.net` |
+| `ctm-prod-files-pe` | Storage `ctmprodfilesp01` (NFS share) | `file` | `privatelink.file.core.windows.net` |
+
+The DR region gets its own three (`ctm-prod-dr-kv-pe`, `ctm-prod-dr-blob-pe`,
+`ctm-prod-dr-files-pe`) in the DR utility pe subnet. The PostgreSQL Flexible
+Server uses VNet integration (the delegated data subnet), not a private
+endpoint, so there is no fourth PE.
+
+### Private DNS zones: created-or-linked
+
+Per platform region, five zones are in play. A privatelink zone passed in via
+`network.existing_private_dns_zone_ids` is used as-is and **not linked** (your
+hub must already resolve it for these VNets); any zone *not* passed in is
+created in the platform resource group and linked.
+
+| Zone | Created when | Registration | Records managed |
+|---|---|---|---|
+| `prod.ctm.internal` (platform zone; same name exists in the DR region) | always | **on** (VM hostnames auto-register) | `ctm-web` A → LB frontend; `ctm-db` CNAME → PostgreSQL (DR: → replica) |
+| `privatelink.blob.core.windows.net` | `blob` id not supplied | off | by the blob PE zone group |
+| `privatelink.file.core.windows.net` | `file` id not supplied | off | by the files PE zone group |
+| `privatelink.vaultcore.azure.net` | `vault` id not supplied | off | by the KV PE zone group |
+| `ctmprodp01.postgres.database.azure.com` (nonprod `ctmnonprodn01.…`, DR `ctmproddrp01.…`) | `postgres` id not supplied | off | by the Flexible Server (VNet integration) |
+
+### Zone-link matrix: every created zone × every platform VNet
+
+Each zone the platform creates gets **one virtual-network link per VNet of
+the region** (link name = VNet name): the utility VNet, each server VNet, any
+relocated-agents VNet, plus everything in `network.extra_dns_vnets`. The
+platform zone's links are registration-enabled; privatelink zone links are
+not. With the shipped configs:
+
+| Region | VNets linked into every created zone | Links per created zone |
+|---|---|---|
+| nonprod | `vnet-dev-utility`, `vnet-ctm-dev`, `vnet-ctm-qa` | 3 |
+| prod primary | `vnet-prod-utility`, `vnet-ctm-uat`, `vnet-ctm-prod` | 3 |
+| prod DR | `vnet-dr-utility`, `vnet-ctm-prod-dr` (DR-protected servers only) | 2 |
+
+So a default prod primary region carries 5 zones × 3 VNets = 15 links (12 on
+the four created privatelink/postgres zones + 3 registration-enabled links on
+`prod.ctm.internal`). Hub-supplied zones reduce that: each supplied id drops
+its zone's links entirely.
 
 ## Cross-region (DR)
 

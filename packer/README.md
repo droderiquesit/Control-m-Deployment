@@ -1,5 +1,15 @@
 # ctm-rhel9 golden image (Packer → Azure Compute Gallery)
 
+**The image is the operating system only — no BMC software is ever baked
+into it.** EM and Control-M/Server are installed at provision time by
+cloud-init, using the BMC EPD media + silent-install XMLs downloaded from the
+`installers` blob container (managed identity); agents are provisioned at
+boot through the EM Automation API (`ctm provision`). The media reaches blob
+from an Azure Artifacts feed via the pipeline's media stage or
+`ctmdeploy media upload` (`docs/AZURE-DEVOPS.md` §5). Rebuilding or bumping
+this image therefore never changes the Control-M version, and a Control-M
+upgrade never needs a new image.
+
 Every Control-M VM (EM, Server) and agent VMSS instance boots from the
 **ctm-rhel9** image in the **ctmgallery** Azure Compute Gallery instead of the
 raw marketplace image. Packer builds that image from marketplace
