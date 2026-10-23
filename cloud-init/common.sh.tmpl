@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# Control-M node bootstrap: common section (rendered by ctmdeploy render.py,
+# which substitutes the two-underscore token placeholders). Runs once via
+# cloud-init on first boot. Idempotent: guarded by a marker file. OS prep
+# (packages, firewall/SELinux posture, limits, sysctl, Node.js) is baked into
+# the ctm-rhel9 golden image by Packer — see packer/README.md.
+# ---------------------------------------------------------------------------
+set -euo pipefail
+exec > >(tee -a /var/log/ctm-bootstrap.log | logger -t ctm-bootstrap) 2>&1
+
+ROLE="__ROLE__"
+ENVIRONMENT="__ENVIRONMENT__"
+KEY_VAULT="__KEY_VAULT_NAME__"
+IDENTITY_CLIENT_ID="__IDENTITY_CLIENT_ID__"
+BLOB_ACCOUNT="__BLOB_ACCOUNT__"
+INSTALLERS_CONTAINER="__INSTALLERS_CONTAINER__"
+BACKUPS_CONTAINER="__BACKUPS_CONTAINER__"
+NFS_SERVER="__NFS_SERVER__"
+NFS_EXPORT="__NFS_EXPORT__"
+DATA_MOUNT="__DATA_MOUNT__"
+ATTACH_DATA_DISK="__ATTACH_DATA_DISK__"
+CTM_VERSION="__CTM_VERSION__"
+DNS_ZONE="__DNS_ZONE__"
+SHARED_MOUNT=/mnt/ctm-shared
+MARKER=/var/lib/ctm/bootstrap.done
+
+if [ -f "$MARKER" ]; then
+  echo "bootstrap already completed on $(cat "$MARKER"); nothing to do"
+  exit 0
+fi
+mkdir -p /var/lib/ctm
+echo "== $(date -u +%FT%TZ) bootstrap start role=$ROLE env=$ENVIRONMENT host=$(hostname)"
+
+# ---------------------------------------------------------------------------
+# Helpers: Azure IMDS managed-identity token, Key Vault secrets, Blob download.
+# No Azure CLI needed on the box.
+# ---------------------------------------------------------------------------
+imds_token() {
+  curl -sS --retry 5 --retry-delay 3 -H "Metadata: true" \
+    "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=$1&client_id=$IDENTITY_CLIENT_ID" \
+    | jq -r .access_token
+}
+
+kv_secret() {
+  local tok
+  tok=$(imds_token "https://vault.azure.net")
+  curl -sSf --retry 5 --retry-delay 3 -H "Authorization: Bearer $tok" \
+    "https://$KEY_VAULT.vault.azure.net/secrets/$1?api-version=7.4" | jq -r .value
+}
+
+blob_get() {
+  local tok
+  tok=$(imds_token "https://storage.azure.com/")
+  curl -sSf --retry 5 --retry-delay 5 -H "Authorization: Bearer $tok" -H "x-ms-version: 2021-08-06" \
+    "https://$BLOB_ACCOUNT.blob.core.windows.net/$INSTALLERS_CONTAINER/$1" -o "$2"
+}
+
+blob_put_backup() {
+  local tok
+  tok=$(imds_token "https://storage.azure.com/")
+  curl -sSf -X PUT -H "Authorization: Bearer $tok" -H "x-ms-version: 2021-08-06" \
+    -H "x-ms-blob-type: BlockBlob" --data-binary "@$1" \
+    "https://$BLOB_ACCOUNT.blob.core.windows.net/$BACKUPS_CONTAINER/$2"
+}
+
+wait_for() { # wait_for <seconds> <command...>
+  local deadline=$(( $(date +%s) + $1 )); shift
+  until "$@"; do
+    if [ "$(date +%s)" -ge "$deadline" ]; then echo "timeout waiting for: $*"; return 1; fi
+    sleep 5
+  done
+}
+
+# Persist helpers for later operational use (backups, re-registration).
+cat > /usr/local/sbin/ctm-azure-helpers.sh <<HELPERS
+KEY_VAULT="$KEY_VAULT"
+IDENTITY_CLIENT_ID="$IDENTITY_CLIENT_ID"
+BLOB_ACCOUNT="$BLOB_ACCOUNT"
+INSTALLERS_CONTAINER="$INSTALLERS_CONTAINER"
+BACKUPS_CONTAINER="$BACKUPS_CONTAINER"
+$(declare -f imds_token kv_secret blob_get blob_put_backup wait_for)
+HELPERS
+chmod 0750 /usr/local/sbin/ctm-azure-helpers.sh
+
+# ---------------------------------------------------------------------------
+# OS preparation (RHEL 9 packages, firewalld off, SELinux permissive, kernel
+# limits/sysctl, Node.js 20) is BAKED into the golden image by the Packer
+# scripts under packer/scripts/. Only environment-specific setup runs here.
+# ---------------------------------------------------------------------------
+
+# Nodes resolve each other through the platform private DNS zone.
+if ! grep -q "$DNS_ZONE" /etc/systemd/resolved.conf 2>/dev/null; then
+  mkdir -p /etc/systemd/resolved.conf.d
+  printf '[Resolve]\nDomains=%s\n' "$DNS_ZONE" > /etc/systemd/resolved.conf.d/ctm.conf
+  systemctl restart systemd-resolved 2>/dev/null || true
+fi
+grep -q "search $DNS_ZONE" /etc/resolv.conf || echo "search $DNS_ZONE" >> /etc/resolv.conf
+
+# ---------------------------------------------------------------------------
+# Persistent data disk (LUN 0) -> $DATA_MOUNT (Control-M home directories).
+# ---------------------------------------------------------------------------
+if [ "$ATTACH_DATA_DISK" = "true" ]; then
+  DEV=/dev/disk/azure/scsi1/lun0
+  wait_for 600 test -e "$DEV"
+  if ! blkid "$DEV" >/dev/null 2>&1; then
+    mkfs.xfs -f -L ctmdata "$DEV"
+  fi
+  mkdir -p "$DATA_MOUNT"
+  grep -q "LABEL=ctmdata" /etc/fstab || echo "LABEL=ctmdata $DATA_MOUNT xfs defaults,nofail 0 2" >> /etc/fstab
+  mount -a
+fi
+mkdir -p "$DATA_MOUNT"
+
+# ---------------------------------------------------------------------------
+# Shared NFS filesystem (Azure Files Premium, NFS 4.1): installer cache,
+# EM/Server backups and shared logs.
+# ---------------------------------------------------------------------------
+mkdir -p "$SHARED_MOUNT"
+if ! grep -q "$NFS_SERVER:$NFS_EXPORT" /etc/fstab; then
+  echo "$NFS_SERVER:$NFS_EXPORT $SHARED_MOUNT nfs vers=4,minorversion=1,sec=sys,nofail,_netdev 0 0" >> /etc/fstab
+fi
+wait_for 300 mount "$SHARED_MOUNT"
+mkdir -p "$SHARED_MOUNT"/{installers,backups,logs}
+
+echo "== common bootstrap finished"

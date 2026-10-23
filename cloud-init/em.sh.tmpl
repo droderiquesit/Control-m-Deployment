@@ -1,0 +1,116 @@
+# ---------------------------------------------------------------------------
+# Control-M/Enterprise Manager node (__EM_ROLE__). Appended to the common
+# section by ctmdeploy render.py; installs/starts EM from the NFS media cache.
+# ---------------------------------------------------------------------------
+EM_ROLE="__EM_ROLE__"
+EM_USER="__EM_USER__"
+EM_HOME="$DATA_MOUNT/$EM_USER"
+EM_INSTALLER_BLOB="__EM_INSTALLER_BLOB__"
+EM_SILENT_BLOB="__EM_SILENT_BLOB__"
+DB_HOST="__DB_HOST__"
+DB_PORT="__DB_PORT__"
+EM_DB_NAME="__EM_DB_NAME__"
+EM_DB_USER="__EM_DB_USER__"
+DB_ADMIN_USER="__DB_ADMIN_USER__"
+EM_PRIMARY_HOST="__EM_PRIMARY_HOST__"
+EM_SECONDARY_HOST="__EM_SECONDARY_HOST__"
+WEB_PORT="__WEB_PORT__"
+
+id -u "$EM_USER" >/dev/null 2>&1 || useradd -m -d "$EM_HOME" -s /bin/bash "$EM_USER"
+mkdir -p "$EM_HOME" && chown "$EM_USER":"$EM_USER" "$EM_HOME"
+
+if [ -f "$EM_HOME/.ctm_installed" ]; then
+  echo "EM already installed on persistent disk; starting services only"
+else
+  DB_ADMIN_PASSWORD=$(kv_secret db-admin-password)
+  EM_DB_PASSWORD=$(kv_secret em-db-password)
+  EM_ADMIN_PASSWORD=$(kv_secret em-admin-password)
+
+  if [ "$EM_ROLE" = "secondary" ]; then
+    echo "== secondary: waiting for primary EM ($EM_PRIMARY_HOST) to serve Control-M Web"
+    wait_for 7200 curl -sfk -o /dev/null "https://$EM_PRIMARY_HOST:$WEB_PORT/"
+  fi
+
+  # Installer media is cached once on the shared NFS volume.
+  INSTALL_SRC="$SHARED_MOUNT/installers/em/$CTM_VERSION"
+  if [ ! -f "$INSTALL_SRC/.extracted" ]; then
+    mkdir -p "$INSTALL_SRC"
+    blob_get "$EM_INSTALLER_BLOB" /tmp/em-installer.bin
+    tar -xf /tmp/em-installer.bin -C "$INSTALL_SRC"
+    rm -f /tmp/em-installer.bin
+    touch "$INSTALL_SRC/.extracted"
+  fi
+  chown -R "$EM_USER":"$EM_USER" "$INSTALL_SRC"
+
+  # Silent-install XML comes from the installers container (generated with the
+  # BMC installer for your exact version) and has placeholders substituted here.
+  # U builds the XML's two-underscore placeholders at runtime so they never
+  # look like render tokens (the renderer rejects leftover token-shaped text).
+  U='__'
+  blob_get "$EM_SILENT_BLOB" /tmp/em-silent.xml
+  sed -i \
+    -e "s|${U}DB_HOST${U}|$DB_HOST|g" \
+    -e "s|${U}DB_PORT${U}|$DB_PORT|g" \
+    -e "s|${U}DB_NAME${U}|$EM_DB_NAME|g" \
+    -e "s|${U}DB_ADMIN_USER${U}|$DB_ADMIN_USER|g" \
+    -e "s|${U}DB_ADMIN_PASSWORD${U}|$DB_ADMIN_PASSWORD|g" \
+    -e "s|${U}EM_DB_USER${U}|$EM_DB_USER|g" \
+    -e "s|${U}EM_DB_PASSWORD${U}|$EM_DB_PASSWORD|g" \
+    -e "s|${U}EM_HOME${U}|$EM_HOME|g" \
+    -e "s|${U}EM_USER${U}|$EM_USER|g" \
+    -e "s|${U}EM_ADMIN_PASSWORD${U}|$EM_ADMIN_PASSWORD|g" \
+    -e "s|${U}HOSTNAME${U}|$(hostname -s)|g" \
+    -e "s|${U}PRIMARY_HOST${U}|$EM_PRIMARY_HOST|g" \
+    -e "s|${U}SECONDARY_HOST${U}|$EM_SECONDARY_HOST|g" \
+    -e "s|${U}WEB_PORT${U}|$WEB_PORT|g" \
+    /tmp/em-silent.xml
+  chown "$EM_USER":"$EM_USER" /tmp/em-silent.xml && chmod 600 /tmp/em-silent.xml
+
+  SETUP=$(find "$INSTALL_SRC" -maxdepth 2 -name setup.sh | head -n1)
+  [ -n "$SETUP" ] || { echo "setup.sh not found under $INSTALL_SRC"; exit 1; }
+  echo "== installing Control-M/EM ($EM_ROLE) from $SETUP"
+  su - "$EM_USER" -c "$SETUP -silent /tmp/em-silent.xml"
+  rm -f /tmp/em-silent.xml
+  touch "$EM_HOME/.ctm_installed"
+fi
+
+# systemd integration: EM components are started/stopped as the EM user.
+cat > /etc/systemd/system/controlm-em.service <<UNIT
+[Unit]
+Description=Control-M/Enterprise Manager ($EM_ROLE)
+After=network-online.target remote-fs.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+User=$EM_USER
+WorkingDirectory=$EM_HOME
+ExecStart=/bin/bash -lc 'start_all'
+ExecStop=/bin/bash -lc 'stop_all'
+TimeoutStartSec=600
+TimeoutStopSec=300
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now controlm-em.service || true
+
+# Nightly EM metadata backup to the shared volume + blob (restorable in DR).
+cat > /usr/local/sbin/ctm-em-backup.sh <<BACKUP
+#!/usr/bin/env bash
+set -euo pipefail
+. /usr/local/sbin/ctm-azure-helpers.sh
+TS=\$(date -u +%Y%m%dT%H%M%SZ)
+OUT=$SHARED_MOUNT/backups/em-\$(hostname -s)-\$TS.tar.gz
+tar -czf "\$OUT" -C "$EM_HOME" etc data 2>/dev/null || tar -czf "\$OUT" -C "$EM_HOME" etc
+blob_put_backup "\$OUT" "em/\$(basename "\$OUT")"
+find $SHARED_MOUNT/backups -name 'em-*.tar.gz' -mtime +14 -delete
+BACKUP
+chmod 0750 /usr/local/sbin/ctm-em-backup.sh
+echo "15 1 * * * root /usr/local/sbin/ctm-em-backup.sh >> /var/log/ctm-backup.log 2>&1" > /etc/cron.d/ctm-em-backup
+
+date -u +%FT%TZ > "$MARKER"
+echo "== EM bootstrap finished"

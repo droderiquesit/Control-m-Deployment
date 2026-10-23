@@ -1,3 +1,6 @@
+# Static validation: compile + lint every Bicep file, byte-compile and test
+# the ctmdeploy package, syntax-check the cloud-init templates and Packer
+# provisioning scripts, and load both environment configs.
 parameters:
   - name: environments
     type: object
@@ -7,35 +10,52 @@ stages:
     displayName: Validate
     jobs:
       - job: static_checks
-        displayName: fmt / validate / tflint
+        displayName: bicep build+lint / pytest / shell syntax
         steps:
           - checkout: self
             fetchDepth: 1
 
-          - template: steps-terraform-install.yml
+          - template: steps-tools-install.yml
             parameters:
-              version: $(terraformVersion)
+              includeDev: true
 
-          - bash: terraform fmt -check -recursive -diff
-            displayName: terraform fmt
+          - bash: |
+              set -euo pipefail
+              rc=0
+              while IFS= read -r f; do
+                echo "== bicep build+lint: $f"
+                bicep build "$f" --stdout >/dev/null || rc=1
+                bicep lint "$f" || rc=1
+              done < <(find bicep -name '*.bicep' | sort)
+              exit $rc
+            displayName: bicep build + lint (all templates)
+
+          - bash: |
+              set -euo pipefail
+              python -m compileall -q deploy
+            displayName: python compileall
+
+          - bash: |
+              set -euo pipefail
+              python -m pytest deploy/tests -q
+            displayName: pytest (config / node plan / render)
 
           - ${{ each env in parameters.environments }}:
               - bash: |
                   set -euo pipefail
-                  terraform init -backend=false -input=false >/dev/null
-                  terraform validate -no-color
-                displayName: terraform validate (${{ env.name }})
-                workingDirectory: environments/${{ env.name }}
+                  python -c "from pathlib import Path; from ctmdeploy.config import load_config; cfg = load_config('${{ env.name }}', Path('.'), allow_placeholders=True); print('config ok:', cfg.name, '-', len(cfg.servers), 'server(s)')"
+                displayName: config load (${{ env.name }})
 
+          # Packer provisioning scripts and cloud-init templates are plain bash
+          # (the __TOKEN__ placeholders are legal strings), so `bash -n` parses
+          # them. `packer validate` itself is intentionally NOT run here:
+          # Packer is only installed in the image stage, and template validation
+          # needs the azure plugin + credentials. The image stage validates
+          # implicitly on build.
           - bash: |
               set -euo pipefail
-              curl -fsSL https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
-              tflint --init
-              tflint --recursive --config "$(Build.SourcesDirectory)/.tflint.hcl" --format compact
-            displayName: tflint
-
-          - bash: |
-              set -euo pipefail
-              for f in modules/platform/templates/*.tftpl scripts/*.sh; do bash -n "$f" || exit 1; done
-              echo "bootstrap scripts parse"
+              for f in cloud-init/*.tmpl packer/scripts/*.sh; do
+                bash -n "$f" || exit 1
+              done
+              echo "cloud-init templates and packer scripts parse"
             displayName: shell syntax check

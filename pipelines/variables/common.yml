@@ -1,6 +1,20 @@
+# Shared pipeline variables: tool pins (with checksums where the vendor does
+# not publish a sums file), the Azure WIF service connection, Delinea DSV and
+# Checkmarx One settings. Toolchain: Bicep + Python (ctmdeploy) + Packer.
 variables:
   agentImage: ubuntu-latest
-  terraformVersion: "1.9.8"
+
+  # Bicep CLI (bicep-linux-x64 asset of https://github.com/Azure/bicep/releases).
+  # The sha256 is of that exact release asset; bump both together.
+  bicepVersion: "0.30.23"
+  bicepSha256: "b6a41ce8bdbf448feaf8fe2286164fb8c84e5d006c293fbc20591ff9baf76f18"
+
+  # Python used for the ctmdeploy orchestrator (requires >= 3.11).
+  pythonVersion: "3.12"
+
+  # Packer, for the golden-image stage only (verified against the vendor's
+  # SHA256SUMS file at download time).
+  packerVersion: "1.11.2"
 
   # Azure Resource Manager service connection (Workload Identity Federation).
   # The GUID is shown in Project settings > Service connections > (connection) > URL (resourceId).

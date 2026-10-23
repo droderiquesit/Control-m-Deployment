@@ -1,0 +1,117 @@
+# ---------------------------------------------------------------------------
+# NONPROD platform: one Enterprise Manager (single node) managing two
+# Control-M/Servers, CTM_DEV and CTM_QA, each with its own agent pool.
+# Zone-redundant database so QA can rehearse HA; no DR.
+# Single source of truth: ctmdeploy reads this file and feeds Bicep its params.
+# ---------------------------------------------------------------------------
+subscription_id: "00000000-0000-0000-0000-000000000000"
+environment: nonprod
+location: eastus2
+unique_suffix: n01
+resource_lock: false
+
+tags:
+  costCenter: scheduling
+  owner: platform-team
+
+# Existing network (select, not create)
+network:
+  vnet_name: vnet-nonprod-eastus2
+  vnet_resource_group_name: rg-network-nonprod
+  app_subnet_name: snet-ctm-app
+  data_subnet_name: snet-ctm-postgres
+  pe_subnet_name: snet-ctm-pe
+  # Hub-managed private DNS zones (optional keys: blob, file, vault, postgres)
+  # existing_private_dns_zone_ids: { blob: "...", file: "...", vault: "...", postgres: "..." }
+  existing_private_dns_zone_ids: {}
+
+deployer_ip_cidrs:
+  - "203.0.113.10/32"
+
+key_vault_public_access: true
+
+ctm_version: "9.0.21.300"
+
+# Blob-name overrides for installers / silent XMLs; {} keeps the defaults
+# (same blob names as before the toolchain migration).
+installer_blobs: {}
+
+# Compute Gallery golden image published by Packer (packer/ctm-rhel9.pkr.hcl).
+# All VMs and scale sets boot from this image instead of the marketplace image.
+image:
+  gallery_resource_group: ctm-images-rg
+  gallery_name: ctmgallery
+  image_definition: ctm-rhel9
+  image_version: latest # or an explicit version such as "1.0.0"
+
+em:
+  vm_size: Standard_D4s_v5
+  data_disk_gb: 256
+  disk_type: Premium_LRS
+  enable_secondary: false # single EM is enough for nonprod; flip to true to rehearse EM failover
+  zones: ["1", "2"]
+  web_port: 8443
+
+servers:
+  dev:
+    name: CTM_DEV
+    vm_size: Standard_D4s_v5
+    data_disk_gb: 128
+    disk_type: Premium_LRS
+    enable_secondary: false
+    zones: ["1", "2"]
+    agents:
+      vm_size: Standard_D2s_v5
+      min: 1
+      max: 2
+      default: 1
+      use_spot: true
+      scale_out_cpu: 70
+      scale_in_cpu: 25
+  qa:
+    name: CTM_QA
+    vm_size: Standard_D4s_v5
+    data_disk_gb: 256
+    disk_type: Premium_LRS
+    enable_secondary: true # Server HA pair, so failover is tested before prod
+    zones: ["1", "2"]
+    agents:
+      vm_size: Standard_D2s_v5
+      min: 1
+      max: 4
+      default: 2
+      use_spot: true
+      scale_out_cpu: 70
+      scale_in_cpu: 25
+
+database:
+  sku_name: GP_Standard_D2ds_v5
+  storage_mb: 131072
+  high_availability_mode: ZoneRedundant
+  backup_retention_days: 7
+  geo_redundant_backup: false
+  postgres_version: "16"
+
+storage:
+  blob_replication_type: ZRS
+  files_replication_type: ZRS
+  shared_share_quota_gb: 256
+
+load_balancer:
+  internal: true
+
+backup:
+  enabled: true
+  storage_mode_type: ZoneRedundant
+  cross_region_restore: false
+  daily_retention_days: 14
+  weekly_retention_weeks: 12
+  include_files_share: true
+
+observability:
+  log_retention_days: 30
+  alert_emails:
+    - ctm-nonprod-alerts@example.com
+
+dr:
+  enabled: false

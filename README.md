@@ -1,6 +1,6 @@
-# Control-M on Azure — Terraform
+# Control-M on Azure — Bicep + Python + Packer
 
-Infrastructure as Code for a highly available, disaster-recoverable and
+Infrastructure as code for a highly available, disaster-recoverable and
 horizontally scalable **BMC Control-M** platform on Microsoft Azure, serving
 the **dev, qa, uat and prod** stages from two platforms:
 
@@ -15,35 +15,51 @@ Job definitions move dev → qa → uat → prod with the Automation API
 (`ctm deploy`), not by re-deploying infrastructure.
 
 The platform is deployed **into networks you already own**: every environment
-points at an existing VNet and subnets. Terraform creates the Control-M tiers,
-database, storage, secrets, monitoring, backup and DR plumbing — nothing in the
-network team's domain.
+points at an existing VNet and subnets. The toolchain creates the Control-M
+tiers, database, storage, secrets, monitoring, backup and DR plumbing —
+nothing in the network team's domain.
+
+## Toolchain
+
+| Tool | Role |
+|------|------|
+| **Bicep** (`bicep/`) | every Azure resource, compiled and submitted as ARM deployments |
+| **Python** (`deploy/`, package `ctmdeploy`) | the orchestrator: loads `environments/<env>/config.yaml`, generates/seeds Key Vault secrets, renders cloud-init, runs the phased deployments, enables Site Recovery replication, drives DR failover |
+| **Packer** (`packer/`) | builds the **ctm-rhel9** golden image (RHEL 9 + Control-M OS prep baked in) and publishes it to an Azure Compute Gallery; every VM and scale-set instance boots from it |
+
+**Deployments are stateless.** Bicep/ARM deployments compare the template to
+what exists in Azure on every run — there is no state file, no state backend
+and no bootstrap step. `ctmdeploy whatif` shows the changes a run would make;
+the apply re-runs the same deployments.
 
 ```
-environments/            one root per platform (same code, different tfvars)
-  nonprod | prod         main.tf  variables.tf  terraform.tfvars  backend.hcl
-modules/
-  platform/              composition for ONE region (primary or dr role)
-    templates/           cloud-init bootstrap for EM, Server and Agent nodes
-  network/               lookup of the existing VNet/subnets (+ missing private DNS zones)
-  security/              managed identity, Key Vault, secrets, private endpoint
-  storage/               blob (installers/backups) + Premium Files NFS share
-  database/              PostgreSQL Flexible Server (zone-redundant HA)
-  load-balancer/         Standard LB for Control-M Web / Automation API
-  node/                  zonal VM with persistent data disk (EM / Server)
-  agent-pool/            VM Scale Set + autoscale + graceful deregistration
-  dns/                   platform private DNS zone (ctm-web, ctm-db aliases)
-  observability/         Log Analytics, DCR, action group, alerts
-  backup/                Recovery Services vault, VM + file share policies
-  dr/                    DB cross-region replica, Site Recovery, blob replication, Traffic Manager
-bootstrap/               remote state (resource group + storage account)
-azure-pipelines.yml      Azure DevOps pipeline (Checkmarx One + Delinea DSV + gated applies)
-pipelines/               pipeline stage/step templates and variables
-.github/workflows/       equivalent GitHub Actions pipeline
-scripts/
-  silent-install/        placeholder contract for BMC silent-install XML files
-  dr-failover.sh         scripted regional failover
-docs/                    architecture, network requirements, DR runbook, operations
+bicep/
+  rg.bicep                  subscription scope: resource groups + optional locks
+  foundation.bicep          one region's foundation (role primary|dr)
+  compute.bicep             EM/Server VMs + agent VMSS + backup + VM alerts
+  dr.bicep                  PG replica, ASR vault, blob object replication, Traffic Manager
+  images.bicep              Compute Gallery + ctm-rhel9 image definition
+  modules/                  network, dns, security, storage, database, load-balancer,
+                            node, agent-pool, observability, backup, ...
+environments/
+  nonprod/config.yaml       single source of truth per platform (python reads it;
+  prod/config.yaml          bicep gets params derived from it)
+cloud-init/                 boot-time templates (__TOKEN__ placeholders) for EM,
+                            Server and Agent nodes — environment-specific work only
+packer/
+  ctm-rhel9.pkr.hcl         golden image build (marketplace RHEL 9 -> Compute Gallery)
+  scripts/                  baked OS prep: packages, tuning, Node.js 20, deprovision
+deploy/
+  pyproject.toml            pip install -e deploy/
+  ctmdeploy/                cli, config, azure, secrets, render, deploy,
+                            replication, failover
+  tests/                    pure-python tests (config, node plan, rendering)
+pipelines/                  Azure DevOps stage/step templates and variables
+azure-pipelines.yml         ADO pipeline (Checkmarx One + Delinea DSV + gated applies)
+.github/workflows/deploy.yml  equivalent GitHub Actions pipeline
+scripts/silent-install/     placeholder contract for BMC silent-install XML files
+docs/                       architecture, network requirements, DR runbook, operations
+Makefile                    make whatif/deploy/image/failover/fmt/lint/test
 ```
 
 ## Architecture (per platform)
@@ -61,11 +77,13 @@ docs/                    architecture, network requirements, DR runbook, operati
 | Monitoring | Log Analytics + Azure Monitor Agent, metric alerts, Service Health | — | — |
 | Backup | Recovery Services vault (GRS + cross-region restore in prod), daily VM + file share | — | — |
 | DR (prod platform) | second region: PostgreSQL cross-region replica, **Site Recovery** replication of EM/Server VMs, replicated installers, warm agent scale set, optional Traffic Manager | — | — |
+| Golden image | **ctm-rhel9** in Compute Gallery `ctmgallery` (`ctm-images-rg`), versions replicated to both regions | — | rebuild with Packer, bump `image.image_version` |
 
 Node identity is stable: hostnames, persistent `/ctm` data disks and the
 `ctm-db` / `ctm-web` DNS aliases are identical in the primary and DR regions,
 so a failed-over node starts Control-M unchanged against the promoted database.
-See `docs/ARCHITECTURE.md` for the diagram and `docs/DR-RUNBOOK.md` for failover.
+See `docs/ARCHITECTURE.md` for the diagrams (including how VM images are
+built, stored and consumed) and `docs/DR-RUNBOOK.md` for failover.
 
 ## Platform matrix
 
@@ -81,8 +99,9 @@ See `docs/ARCHITECTURE.md` for the diagram and `docs/DR-RUNBOOK.md` for failover
 | Locks / purge protection | — | yes |
 | EM/Server VMs | 4 | 6 |
 
-Everything above is in `environments/<platform>/terraform.tfvars`; the code is identical.
-Moving a stage to its own platform later is a tfvars change (new root with one Server).
+Everything above is in `environments/<platform>/config.yaml`; the code is
+identical. Moving a stage to its own platform later is a config change (new
+environment with one Server).
 
 ## Prerequisites
 
@@ -92,45 +111,62 @@ Moving a stage to its own platform later is a tfvars change (new root with one S
    passed in; missing ones are created in the platform resource group.
 2. **BMC media** (EPD download) for Control-M/EM and Control-M/Server, plus the four
    silent-install XML files described in `scripts/silent-install/README.md`.
-3. **Azure identity** running Terraform with `Contributor` + `User Access Administrator`
-   (role assignments) on the subscription, and `Key Vault Secrets Officer` is granted
-   automatically to the deployer.
-4. Terraform ≥ 1.6, Azure CLI, (optional) tflint / pre-commit.
+3. **Azure identity** running the deployment with `Contributor` + `User Access
+   Administrator` (role assignments) on the subscription; `Key Vault Secrets
+   Officer` is granted automatically to the deployer object id you pass.
+4. **Tools**: Python ≥ 3.11, the Bicep CLI, Azure CLI (login only), Packer ≥ 1.10
+   for image builds; (optional) pre-commit.
+   `pip install -e deploy/` installs `ctmdeploy`.
 
 ## Deploy
 
 ```bash
-# 0. one-time state backend
-terraform -chdir=bootstrap init
-terraform -chdir=bootstrap apply -var subscription_id=<sub> -var state_storage_account_name=<unique>
-#    then put the storage account name into environments/*/backend.hcl
+# 0. install the orchestrator
+pip install -e "deploy/[dev]"
 
-# 1. edit environments/nonprod/terraform.tfvars: subscription, network names, deployer IPs, emails
-make init  ENV=nonprod
-make plan  ENV=nonprod
-make apply ENV=nonprod       # creates everything except the VM installs (they wait for media)
+# 1. golden image first: gallery (one-time, idempotent) + packer build
+az login
+python -m ctmdeploy image gallery --env prod       # ctm-images-rg / ctmgallery / ctm-rhel9
+python -m ctmdeploy image build  --env prod --version 1.0.0
 
-# 2. upload media + silent XML into the installers container printed by `terraform output`
+# 2. seed the config: edit environments/nonprod/config.yaml
+#    (subscription id, network names, deployer IPs, alert emails, image version)
+
+# 3. what-if, then deploy the phases
+python -m ctmdeploy whatif --env nonprod
+python -m ctmdeploy deploy --env nonprod --phase all
+#    phases, in order: rg -> foundation -> secrets -> compute -> dr -> replication
+#    (dr/replication run only where dr.enabled; any phase can be re-run alone)
+
+# 4. upload media + silent XML into the installers container
 az storage blob upload-batch --auth-mode login \
   --account-name <blob account> --destination installers --source ./media
 
-# 3. the EM/Server VMs are already booting and retry the download; follow progress with
+# 5. the EM/Server VMs are already booting and retry the download; follow with
 az serial-console connect ... # or: ssh via Bastion, then tail -f /var/log/ctm-bootstrap.log
 ```
+
+There is no state backend and no bootstrap step: every deployment is a
+stateless ARM operation, repeatable and idempotent. `ctmdeploy whatif` is the
+review tool; the Key Vault secrets are generated (or taken from
+`CTM_PLATFORM_SECRETS` overrides) and seeded idempotently — existing secrets
+are never rotated silently.
 
 Bootstrap order is enforced on the nodes themselves: the secondary EM waits for
 the primary's web server, the secondary Server waits for the primary's
 Configuration Agent, and agents wait for the Automation API behind the LB.
 
-Promotion between environments is a pull request that changes only tfvars.
-The **Azure DevOps pipeline** (`azure-pipelines.yml`, setup in
-`docs/AZURE-DEVOPS.md`) runs fmt/validate/tflint, a Checkmarx One scan (SAST,
-SCA, IaC), a plan per platform, then applies nonprod → prod on `main` behind
-Azure DevOps environment approvals. Platform passwords come from
-Delinea DevOps Secrets Vault and override the Terraform-generated ones. An
-equivalent GitHub Actions workflow lives in `.github/workflows/terraform.yml`.
+Promotion between environments is a pull request that changes only
+`environments/<platform>/config.yaml`. The **Azure DevOps pipeline**
+(`azure-pipelines.yml`, setup in `docs/AZURE-DEVOPS.md`) runs bicep build/lint
+and the python tests, a Checkmarx One scan (SAST, SCA, IaC), a what-if per
+platform, then applies nonprod → prod on `main` behind Azure DevOps
+environment approvals. Platform passwords come from Delinea DevOps Secrets
+Vault and override the generated ones. An equivalent GitHub Actions workflow
+lives in `.github/workflows/deploy.yml`. A manual pipeline run with
+`runImageBuild=true` publishes a new golden-image version with Packer.
 
-## What you still own after `apply`
+## What you still own after deploy
 
 * **Register each Control-M/Server in its EM** (Control-M Configuration
   Manager → Add Control-M/Server: `CTM_DEV` on `ctm-srv-dev-a`, `CTM_QA` on
@@ -142,12 +178,14 @@ equivalent GitHub Actions workflow lives in `.github/workflows/terraform.yml`.
   infrastructure pipeline only promotes platform changes.
 * **Certificates**: EM ships a self-signed certificate; replace it and remove
   the `-k` / `NODE_TLS_REJECT_UNAUTHORIZED=0` shortcuts in
-  `modules/platform/templates/agent.sh.tftpl`.
+  `cloud-init/agent.sh.tmpl`.
 * **Validate CLI syntax** of the `ctm provision` / `ctm config` commands in the
   agent template against `ctm provision -h` for your Control-M release.
-* **DR drills** (`scripts/dr-failover.sh <env> --test`) at least quarterly.
+* **DR drills** (`python -m ctmdeploy failover --env prod --test`) at least
+  quarterly.
 
 ## Operations
 
-`docs/OPERATIONS.md` covers scaling, patching, rotating secrets, backups and
-restoring. `docs/DR-RUNBOOK.md` covers regional failover and failback.
+`docs/OPERATIONS.md` covers scaling, patching, image revisions, rotating
+secrets, backups and restoring. `docs/DR-RUNBOOK.md` covers regional failover
+and failback. `packer/README.md` covers the golden image lifecycle.

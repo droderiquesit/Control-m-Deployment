@@ -1,5 +1,6 @@
-# Gated apply. The ADO environment "ctm-<env>" carries the approvals, business
-# hours and exclusive-lock checks (configured once in the portal, see docs).
+# Gated apply: `ctmdeploy deploy --phase all` for one environment. The ADO
+# environment "ctm-<env>" carries the approvals, business hours and
+# exclusive-lock checks (configured once in the portal, see docs).
 parameters:
   - name: environment
     type: string
@@ -14,19 +15,19 @@ stages:
   - stage: apply_${{ parameters.environment }}
     displayName: Apply ${{ parameters.environment }}
     dependsOn:
-      - plan_${{ parameters.environment }}
+      - whatif_${{ parameters.environment }}
       - ${{ if ne(parameters.previousEnvironment, '') }}:
           - apply_${{ parameters.previousEnvironment }}
-    # Runs on main only, when this environment's plan has changes, and when the
-    # previous environment applied successfully or had nothing to apply (Skipped).
+    # Runs on main only, when this environment's what-if has changes, and when
+    # the previous environment applied successfully or had nothing to apply (Skipped).
     ${{ if ne(parameters.previousEnvironment, '') }}:
       condition: >-
         and(
           eq('${{ parameters.enabled }}', 'True'),
           eq(variables['Build.SourceBranch'], 'refs/heads/main'),
           ne(variables['Build.Reason'], 'PullRequest'),
-          eq(dependencies.plan_${{ parameters.environment }}.result, 'Succeeded'),
-          eq(dependencies.plan_${{ parameters.environment }}.outputs['plan.plan.planHasChanges'], 'true'),
+          eq(dependencies.whatif_${{ parameters.environment }}.result, 'Succeeded'),
+          eq(dependencies.whatif_${{ parameters.environment }}.outputs['whatif.whatif.hasChanges'], 'true'),
           in(dependencies.apply_${{ parameters.previousEnvironment }}.result, 'Succeeded', 'Skipped')
         )
     ${{ else }}:
@@ -35,12 +36,12 @@ stages:
           eq('${{ parameters.enabled }}', 'True'),
           eq(variables['Build.SourceBranch'], 'refs/heads/main'),
           ne(variables['Build.Reason'], 'PullRequest'),
-          eq(dependencies.plan_${{ parameters.environment }}.result, 'Succeeded'),
-          eq(dependencies.plan_${{ parameters.environment }}.outputs['plan.plan.planHasChanges'], 'true')
+          eq(dependencies.whatif_${{ parameters.environment }}.result, 'Succeeded'),
+          eq(dependencies.whatif_${{ parameters.environment }}.outputs['whatif.whatif.hasChanges'], 'true')
         )
     jobs:
       - deployment: apply
-        displayName: terraform apply (${{ parameters.environment }})
+        displayName: ctmdeploy deploy (${{ parameters.environment }})
         environment: ctm-${{ parameters.environment }}
         timeoutInMinutes: 180
         strategy:
@@ -50,13 +51,41 @@ stages:
                 - checkout: self
                   fetchDepth: 1
 
+                - template: steps-tools-install.yml
+
                 - template: steps-dsv-secrets.yml
                   parameters:
                     environment: ${{ parameters.environment }}
                     readPlatform: true
 
-                - template: steps-terraform-run.yml
-                  parameters:
-                    environment: ${{ parameters.environment }}
-                    command: apply
-                    planArtifact: tfplan-${{ parameters.environment }}
+                # Deployments are stateless ARM calls — the apply re-runs the
+                # deployments the approvers reviewed in the whatif-<env>
+                # artifact. The whole run stays inside one AzureCLI@2 task so
+                # the WIF login (and its token refresh) covers long applies.
+                - task: AzureCLI@2
+                  displayName: ctmdeploy deploy --phase all
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    addSpnToEnvironment: true
+                    inlineScript: |
+                      set -euo pipefail
+                      export ARM_CLIENT_ID="$servicePrincipalId"
+                      export ARM_TENANT_ID="$tenantId"
+                      export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                      export AZURE_CLIENT_ID="$ARM_CLIENT_ID"
+                      export AZURE_TENANT_ID="$ARM_TENANT_ID"
+                      export AZURE_SUBSCRIPTION_ID="$ARM_SUBSCRIPTION_ID"
+                      # Grants the pipeline identity Key Vault Secrets Officer
+                      # in foundation so the secrets phase can seed the vaults.
+                      CTM_DEPLOYER_OBJECT_ID="$(az ad sp show --id "$servicePrincipalId" --query id -o tsv 2>/dev/null || true)"
+                      export CTM_DEPLOYER_OBJECT_ID
+                      [ -n "$CTM_DEPLOYER_OBJECT_ID" ] || echo "##[warning]could not resolve the service principal object id; grant Key Vault Secrets Officer out-of-band or set CTM_DEPLOYER_OBJECT_ID"
+
+                      python -m ctmdeploy deploy \
+                        --env ${{ parameters.environment }} \
+                        --phase all --yes --wait
+                  env:
+                    CTM_PLATFORM_SECRETS: $(platformSecretsJson)
+                    SYSTEM_ACCESSTOKEN: $(System.AccessToken)

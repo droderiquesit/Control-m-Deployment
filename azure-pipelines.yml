@@ -1,15 +1,17 @@
 # ---------------------------------------------------------------------------
-# Control-M platform — Azure DevOps pipeline
+# Control-M platform — Azure DevOps pipeline (Bicep + Python + Packer)
 #
-#   validate ─► security (Checkmarx One: SAST + SCA + IaC) ─► plan(nonprod|prod)
+#   validate ─► security (Checkmarx One: SAST + SCA + IaC) ─► whatif(nonprod|prod)
 #            ─► apply nonprod (CTM_DEV + CTM_QA) ─► apply prod (CTM_UAT + CTM_PROD)
 #               main branch only; approvals/checks live on the ADO environments
 #               ctm-nonprod and ctm-prod
+#   image    ─► manual (runImageBuild=true): Packer publishes a new ctm-rhel9
+#               version to the Compute Gallery
 #
 # Secrets: Delinea DevOps Secrets Vault (DSV) supplies the Control-M platform
-# passwords (TF_VAR_platform_secrets) and the Checkmarx credentials; Azure auth
-# is a Workload Identity Federation service connection (no stored SPN secret).
-# Setup steps: docs/AZURE-DEVOPS.md
+# passwords (CTM_PLATFORM_SECRETS, seeded into Key Vault by ctmdeploy) and the
+# Checkmarx credentials; Azure auth is a Workload Identity Federation service
+# connection (no stored SPN secret). Setup steps: docs/AZURE-DEVOPS.md
 # ---------------------------------------------------------------------------
 name: ctm-$(Date:yyyyMMdd)$(Rev:.r)
 
@@ -17,13 +19,13 @@ trigger:
   branches:
     include: [main]
   paths:
-    include: [modules, environments, pipelines, azure-pipelines.yml]
+    include: [bicep, deploy, environments, cloud-init, packer, pipelines, azure-pipelines.yml]
 
 pr:
   branches:
     include: [main]
   paths:
-    include: [modules, environments, pipelines, azure-pipelines.yml]
+    include: [bicep, deploy, environments, cloud-init, packer, pipelines, azure-pipelines.yml]
 
 parameters:
   - name: environments
@@ -45,6 +47,14 @@ parameters:
     displayName: Environments allowed to apply in this run (manual runs can restrict)
     type: object
     default: [nonprod, prod]
+  - name: runImageBuild
+    displayName: Build + publish a new ctm-rhel9 golden image (Packer)
+    type: boolean
+    default: false
+  - name: imageVersion
+    displayName: Gallery image version to publish (semver; only with runImageBuild)
+    type: string
+    default: "1.0.0"
 
 variables:
   - template: pipelines/variables/common.yml
@@ -67,9 +77,16 @@ stages:
       failOnThreshold: ${{ parameters.failOnCheckmarxThreshold }}
       dependsOn: [validate]
 
-  # ---------------- 3+4. plan and gated apply per environment ----------------
+  # ---------------- golden image (manual) ----------------
+  - template: pipelines/templates/stage-image.yml
+    parameters:
+      enabled: ${{ parameters.runImageBuild }}
+      imageVersion: ${{ parameters.imageVersion }}
+      dependsOn: [validate]
+
+  # ---------------- 3+4. what-if and gated apply per environment ----------------
   - ${{ each env in parameters.environments }}:
-      - template: pipelines/templates/stage-plan.yml
+      - template: pipelines/templates/stage-whatif.yml
         parameters:
           environment: ${{ env.name }}
 

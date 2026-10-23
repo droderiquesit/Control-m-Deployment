@@ -24,3 +24,17 @@ terraform.rc
 .vscode/
 *.swp
 .DS_Store
+
+# Python (ctmdeploy)
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Packer
+packer_cache/
+packer/*.pkrvars.hcl
+
+# Bicep build artifacts (bicep build without --stdout)
+bicep/**/*.json

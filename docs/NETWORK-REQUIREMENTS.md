@@ -2,13 +2,13 @@
 
 The platform never creates or modifies a VNet, subnet, NSG, route table or
 firewall. Each platform (nonprod, prod, and the prod DR region) needs the following to exist
-before `terraform apply`.
+before the deployment runs (`ctmdeploy deploy`).
 
 ## Subnets
 
-| tfvars key | Purpose | Size | Must have |
+| config key (`network:`) | Purpose | Size | Must have |
 |------------|---------|------|-----------|
-| `app_subnet_name` | EM and Server VMs, agent scale set, LB frontend | /24 minimum, /22 recommended for prod agents | outbound internet (NAT Gateway, Azure Firewall or proxy) for OS packages and BMC media mirrors |
+| `app_subnet_name` | EM and Server VMs, agent scale set, LB frontend | /24 minimum, /22 recommended for prod agents | outbound internet (NAT Gateway, Azure Firewall or proxy) for BMC media mirrors and Azure APIs |
 | `data_subnet_name` | PostgreSQL Flexible Server | /28 minimum (/27 if DR replica shares the layout) | **delegation to `Microsoft.DBforPostgreSQL/flexibleServers`**, no other resources |
 | `pe_subnet_name` (optional) | Private endpoints for Key Vault, Blob and Files | /27 | private endpoint network policies disabled (default) |
 
@@ -26,7 +26,7 @@ Web 8443). Keep it simple and secure at the subnet boundary:
 | 130 | Inbound | Bastion / jump subnet | * | 22 | operator SSH |
 | 4000 | Inbound | * | * | * | deny |
 | — | Outbound | app subnet | data subnet | 5432 | PostgreSQL |
-| — | Outbound | app subnet | Internet | 443 | packages, BMC support, Azure APIs (or use private endpoints + service tags) |
+| — | Outbound | app subnet | Internet | 443 | BMC support, Azure APIs (or use private endpoints + service tags); OS packages are baked into the ctm-rhel9 image |
 
 Jobs that agents run may need additional outbound rules (SFTP, databases,
 SaaS APIs) — those belong to the agent host group's own NSG policy.
@@ -40,8 +40,8 @@ SaaS APIs) — those belong to the agent host group's own NSG policy.
 * Private endpoints need the standard zones `privatelink.blob.core.windows.net`,
   `privatelink.file.core.windows.net`, `privatelink.vaultcore.azure.net` and a
   `<x>.postgres.database.azure.com` zone linked to the VNet. Pass hub-managed
-  zone ids through `existing_private_dns_zone_ids`; anything omitted is created
-  in the platform resource group and linked to the VNet.
+  zone ids through `network.existing_private_dns_zone_ids`; anything omitted
+  is created in the platform resource group and linked to the VNet.
 * If the VNet uses custom DNS servers (hub resolver / AD DNS), they must forward
   `*.ctm.internal`, the privatelink zones and `*.postgres.database.azure.com` to
   Azure DNS (`168.63.129.16`) or a DNS Private Resolver.
@@ -55,3 +55,12 @@ SaaS APIs) — those belong to the agent host group's own NSG policy.
   EM/Server NICs in the DR `app` subnet; NSG rules must mirror the primary.
 * Platform secrets, DNS aliases and hostnames are identical in both regions by
   design, so no application reconfiguration is needed on failover.
+
+## Packer builds
+
+The temporary build VM Packer creates (in its own throwaway resource group,
+default networking) needs outbound internet to pull RHEL packages and Node.js;
+it does not touch the platform VNets. If your subscription policy forbids
+public IPs, set the azure-arm builder's
+`virtual_network_name`/`virtual_network_subnet_name` to a build subnet with
+outbound access.

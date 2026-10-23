@@ -1,0 +1,69 @@
+# Golden image build: a pinned, checksum-verified Packer publishes a new
+# ctm-rhel9 version to the Azure Compute Gallery (replicated eastus2+centralus).
+# Manual: run the pipeline with runImageBuild=true and an imageVersion.
+parameters:
+  - name: enabled
+    type: boolean
+    default: false
+  - name: imageVersion
+    type: string
+  - name: dependsOn
+    type: object
+    default: [validate]
+
+stages:
+  - stage: image
+    displayName: Image (Packer ctm-rhel9)
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: and(succeeded(), eq('${{ parameters.enabled }}', 'True'))
+    jobs:
+      - job: packer_build
+        displayName: packer build ctm-rhel9 ${{ parameters.imageVersion }}
+        timeoutInMinutes: 120
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - template: steps-tools-install.yml
+
+          - bash: |
+              set -euo pipefail
+              V="$(packerVersion)"
+              cd "$(Agent.TempDirectory)"
+              curl -fsSLO "https://releases.hashicorp.com/packer/${V}/packer_${V}_linux_amd64.zip"
+              curl -fsSLO "https://releases.hashicorp.com/packer/${V}/packer_${V}_SHA256SUMS"
+              grep "packer_${V}_linux_amd64.zip" "packer_${V}_SHA256SUMS" | sha256sum -c -
+              unzip -oq "packer_${V}_linux_amd64.zip" packer
+              sudo install -m 0755 packer /usr/local/bin/packer
+              packer version
+            displayName: Install Packer $(packerVersion) (sha256 verified)
+
+          # Packer authenticates through the az CLI session the task opens
+          # (use_azure_cli_auth = true in packer/ctm-rhel9.pkr.hcl) — no
+          # credentials on disk, no service-principal secret anywhere.
+          - task: AzureCLI@2
+            displayName: ctmdeploy image gallery + build
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                export AZURE_CLIENT_ID="$ARM_CLIENT_ID"
+                export AZURE_TENANT_ID="$ARM_TENANT_ID"
+                export AZURE_SUBSCRIPTION_ID="$ARM_SUBSCRIPTION_ID"
+
+                # Idempotent: resource group ctm-images-rg + gallery ctmgallery
+                # + image definition ctm-rhel9 (bicep/images.bicep).
+                python -m ctmdeploy image gallery --env prod
+
+                # Builds from the marketplace RHEL 9 base and publishes gallery
+                # version ${{ parameters.imageVersion }} (immutable — bump, never rebuild).
+                python -m ctmdeploy image build --env prod \
+                  --version "${{ parameters.imageVersion }}"
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)

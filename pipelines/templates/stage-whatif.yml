@@ -1,0 +1,82 @@
+# ARM what-if analysis for one environment (`ctmdeploy whatif`): prints every
+# change, publishes the 'whatif-<env>' artifact for the apply approvers, and
+# sets the output variable hasChanges that gates the apply stage.
+# NOTE: ARM has no "apply this exact saved plan" — the apply stage re-runs the
+# deployments; approvers review this stage's artifact before approving.
+parameters:
+  - name: environment
+    type: string
+
+stages:
+  - stage: whatif_${{ parameters.environment }}
+    displayName: What-if ${{ parameters.environment }}
+    dependsOn: [validate, security]
+    # Analyze when validation passed and the security stage passed or was switched off (never when it failed).
+    condition: >-
+      and(
+        eq(dependencies.validate.result, 'Succeeded'),
+        in(dependencies.security.result, 'Succeeded', 'Skipped')
+      )
+    jobs:
+      - job: whatif
+        displayName: ctmdeploy whatif (${{ parameters.environment }})
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - template: steps-tools-install.yml
+
+          - template: steps-dsv-secrets.yml
+            parameters:
+              environment: ${{ parameters.environment }}
+              readPlatform: true
+
+          # Runs inside AzureCLI@2 so DefaultAzureCredential resolves through
+          # the task's federated az login (WIF service connection, no secrets).
+          # addSpnToEnvironment exposes $servicePrincipalId/$tenantId, exported
+          # as ARM_*/AZURE_* for the SDK and any tooling that reads them.
+          - task: AzureCLI@2
+            displayName: ctmdeploy whatif
+            name: whatif
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                export AZURE_CLIENT_ID="$ARM_CLIENT_ID"
+                export AZURE_TENANT_ID="$ARM_TENANT_ID"
+                export AZURE_SUBSCRIPTION_ID="$ARM_SUBSCRIPTION_ID"
+                # Object id of the pipeline identity: foundation grants it
+                # Key Vault Secrets Officer so the secrets phase can seed.
+                # Needs Graph read on the SPN; empty keeps the what-if honest
+                # about the role assignment being absent.
+                CTM_DEPLOYER_OBJECT_ID="$(az ad sp show --id "$servicePrincipalId" --query id -o tsv 2>/dev/null || true)"
+                export CTM_DEPLOYER_OBJECT_ID
+                [ -n "$CTM_DEPLOYER_OBJECT_ID" ] || echo "##[warning]could not resolve the service principal object id (Graph permission?); foundation what-if omits the deployer role assignment"
+
+                TXT="$(Build.ArtifactStagingDirectory)/${{ parameters.environment }}-whatif.txt"
+                python -m ctmdeploy whatif --env ${{ parameters.environment }} \
+                  --output "$(Build.ArtifactStagingDirectory)/${{ parameters.environment }}-whatif.json" \
+                  | tee "$TXT"
+
+                # ctmdeploy ends stdout with a machine-readable 'has_changes=true|false'.
+                HAS=$(grep -Eo '^has_changes=(true|false)$' "$TXT" | tail -1 | cut -d= -f2)
+                if [ -z "$HAS" ]; then
+                  echo "##[error]whatif output is missing the has_changes marker"
+                  exit 1
+                fi
+                echo "##vso[task.setvariable variable=hasChanges;isOutput=true]$HAS"
+            env:
+              # JSON map of secret overrides from DSV; ctmdeploy seeds them into
+              # Key Vault during apply and models them during what-if. Never logged.
+              CTM_PLATFORM_SECRETS: $(platformSecretsJson)
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+          - publish: $(Build.ArtifactStagingDirectory)
+            artifact: whatif-${{ parameters.environment }}
+            displayName: Publish what-if artifact

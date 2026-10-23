@@ -1,6 +1,6 @@
 # Disaster recovery runbook
 
-Applies to platforms with `dr.enabled = true` (the prod platform, which hosts `CTM_UAT` and `CTM_PROD`).
+Applies to platforms with `dr.enabled: true` (the prod platform, which hosts `CTM_UAT` and `CTM_PROD`).
 
 | Objective | Target | Mechanism |
 |-----------|--------|-----------|
@@ -13,7 +13,8 @@ Applies to platforms with `dr.enabled = true` (the prod platform, which hosts `C
 * **Primary**: full platform. **DR**: foundation + replica + ASR replicas +
   warm agents per Server (`dr.warm_agents`).
 * Secrets, DNS aliases (`ctm-db`, `ctm-web`), hostnames and the NFS layout are
-  identical in both regions.
+  identical in both regions. Both regions boot from the same ctm-rhel9 gallery
+  image (versions are replicated to the DR region at publish time).
 * Installer media and EM/Server backup exports are object-replicated to the DR
   blob account; the DR Files share is empty until failover (backups restore
   from blob if required).
@@ -21,7 +22,7 @@ Applies to platforms with `dr.enabled = true` (the prod platform, which hosts `C
 ## Test failover (quarterly, no production impact)
 
 ```bash
-./scripts/dr-failover.sh prod --test
+python -m ctmdeploy failover --env prod --test
 ```
 
 Site Recovery brings test copies of the EM and Server VMs up in the DR VNet (in an
@@ -33,14 +34,16 @@ in the Azure portal. The database replica is not touched.
 
 1. Declare the incident; confirm the primary region (or the database) is
    unavailable and not just degraded. Promotion is one-way.
-2. Run the scripted failover:
+2. Run the scripted failover (it asks for confirmation; `--yes` skips it):
    ```bash
-   ./scripts/dr-failover.sh prod
+   python -m ctmdeploy failover --env prod
    ```
-   It promotes the replica (`forced`, standalone), starts an unplanned ASR
+   It promotes the replica (forced, standalone), starts an unplanned ASR
    failover for `ctm-em-a/b`, `ctm-srv-uat-a/b` and `ctm-srv-prod-a/b`, sets
    the DR `ctm-db` CNAME to the promoted server and scales each Server's DR
-   agent scale set to its configured minimum.
+   agent scale set (`ctm-prod-dr-agents-<stage>`) to its configured
+   `agents.min` from `environments/prod/config.yaml`. It ends by printing the
+   manual checklist (steps 3-7 below).
 3. When the ASR jobs finish, log in to `ctm-em-a` (DR) and check
    `systemctl status controlm-em`, and `controlm-server` on `ctm-srv-prod-a`
    and `ctm-srv-uat-a`. The
@@ -51,24 +54,30 @@ in the Azure portal. The database replica is not touched.
    primary region are gone; re-run or resubmit jobs per business policy.
 5. Switch users: Traffic Manager does this automatically for public endpoints;
    for internal access update the corporate DNS record for Control-M Web to the
-   DR load balancer IP (`terraform output -json | jq .dr`).
+   DR load balancer IP:
+   ```bash
+   az deployment group show -g ctm-prod-dr-rg -n ctm-prod-foundation-dr \
+     --query properties.outputs.lbFrontendIp.value -o tsv
+   ```
 6. **Commit** the failover in Site Recovery once validated.
 7. Re-point backups: enable the Recovery Services vault in the DR platform
    (`backup.enabled` for the DR role) if the outage will be long.
 
 ## Failback
 
-1. When the primary region is healthy, run `terraform apply` for the
-   environment. The promoted replica is standalone; Terraform recreates the
-   primary database only if you remove the old server. Recommended path: create
+1. When the primary region is healthy, re-run
+   `python -m ctmdeploy whatif --env prod` to see what the deployment would
+   change. The promoted replica is standalone; the deployment recreates the
+   primary database only if the old server is gone. Recommended path: create
    a new read replica *from DR back to primary* (`az postgres flexible-server
    replica create`), wait for sync, then promote it during a maintenance window.
-2. Re-protect the VMs in Site Recovery in the reverse direction and fail back
-   during the same window.
+2. Re-protect the VMs in Site Recovery in the reverse direction
+   (`ctmdeploy deploy --env prod --phase replication` re-creates protection
+   once direction is restored) and fail back during the same window.
 3. Restore the `ctm-db` CNAME in the primary zone and switch Traffic Manager /
    corporate DNS back.
-4. Update `terraform.tfvars`/state to reflect the new primary and apply, so
-   drift is zero again.
+4. Update `environments/prod/config.yaml` to reflect the new primary and run
+   `python -m ctmdeploy deploy --env prod --phase all`, so drift is zero again.
 
 ## Things that are NOT automatic
 

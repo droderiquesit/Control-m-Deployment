@@ -1,0 +1,40 @@
+# Installs the deployment toolchain on a hosted agent: a pinned, checksum-
+# verified Bicep CLI (no marketplace extension, az not required for builds)
+# and the ctmdeploy python package from deploy/ in editable mode.
+parameters:
+  - name: includeDev
+    type: boolean
+    default: false # true adds pytest/ruff (the validate stage needs them)
+
+steps:
+  - task: UsePythonVersion@0
+    displayName: Use Python $(pythonVersion)
+    inputs:
+      versionSpec: $(pythonVersion)
+
+  - bash: |
+      set -euo pipefail
+      V="$(bicepVersion)"
+      SHA="$(bicepSha256)"
+      curl -fsSL -o "$(Agent.TempDirectory)/bicep" \
+        "https://github.com/Azure/bicep/releases/download/v${V}/bicep-linux-x64"
+      echo "${SHA}  $(Agent.TempDirectory)/bicep" | sha256sum -c -
+      sudo install -m 0755 "$(Agent.TempDirectory)/bicep" /usr/local/bin/bicep
+      bicep --version
+    displayName: Install Bicep $(bicepVersion) (sha256 verified)
+
+  - ${{ if eq(parameters.includeDev, true) }}:
+      - bash: |
+          set -euo pipefail
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet -e "deploy/[dev]"
+          python -m ctmdeploy --help >/dev/null
+        displayName: Install ctmdeploy (+dev tools)
+
+  - ${{ if ne(parameters.includeDev, true) }}:
+      - bash: |
+          set -euo pipefail
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet -e deploy/
+          python -m ctmdeploy --help >/dev/null
+        displayName: Install ctmdeploy
