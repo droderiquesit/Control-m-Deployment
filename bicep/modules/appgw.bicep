@@ -6,6 +6,11 @@
 // only the active EM's LB passes it, so ctm-global.<zone> follows whichever
 // region is up - automatic primary/DR behavior, DR joins when its EM answers.
 // Layer 4 (TLS/TCP proxy) needs api-version 2023-11-01 or later.
+// access.bicep instantiates this module up to TWICE: the primary gateway in
+// the primary utility VNet, and (access.appgw.dr_instance) its DR TWIN in the
+// DR utility VNet. The `existing` zone reference below resolves against the
+// deployment's resource-group scope, so each instance writes ctm-global into
+// ITS region's copy of the platform zone, pointing at the local gateway.
 
 @description('Platform name prefix (e.g. ctm-prod); the gateway is named <name>-appgw.')
 param name string

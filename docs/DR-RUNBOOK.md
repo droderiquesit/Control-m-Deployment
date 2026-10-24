@@ -35,6 +35,13 @@ regional failover even though UAT compute is not replicated.
 * Secrets, DNS aliases (`ctm-db`, `ctm-web`), hostnames and the NFS layout are
   identical in both regions. Both regions boot from the same ctm-rhel9 gallery
   image (versions are replicated to the DR region at publish time).
+* **Private entry (`ctm-global`)**: with `access.appgw.dr_instance` (the
+  shipped prod config) each region runs its own private Application Gateway —
+  `ctm-prod-appgw` and the DR twin `ctm-prod-dr-appgw` — both balancing the
+  same two internal LBs, and each regional copy of `prod.ctm.internal`
+  carries a `ctm-global` record pointing at its **local** gateway. The DR
+  entry therefore already works before any failover step and survives a
+  primary-region loss.
 * Installer media and EM/Server backup exports are object-replicated to the DR
   blob account; the DR Files share is empty until failover (backups restore
   from blob if required).
@@ -62,10 +69,17 @@ in the Azure portal. The database replica is not touched.
    It promotes the replica (forced, standalone), starts an unplanned ASR
    failover for the protected VMs — `ctm-em-a/b` and the DR-protected Servers'
    nodes (`ctm-srv-prod-a/b`; `CTM_UAT` is not replicated) — sets the DR
-   `ctm-db` CNAME to the promoted server and scales each DR-protected Server's
-   warm agent scale set (`ctm-prod-dr-agents-prod`) to its configured
-   `agents.min` from `environments/prod/config.yaml`. It ends by printing the
-   manual checklist (steps 3-7 below).
+   `ctm-db` CNAME to the promoted server, **re-asserts `ctm-global`** at the
+   DR gateway twin's private IP (read live from `ctm-prod-dr-appgw` via the
+   SDK: an idempotent upsert in the DR zone copy, which the access phase
+   already pointed at the twin, and a *best-effort* upsert in the primary
+   zone copy — skipped with a warning when the primary region is
+   unreachable), and scales each DR-protected Server's warm agent scale set
+   (`ctm-prod-dr-agents-prod`) to its configured `agents.min` from
+   `environments/prod/config.yaml`. It ends by printing the manual checklist
+   (steps 3-7 below) and a reminder that **corporate DNS forwarders resolving
+   `*.ctm.internal` through primary-region VNets may need their forwarder
+   target switched** to a DR-region resolver.
 3. When the ASR jobs finish, log in to `ctm-em-a` (DR) and check
    `systemctl status controlm-em`, and `controlm-server` on `ctm-srv-prod-a`.
    The services start automatically; the `ctm-db` alias resolves to the
@@ -75,9 +89,14 @@ in the Azure portal. The database replica is not touched.
    its compute was not replicated (see "UAT during a DR event" below). Agents
    that were running in the primary region are gone; re-run or resubmit jobs
    per business policy.
-5. Switch users: Traffic Manager does this automatically for public endpoints;
-   for internal access update the corporate DNS record for Control-M Web to the
-   DR load balancer IP:
+5. Switch users: clients on `ctm-global.prod.ctm.internal` whose VNets
+   resolve through the **DR** zone copy need no change — the DR gateway twin
+   answers and routes to the failed-over EM. Check corporate DNS forwarders:
+   any that resolve `*.ctm.internal` through primary-region VNets (or a
+   primary-region DNS Private Resolver) must have their forwarder target
+   switched to a DR-region resolver. Traffic Manager handles public endpoints
+   automatically; for internal access still pinned to `ctm-web`, update the
+   corporate DNS record for Control-M Web to the DR load balancer IP:
    ```bash
    az deployment group show -g ctm-prod-dr-rg -n ctm-prod-foundation-dr \
      --query properties.outputs.lbFrontendIp.value -o tsv
@@ -113,7 +132,10 @@ already holds the UAT data. Otherwise simply wait for failback. (To make UAT
    (`ctmdeploy deploy --env prod --phase replication` re-creates protection
    once direction is restored) and fail back during the same window.
 3. Restore the `ctm-db` CNAME in the primary zone and switch Traffic Manager /
-   corporate DNS back.
+   corporate DNS (forwarder targets included) back. If the failover's
+   best-effort write reached the primary zone copy, its `ctm-global` record
+   now points at the DR twin — re-running `--phase access` (included in step
+   4's `--phase all`) re-asserts it back to the primary gateway.
 4. Update `environments/prod/config.yaml` to reflect the new primary and run
    `python -m ctmdeploy deploy --env prod --phase all`, so drift is zero again.
 

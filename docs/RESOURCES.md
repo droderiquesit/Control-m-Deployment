@@ -134,7 +134,10 @@ Subscription-scope deployment `ctm-<env>-access`, after `compute` (it needs
 the foundation LB frontend IPs) and before `dr`. Skipped entirely when
 `access.bastion`/`access.appgw`, `kv_sync` and `build_agents` are all
 disabled. The gateway is **honored on prod only** (it balances the primary
-AND DR internal LBs); nonprod gets Bastion + kvsync.
+AND DR internal LBs); nonprod gets Bastion + kvsync. With
+`access.appgw.dr_instance` (and `dr.enabled`) the phase also deploys a **DR
+TWIN** of the gateway into the DR platform RG, so the `ctm-global` entry
+survives a primary-region loss.
 
 | Resource type | Name | Scope / RG | Condition | nonprod | prod primary | prod DR |
 |---|---|---|---|---|---|---|
@@ -142,6 +145,8 @@ AND DR internal LBs); nonprod gets Bastion + kvsync.
 | Azure Bastion (Standard) | `ctm-prod-bastion` in `AzureBastionSubnet` (native-client tunneling + IP connect on) | platform RG | `access.bastion.enabled` | 1 | 1 | 0 |
 | Application Gateway (Standard_v2, **private-only frontend**) | `ctm-prod-appgw` in `snet-ctm-appgw`: static private frontend IP (first assignable host of the subnet), autoscale 1→2, **layer-4 TCP** listeners 443 + 8443, one backend pool = [primary LB frontend IP, DR LB frontend IP], TCP health probe → healthy-only (automatic primary/DR) routing | platform RG | `access.appgw.enabled` **and prod** | 0 | 1 | 0 |
 | DNS A record | `ctm-global` → the gateway's private frontend IP (TTL 60) | `prod.ctm.internal` zone, platform RG | with the gateway | 0 | 1 | 0 |
+| Application Gateway (Standard_v2, **private-only frontend**) — **DR twin** | `ctm-prod-dr-appgw` in the DR utility VNet's `snet-ctm-appgw`: same shape as the primary gateway and the **same** backend pool = [primary LB frontend IP, DR LB frontend IP]; its own static private frontend keeps the entry answering through a primary-region loss | **DR platform RG** | `access.appgw.dr_instance` **and prod and** `dr.enabled` | 0 | 0 | 1 |
+| DNS A record | `ctm-global` → the **DR twin's** private frontend IP (TTL 60) — the primary zone's record keeps pointing at the primary gateway (two-gateway entry pattern; `ctmdeploy failover` re-asserts this record) | `prod.ctm.internal` **DR zone copy**, DR platform RG | with the DR twin | 0 | 0 | 1 |
 | Storage account (Standard_LRS) | `<compact>func<hash>` (deterministic `uniqueString` suffix) — Functions host state + durable task hub only, no platform data | platform RG | `kv_sync.enabled` | 1 | 1 | 0 |
 | App Service plan (EP1 Linux Elastic Premium) | `ctm-prod-kvsync-plan` (warm instance — billed around the clock; nonprod may disable) | platform RG | `kv_sync.enabled` | 1 | 1 | 0 |
 | Function App (python 3.11, system-assigned MI) | `ctm-prod-kvsync` — VNet-integrated into `snet-ctm-func` (`vnetRouteAllEnabled`); app settings `KEY_VAULT_URI`, `CTM_API_BASE`, `SYNC_SCHEDULE`, `CTM_VERIFY_TLS`; **code arrives separately** via `ctmdeploy kvsync deploy` (zip-deploy, data-plane) | platform RG | `kv_sync.enabled` | 1 | 1 | 0 |

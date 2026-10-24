@@ -522,11 +522,17 @@ class AccessConfig:
 
     `appgw` is parsed for every environment but HONORED on prod only (the
     gateway balances across the primary + DR internal load balancers, which
-    only prod has).
+    only prod has). `appgw.dr_instance` (v4.2) additionally deploys a DR TWIN
+    of the gateway in the DR utility VNet — its own private frontend, the
+    SAME two-LB backend pool — plus a `ctm-global` A record in the DR copy of
+    the platform zone pointing at the twin, so the private entry point
+    survives a primary-region loss. It is only meaningful when ``dr.enabled``
+    and ``appgw.enabled`` (inert otherwise; nonprod untouched).
     """
 
     bastion_enabled: bool = False
     appgw_enabled: bool = False
+    appgw_dr_instance: bool = False
 
     @property
     def any_enabled(self) -> bool:
@@ -941,6 +947,20 @@ class EnvironmentConfig:
     @property
     def asr_policy_name(self) -> str:
         return f"{self.name}-asr-policy"
+
+    @property
+    def appgw_name(self) -> str:
+        """The private Application Gateway in the primary utility VNet
+        (access phase; `ctm-global` in the primary zone points at it)."""
+        return f"{self.name}-appgw"
+
+    @property
+    def dr_appgw_name(self) -> str:
+        """The gateway's DR TWIN in the DR utility VNet
+        (access.appgw.dr_instance; `ctm-global` in the DR zone copy points
+        at it). Deterministic: bicep/access.bicep passes name='<name>-dr' to
+        modules/appgw.bicep, which appends '-appgw'."""
+        return f"{self.dr_name}-appgw"
 
     @property
     def replica_sku_name(self) -> str:
@@ -1608,6 +1628,7 @@ def _parse_access(raw: Any, path: str) -> AccessConfig:
     return AccessConfig(
         bastion_enabled=_bool(bastion, "enabled", f"{path}.bastion", False),
         appgw_enabled=_bool(appgw, "enabled", f"{path}.appgw", False),
+        appgw_dr_instance=_bool(appgw, "dr_instance", f"{path}.appgw", False),
     )
 
 
@@ -2036,6 +2057,18 @@ def load_config_file(
     # own networking, the default) the vnets list is inert documentation.
     if cfg.network_infrastructure.create:
         _validate_network_infrastructure(cfg)
+    # v4.2: the DR gateway twin (access.appgw.dr_instance) resolves its subnet
+    # by ROLE from the DR utility VNet's network_infrastructure entry — require
+    # that appgw-role subnet at load time. Only meaningful when dr.enabled and
+    # appgw.enabled (the flag is inert otherwise, nonprod included).
+    if cfg.access.appgw_dr_instance and cfg.access.appgw_enabled and cfg.dr.enabled:
+        try:
+            cfg.appgw_subnet_id("dr")
+        except ConfigError as exc:
+            raise ConfigError(
+                f"config.access.appgw.dr_instance: the DR gateway twin needs an "
+                f"'appgw'-role subnet in the DR utility VNet plan — {exc}"
+            ) from exc
     return cfg
 
 

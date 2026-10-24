@@ -83,7 +83,16 @@ revving the images, not by touching nodes:
   private Application Gateway) follows whichever region's EM answers the TCP
   health probe — use it as the client-facing default so a DR failover needs
   no client change. The gateway is layer-4: TLS stays end-to-end, so
-  certificate work happens on the EM web tier only.
+  certificate work happens on the EM web tier only. With
+  `access.appgw.dr_instance` (the shipped prod config) a **DR twin**
+  (`ctm-prod-dr-appgw`) runs in the DR utility VNet with the same two-LB
+  backend pool, and the DR copy of the zone resolves `ctm-global` to it — so
+  the entry itself survives a primary-region loss. During a real failover,
+  `ctmdeploy failover` re-asserts the `ctm-global` record (idempotent in the
+  DR zone copy, best-effort in the primary copy) and prints a reminder:
+  corporate DNS forwarders that resolve `*.ctm.internal` through
+  primary-region VNets may need their forwarder target switched to a
+  DR-region resolver.
 
 ## Key Vault → Control-M sync (kvsync)
 

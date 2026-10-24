@@ -600,6 +600,20 @@ def test_prod_dr_settings_and_warm_pools() -> None:
     assert primary_pools[0].min == 2 and primary_pools[1].min == 3
 
 
+def test_prod_access_appgw_dr_instance_ships_enabled() -> None:
+    """The shipped prod config enables the DR gateway twin and resolves its
+    placement (the DR utility VNet's appgw-role subnet) at load time."""
+    cfg = _load("prod")
+    assert cfg.access.appgw_enabled is True
+    assert cfg.access.appgw_dr_instance is True
+    assert cfg.appgw_subnet_id("dr") == _subnet(
+        cfg, "rg-network-prod-dr", "vnet-dr-utility", "snet-ctm-appgw"
+    )
+    # Deterministic gateway names (failover reads the twin live by this name).
+    assert cfg.appgw_name == "ctm-prod-appgw"
+    assert cfg.dr_appgw_name == "ctm-prod-dr-appgw"
+
+
 def test_prod_dr_server_networks() -> None:
     """DR opt-in set: ONLY prod participates (uat is not DR-protected)."""
     cfg = _load("prod")

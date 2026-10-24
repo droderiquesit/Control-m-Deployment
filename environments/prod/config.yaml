@@ -57,10 +57,10 @@ network:
 network_infrastructure:
   create: false            # true = ctmdeploy provisions the full network below
   user_access_cidrs:       # CIDRs allowed to reach Control-M Web/API (NSG rule).
-    - "10.70.2.64/26"      # Keep the snet-ctm-appgw prefix: the Application
-                           # Gateway's backend connections to the EM internal
-                           # LBs of BOTH regions ride this rule. Append
-                           # operator CIDRs as needed.
+    - "10.70.2.64/26"      # Keep BOTH snet-ctm-appgw prefixes (primary + DR):
+    - "10.80.2.0/26"       # each gateway's backend connections to the EM
+                           # internal LBs of BOTH regions ride this rule.
+                           # Append operator CIDRs as needed.
   bastion_cidrs:           # CIDRs allowed SSH 22 to nodes/build agents. Keep
     - "10.70.2.0/26"       # the AzureBastionSubnet prefix: Bastion sessions
                            # egress from it (DR reach over the global peering
@@ -118,6 +118,10 @@ network_infrastructure:
         - {name: snet-ctm-em,       prefix: 10.80.0.0/24,  role: em}
         - {name: snet-ctm-postgres, prefix: 10.80.1.0/27,  role: data}
         - {name: snet-ctm-pe,       prefix: 10.80.1.64/26, role: pe}
+        # DR TWIN of the Application Gateway (access.appgw.dr_instance): its
+        # own private frontend keeps the ctm-global entry answering when the
+        # primary region is lost.
+        - {name: snet-ctm-appgw,    prefix: 10.80.2.0/26,  role: appgw}
     - name: vnet-ctm-prod-dr
       resource_group_name: rg-network-prod-dr
       location: centralus
@@ -173,9 +177,14 @@ installer_blobs: {}
 # whose single backend pool holds BOTH internal LB frontend IPs — primary
 # and DR. Healthy-only routing makes ctm-global.<zone> follow whichever
 # region's EM answers (automatic primary/DR behavior).
+# dr_instance: also deploy a DR TWIN of the gateway (ctm-prod-dr-appgw) in
+# the DR utility VNet's snet-ctm-appgw — same two-LB backend pool, its own
+# private frontend — and point ctm-global in the DR COPY of the platform
+# zone at it, so the private entry point survives a primary-region loss
+# (requires the appgw-role subnet in vnet-dr-utility above).
 access:
   bastion: {enabled: true}
-  appgw: {enabled: true}
+  appgw: {enabled: true, dr_instance: true}
 
 # Key Vault -> Control-M secret sync (functions/kvsync Durable Function,
 # infra from the access phase, code via `ctmdeploy kvsync deploy`). The

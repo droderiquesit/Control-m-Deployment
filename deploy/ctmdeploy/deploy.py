@@ -597,13 +597,19 @@ class Engine:
         prod: Bastion + the PRIVATE Application Gateway whose single backend
         pool holds BOTH internal LB frontend IPs (primary + DR — healthy-only
         routing gives automatic primary/DR behavior) + kvsync + the Azure
-        DevOps build-agent scale set. Subnet ids are built from config and
-        the network plan; backend IPs come from the two foundation outputs.
+        DevOps build-agent scale set. With access.appgw.dr_instance (and
+        dr.enabled) a DR TWIN of the gateway additionally lands in the DR
+        utility VNet — same two-LB backend pool, its own private frontend —
+        and ctm-global in the DR zone copy points at the twin, so the private
+        entry survives a primary-region loss. Subnet ids are built from config
+        and the network plan; backend IPs come from the two foundation outputs.
         """
         cfg = self.cfg
         bastion_enabled = cfg.access.bastion_enabled
         # The gateway balances the primary and DR LBs: honored on prod only.
         appgw_enabled = cfg.access.appgw_enabled and cfg.environment == "prod"
+        # The DR twin needs the gateway, a DR region and the dr_instance flag.
+        dr_appgw_enabled = appgw_enabled and cfg.dr.enabled and cfg.access.appgw_dr_instance
         kvsync_enabled = cfg.kv_sync.enabled
         build_enabled = cfg.build_agents.enabled
         if not (bastion_enabled or appgw_enabled or kvsync_enabled or build_enabled):
@@ -634,6 +640,11 @@ class Engine:
             "appgwSubnetId": cfg.appgw_subnet_id() if appgw_enabled else "",
             "appgwBackendIps": appgw_backend_ips,
             "dnsZoneName": cfg.private_dns_zone_name,
+            # DR gateway twin (both gateways share appgwBackendIps above).
+            "drAppgwEnabled": dr_appgw_enabled,
+            "drAppgwSubnetId": cfg.appgw_subnet_id("dr") if dr_appgw_enabled else "",
+            "drPlatformRgName": cfg.dr_resource_group_name if dr_appgw_enabled else "",
+            "drLocation": cfg.dr.location if dr_appgw_enabled else "",
             "kvSyncEnabled": kvsync_enabled,
             "funcSubnetId": cfg.func_subnet_id() if kvsync_enabled else "",
             "keyVaultId": cfg.key_vault_id,

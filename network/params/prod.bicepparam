@@ -11,7 +11,8 @@
 // One deployment covers BOTH regions (each entry carries its own resource
 // group + location) plus the build VNet:
 //   - vnet-prod-utility <-> vnet-dr-utility is a GLOBAL peering: the
-//     Application Gateway (snet-ctm-appgw) reaches the DR internal LB and
+//     Application Gateway (snet-ctm-appgw) reaches the DR internal LB, its
+//     DR TWIN (the DR snet-ctm-appgw) reaches back to the primary LB, and
 //     Azure Bastion reaches the DR utility VNet.
 //   - vnet-ctm-build peers to ALL THREE utility VNets so the Azure DevOps
 //     scale-set build agents can deploy into nonprod, prod AND DR.
@@ -68,6 +69,10 @@ param vnets = [
       { name: 'snet-ctm-em', prefix: '10.80.0.0/24', role: 'em' }
       { name: 'snet-ctm-postgres', prefix: '10.80.1.0/27', role: 'data' }
       { name: 'snet-ctm-pe', prefix: '10.80.1.64/26', role: 'pe' }
+      // DR TWIN of the Application Gateway (access.appgw.dr_instance): its
+      // own private frontend keeps ctm-global answering if the primary
+      // region is lost.
+      { name: 'snet-ctm-appgw', prefix: '10.80.2.0/26', role: 'appgw' }
     ]
   }
   {
@@ -109,10 +114,11 @@ param vnets = [
 ]
 
 // Operator networks allowed to reach Control-M Web / Automation API (443,
-// 8443) on the em subnets, and the Application Gateway frontend. The appgw
-// subnet prefix MUST stay here: the gateway's backend connections to the EM
-// internal LBs of BOTH regions ride this rule. Append operator CIDRs as needed.
-param userAccessCidrs = ['10.70.2.64/26']
+// 8443) on the em subnets, and the Application Gateway frontends. BOTH appgw
+// subnet prefixes MUST stay here (primary 10.70.2.64/26 and DR 10.80.2.0/26):
+// each gateway's backend connections to the EM internal LBs of BOTH regions
+// ride this rule. Append operator CIDRs as needed.
+param userAccessCidrs = ['10.70.2.64/26', '10.80.2.0/26']
 
 // SSH 22 sources for every node/build subnet. The AzureBastionSubnet prefix
 // MUST stay here — Azure Bastion sessions egress from it, and the agents

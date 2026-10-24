@@ -78,7 +78,7 @@ role derives.
 | Key | Type | Default | Allowed values | What it changes | Consumed by |
 |-----|------|---------|----------------|-----------------|-------------|
 | `create` | bool | `false` | — | `true` = the `network` phase deploys `network/main.bicep`; `false` = phase skipped, block stays the documented plan (+ access-layer subnet resolution) | `network`, `access` (subnet ids) |
-| `user_access_cidrs` | list of CIDR strings | `[]` | valid CIDRs | NSG allow rule on **em** and **appgw** subnets: TCP 443, 8443 from these sources. Prod must keep the appgw subnet prefix — the gateway's backend connections to both regions' internal LBs ride this rule | `network` |
+| `user_access_cidrs` | list of CIDR strings | `[]` | valid CIDRs | NSG allow rule on **em** and **appgw** subnets: TCP 443, 8443 from these sources. Prod must keep **both** appgw subnet prefixes (primary + DR twin) — each gateway's backend connections to both regions' internal LBs ride this rule | `network` |
 | `bastion_cidrs` | list of CIDR strings | `[]` | valid CIDRs | NSG allow rule on em/server/agents/build subnets: TCP 22. Keep the `AzureBastionSubnet` prefixes — Bastion sessions egress from them | `network` |
 | `vnets[].name` | string | — (required) | unique across the list | VNet name (must match the placement blocks when `create: true`) | `network` |
 | `vnets[].resource_group_name` | string | — (required) | — | resource group the VNet lands in (created, deduped across entries) | `network` |
@@ -103,6 +103,7 @@ Deployed by `ctmdeploy deploy --env <env> --phase access`
 |-----|------|---------|----------------|-----------------|-------------|
 | `bastion.enabled` | bool | `false` | — | Azure Bastion Standard `ctm-<env>-bastion` (+ its required static public IP) in the utility VNet's `AzureBastionSubnet`; private SSH to every node and build agent, DR included via the global peering | `access` |
 | `appgw.enabled` | bool | `false` | parsed everywhere, **honored on prod only** | the PRIVATE Application Gateway Standard_v2 `ctm-<env>-appgw` in `snet-ctm-appgw`: layer-4 TCP 443/8443 listeners, one backend pool holding the **primary and DR internal LB frontend IPs** (healthy-only routing = automatic primary/DR), plus the `ctm-global` A record in the platform DNS zone | `access` |
+| `appgw.dr_instance` | bool | `false` | only meaningful when `dr.enabled` **and** `appgw.enabled` (inert otherwise; nonprod untouched). Validated at load: requires an `appgw`-role subnet in the DR utility VNet's `network_infrastructure` entry | a **DR TWIN** of the gateway (`ctm-<env>-dr-appgw`) in the DR utility VNet's `snet-ctm-appgw` — its own private frontend, the **same** two-LB backend pool — plus the `ctm-global` A record in the **DR copy** of the platform zone pointing at the twin, so the private entry point survives a primary-region loss (`ctmdeploy failover` re-asserts the record; the primary zone's record keeps pointing at the primary gateway) | `access`, `failover` |
 
 ## `kv_sync:` — Key Vault → Control-M secret sync
 
@@ -305,5 +306,6 @@ on prod). v4 additions: the node installer blob
 upload`), the kvsync Function App `ctm-<env>-kvsync` (plan
 `ctm-<env>-kvsync-plan`, storage `<compact>func<hash>`), the EM Automation
 API base `https://ctm-web.<env>.ctm.internal:<web_port>/automation-api`
-(`CTM_API_BASE`), Bastion `ctm-<env>-bastion`, gateway `ctm-<env>-appgw`,
+(`CTM_API_BASE`), Bastion `ctm-<env>-bastion`, gateway `ctm-<env>-appgw`
+(DR twin `ctm-<env>-dr-appgw` when `access.appgw.dr_instance`),
 build scale set `ctm-build-agents` with identity `ctm-build-id`.

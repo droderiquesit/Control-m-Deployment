@@ -36,7 +36,9 @@ Bastion** for private SSH to every node (no VM ever has a public IP; DR
 reachable over the global peering), a **private Application Gateway** (prod)
 whose layer-4 TCP frontend publishes **`ctm-global`** — one alias balanced
 across the primary and DR internal load balancers, following whichever EM is
-healthy — a **Key Vault → Control-M sync Durable Function** (`kv_sync`,
+healthy, with a **DR twin** of the gateway in the DR utility VNet
+(`access.appgw.dr_instance`) so the private entry point itself survives a
+primary-region loss — a **Key Vault → Control-M sync Durable Function** (`kv_sync`,
 mirrors `ctm-sync`-tagged secrets into Control-M through the Automation
 API), and the **`ctm-build-agents`** scale set: Azure DevOps elastic-pool
 build agents that deploy into nonprod, prod and DR.
@@ -154,7 +156,7 @@ Makefile                    make whatif/deploy/image/failover/fmt/lint/test
 | Shared filesystem | Azure Files Premium, **NFS 4.1**, ZRS | zone redundant | quota per env |
 | Media/backups | Blob storage, RA-GZRS | geo redundant | — |
 | Entry point | Standard Load Balancer (zone-redundant frontend) `ctm-web.<env>.ctm.internal` → 8443 | probes `/ControlM/` on both EM nodes | — |
-| Global entry point (prod) | private Application Gateway (L4 TCP 443/8443) `ctm-global.prod.ctm.internal` — backend pool = primary **and** DR internal LBs | TCP health probe keeps only answering regions in rotation (automatic primary/DR) | autoscale 1–2 |
+| Global entry point (prod) | private Application Gateway (L4 TCP 443/8443) `ctm-global.prod.ctm.internal` — backend pool = primary **and** DR internal LBs; a DR twin (`ctm-prod-dr-appgw`, `access.appgw.dr_instance`) serves the same alias from the DR zone copy so the entry survives a primary-region loss | TCP health probe keeps only answering regions in rotation (automatic primary/DR) | autoscale 1–2 per gateway |
 | Operator access | Azure Bastion (Standard) in the utility VNet — SSH to every node and build agent, DR included via the global peering; no VM has a public IP | — | — |
 | Secret sync | `ctm-<env>-kvsync` Durable Function (EP1, VNet-integrated): Key Vault secrets tagged `ctm-sync=true` → Control-M secret store via the Automation API | — | schedule per `kv_sync.schedule` |
 | Build agents (prod) | `ctm-build-agents` VMSS in `vnet-ctm-build` (peered to all three utility VNets) — Azure DevOps elastic pool | — | capacity owned by the ADO pool |
@@ -246,7 +248,8 @@ python -m ctmdeploy deploy --env nonprod --phase all
 #    access -> dr -> replication (network only when
 #    network_infrastructure.create; dr/replication only where dr.enabled; any
 #    phase can be re-run alone). compute uploads the node installer to blob
-#    first; access adds Bastion, ctm-global (prod), kvsync infra, build agents.
+#    first; access adds Bastion, ctm-global (prod; + its DR gateway twin when
+#    access.appgw.dr_instance), kvsync infra, build agents.
 python -m ctmdeploy kvsync deploy --env nonprod   # push the sync function code
 
 # 4. publish media + silent XMLs into the installers container(s):

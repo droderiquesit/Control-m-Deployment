@@ -167,8 +167,10 @@ be re-run alone, and re-running is always safe — see the Idempotency section
 of the README). The compute phase uploads `node-scripts/ctm_node_install.py`
 to the installers container first, so nodes always boot the repo's installer
 version. The access phase deploys Bastion, the kvsync Function
-infrastructure, and on prod the private Application Gateway (`ctm-global`)
-plus the `ctm-build-agents` scale set. Pass `--deployer-object-id <objectId>`
+infrastructure, and on prod the private Application Gateway (`ctm-global`) —
+plus its DR twin `ctm-prod-dr-appgw` in the DR utility VNet when
+`access.appgw.dr_instance` (shipped on) — plus the `ctm-build-agents` scale
+set. Pass `--deployer-object-id <objectId>`
 (or export `CTM_DEPLOYER_OBJECT_ID`) so the foundation grants your principal
 Key Vault Secrets Officer for the secrets phase. Everything that got created:
 `docs/RESOURCES.md`; the vault contents and the kvsync tagging convention:
@@ -264,4 +266,6 @@ python -m ctmdeploy failover --env prod --test   # Site Recovery test failover o
 Run at least quarterly; the full failover/failback procedure is
 `docs/DR-RUNBOOK.md`. The `ctm-global` alias needs no runbook step — the
 gateway's health probe moves traffic to the DR load balancer as soon as the
-failed-over EM answers.
+failed-over EM answers, and the DR gateway twin (`access.appgw.dr_instance`)
+keeps the entry itself answering even if the primary region is lost
+(`ctmdeploy failover` re-asserts its record automatically).

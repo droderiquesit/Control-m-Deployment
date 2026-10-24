@@ -6,8 +6,9 @@ runs in its **own VNet** with its agent scale set beside it; the DR region
 mirrors the layout with a DR utility VNet plus one DR VNet per DR-protected
 Server. Three access-layer additions ride the utility VNets: **Azure Bastion**
 (`AzureBastionSubnet`), the **private Application Gateway** behind the
-`ctm-global` alias (`snet-ctm-appgw`, prod) and the **kvsync Function App's
-VNet integration** (`snet-ctm-func`). A dedicated **build VNet**
+`ctm-global` alias (`snet-ctm-appgw` — prod, in the primary utility VNet
+and, with `access.appgw.dr_instance`, a **DR twin** in the DR utility VNet)
+and the **kvsync Function App's VNet integration** (`snet-ctm-func`). A dedicated **build VNet**
 (`vnet-ctm-build`) hosts the Azure DevOps scale-set build agents and peers to
 *all three* utility VNets so one agent pool deploys into nonprod, prod and DR.
 
@@ -86,7 +87,7 @@ and DR — a hard requirement for DR/failback and for the build-agent peerings.
 | prod, eastus2 | `vnet-prod-utility` | utility, peer_to `[vnet-dr-utility]` (**global**) | `10.70.0.0/22` | `snet-ctm-em` `10.70.0.0/24` (em) · `snet-ctm-postgres` `10.70.1.0/27` (data) · `snet-ctm-pe` `10.70.1.64/26` (pe) · `AzureBastionSubnet` `10.70.2.0/26` (bastion) · `snet-ctm-appgw` `10.70.2.64/26` (appgw) · `snet-ctm-func` `10.70.2.128/26` (func) |
 | prod, eastus2 | `vnet-ctm-uat` | spoke → `vnet-prod-utility` | `10.70.8.0/24` | `snet-ctm-server` `10.70.8.0/26` (server) · `snet-ctm-agents` `10.70.8.64/26` (agents) |
 | prod, eastus2 | `vnet-ctm-prod` | spoke → `vnet-prod-utility` | `10.70.9.0/24` | `snet-ctm-server` `10.70.9.0/26` (server) · `snet-ctm-agents` `10.70.9.64/26` (agents) |
-| prod DR, centralus | `vnet-dr-utility` | utility | `10.80.0.0/22` | `snet-ctm-em` `10.80.0.0/24` (em) · `snet-ctm-postgres` `10.80.1.0/27` (data) · `snet-ctm-pe` `10.80.1.64/26` (pe) |
+| prod DR, centralus | `vnet-dr-utility` | utility | `10.80.0.0/22` | `snet-ctm-em` `10.80.0.0/24` (em) · `snet-ctm-postgres` `10.80.1.0/27` (data) · `snet-ctm-pe` `10.80.1.64/26` (pe) · `snet-ctm-appgw` `10.80.2.0/26` (appgw — the DR gateway twin, `access.appgw.dr_instance`) |
 | prod DR, centralus | `vnet-ctm-prod-dr` | spoke → `vnet-dr-utility` | `10.80.9.0/24` | `snet-ctm-server` `10.80.9.0/26` (server) · `snet-ctm-agents` `10.80.9.64/26` (agents) |
 | prod, eastus2 | `vnet-ctm-build` | build, peer_to `[vnet-dev-utility, vnet-prod-utility, vnet-dr-utility]` | `10.90.0.0/24` | `snet-ctm-build` `10.90.0.0/26` (build) |
 
@@ -105,10 +106,11 @@ that one pair and reports it in `unresolvedPeerings` — deploy it from the
   subnet and the em/server/agents/build subnets allow SSH 22 **only** from
   these CIDRs (the prod prefix also covers Bastion → DR over the global
   peering). Append jump-host/operator CIDRs as needed.
-* `user_access_cidrs` in prod MUST keep the appgw subnet prefix
-  (`10.70.2.64/26`): the gateway's backend connections to the EM internal LBs
-  of **both** regions ride the em-subnet 443/8443 rule. Append the operator
-  networks that should reach Control-M Web / the Automation API.
+* `user_access_cidrs` in prod MUST keep **both** appgw subnet prefixes
+  (primary `10.70.2.64/26` and DR `10.80.2.0/26`): each gateway's backend
+  connections to the EM internal LBs of **both** regions ride the em-subnet
+  443/8443 rule. Append the operator networks that should reach Control-M
+  Web / the Automation API.
 
 ### What stays bring-your-own even in Option A
 
@@ -133,7 +135,7 @@ must provide.
 |-----------|-------------|----------------|------------------|
 | **Utility VNet** (one per platform) | `network.utility.*` | `em_subnet_name` (em), `data_subnet_name` (data), `pe_subnet_name` (pe), `AzureBastionSubnet` (bastion), `snet-ctm-appgw` (appgw, prod), `snet-ctm-func` (func) | EM VMs + internal LB frontend; PostgreSQL (delegated); private endpoints; Azure Bastion; the private Application Gateway (`ctm-global`); the kvsync Function's VNet integration |
 | **Server VNet** (one per Control-M/Server, REQUIRED) | `servers.<stage>.network.*` | `server_subnet_name` (server), `agents_subnet_name` (agents) | the stage's Server VM pair; its agent VM scale set |
-| **DR utility VNet** (prod only) | `dr.network.utility.*` | em, data, pe | failed-over EM VMs + DR LB frontend; PostgreSQL replica; DR private endpoints |
+| **DR utility VNet** (prod only) | `dr.network.utility.*` | em, data, pe, `snet-ctm-appgw` (appgw, when `access.appgw.dr_instance`) | failed-over EM VMs + DR LB frontend; PostgreSQL replica; DR private endpoints; the **DR gateway twin** (`ctm-prod-dr-appgw`) |
 | **DR server VNet** (one per DR-protected Server) | `dr.server_networks.<stage>.*` | server, agents | the stage's failed-over Server VMs; its warm agent scale set |
 | **Build VNet** (prod config) | `build_agents.network.*` | `snet-ctm-build` (build) | the `ctm-build-agents` VM scale set (Azure DevOps elastic pool) |
 
@@ -148,7 +150,7 @@ Subnet sizing and must-haves:
 | data | /28 minimum (/27 shipped) | **delegation to `Microsoft.DBforPostgreSQL/flexibleServers`**, nothing else in it |
 | pe | /27 | private endpoint network policies disabled (default) |
 | bastion | **/26 minimum**, name **exactly `AzureBastionSubnet`** | **no NSG** (Azure Bastion manages its own data plane); only in regions where `access.bastion.enabled` |
-| appgw | /26 (Application Gateway v2 wants room to scale) | dedicated to the gateway; NSG must admit GatewayManager 65200-65535; prod utility VNet only |
+| appgw | /26 (Application Gateway v2 wants room to scale) | dedicated to the gateway; NSG must admit GatewayManager 65200-65535; prod utility VNet — plus the DR utility VNet when `access.appgw.dr_instance` (the DR gateway twin's own subnet) |
 | func | /26 | **delegation to `Microsoft.Web/serverFarms`**, nothing else in it; only where `kv_sync.enabled` |
 | server | /28 | outbound internet as above |
 | agents | /24 minimum, /22 recommended for the prod pool | outbound internet as above |
@@ -193,11 +195,11 @@ path):
 | 3 | Agents → Automation API (via the internal LB) | agents subnet → utility em subnet | TCP 8443 |
 | 4 | Every node → private endpoints | all em/server/agents subnets → utility pe subnet | TCP 443 (Key Vault + **blob: the node-install script for every node — agent scale sets included, via the shared node identity — and the EM/Server installer media**; v4.1: the agent itself is baked into the ctm-agent image), TCP 2049 (NFS) |
 | 5 | Agent ⇄ Server | agents subnet ⇄ server subnet (same VNet unless relocated) | TCP 7005-7006 |
-| 6 | Users / API clients → `ctm-global` | operator CIDRs (+ any platform VNet) → appgw frontend (snet-ctm-appgw) | TCP 443, 8443 |
-| 7 | Application Gateway → primary internal LB | snet-ctm-appgw → prod utility em subnet | TCP 8443 (backend + TCP health probe) |
-| 8 | Application Gateway → **DR** internal LB | snet-ctm-appgw → DR utility em subnet, over the **global** utility ⇄ utility peering | TCP 8443 (backend + probe; healthy-only routing = automatic primary/DR) |
+| 6 | Users / API clients → `ctm-global` | operator CIDRs (+ any platform VNet) → each gateway frontend (the primary **and**, with `dr_instance`, the DR twin's snet-ctm-appgw) | TCP 443, 8443 |
+| 7 | Each Application Gateway → primary internal LB | both regions' snet-ctm-appgw → prod utility em subnet (the DR twin crosses the **global** peering) | TCP 8443 (backend + TCP health probe) |
+| 8 | Each Application Gateway → **DR** internal LB | both regions' snet-ctm-appgw → DR utility em subnet (the primary gateway crosses the **global** peering) | TCP 8443 (backend + probe; healthy-only routing = automatic primary/DR) |
 | 9 | Azure Bastion → every node + build agent | AzureBastionSubnet → em/server/agents/build subnets (DR via the global peering) | TCP 22 |
-| 10 | GatewayManager → Application Gateway | service tag → snet-ctm-appgw | TCP 65200-65535 (v2 control plane) |
+| 10 | GatewayManager → each Application Gateway | service tag → every snet-ctm-appgw (both regions) | TCP 65200-65535 (v2 control plane) |
 | 11 | kvsync Function → Key Vault | snet-ctm-func → utility pe subnet (KV private endpoint) | TCP 443 |
 | 12 | kvsync Function → EM Automation API | snet-ctm-func → utility em subnet (internal LB) | TCP 8443 |
 | 13 | Build agents → nonprod/prod/DR private endpoints | snet-ctm-build → each utility pe subnet, over the build peerings | TCP 443 (Key Vault secrets officer ops, blob media/script uploads) |
@@ -254,7 +256,7 @@ build VNet's PE traffic (flow 13) arrives over peering regardless.
 **No NSG.** The subnet is named exactly `AzureBastionSubnet` and Azure
 Bastion manages its own data plane. Keep its prefix in `bastion_cidrs`.
 
-### Application Gateway subnet (prod utility VNet)
+### Application Gateway subnet (prod utility VNet; also the DR utility VNet with `access.appgw.dr_instance`)
 
 | Priority | Direction | Source | Ports | Note |
 |----------|-----------|--------|-------|------|
@@ -283,11 +285,19 @@ deny the rest; outbound open (flows 13-14).
   platform (utility + each server VNet + relocated-agents VNets +
   `network.extra_dns_vnets`). VM hostnames resolve across VNets; the managed
   aliases are `ctm-web` (A → that region's LB frontend), `ctm-db` (CNAME →
-  PostgreSQL / the DR replica) and — new in v4, prod primary zone only —
-  **`ctm-global` (A → the Application Gateway's static private frontend IP,
-  created by the access phase)**. Clients in any linked VNet use
-  `https://ctm-global.prod.ctm.internal` and land on whichever region's EM is
-  healthy; `ctm-web` stays the region-local alias.
+  PostgreSQL / the DR replica) and — prod only — **`ctm-global` (A → an
+  Application Gateway's static private frontend IP, created by the access
+  phase)**. This is the **two-gateway entry pattern**
+  (`access.appgw.dr_instance`): each regional copy of the zone carries its
+  own `ctm-global` record pointing at the **local** gateway — the primary
+  zone's at `ctm-prod-appgw`, the DR zone copy's at the twin
+  `ctm-prod-dr-appgw`. Both gateways hold the **same** backend pool (primary
+  + DR internal LBs, healthy-only routing), so a client lands on the active
+  EM whichever gateway its region's zone link resolves to — and VNets linked
+  to the DR zone copy keep a working entry when the whole primary region
+  (gateway included) is lost. Clients use
+  `https://ctm-global.prod.ctm.internal`; `ctm-web` stays the region-local
+  alias. (Without `dr_instance` only the primary zone carries the record.)
 * Private endpoints need the standard zones
   `privatelink.blob.core.windows.net`, `privatelink.file.core.windows.net`,
   `privatelink.vaultcore.azure.net` and a `<x>.postgres.database.azure.com`
@@ -331,6 +341,7 @@ state and the durable task hub, never platform secrets.
 | Resource | Where | Note |
 |---|---|---|
 | `ctm-global` A record → appgw private frontend IP | `prod.ctm.internal` (primary zone) | the gateway IP is static (derived from the subnet prefix), so the record never drifts |
+| `ctm-global` A record → the **DR twin's** private frontend IP | `prod.ctm.internal` (**DR zone copy**, DR platform RG) | with `access.appgw.dr_instance`; same static-IP property — the two-gateway entry pattern above |
 | Bastion public IP `ctm-<env>-bastion-pip` | platform RG | Azure Bastion's own control-plane endpoint — **not** an entry point to any VM; sessions terminate on private addresses |
 
 ### Zone-link matrix
@@ -356,7 +367,14 @@ one more everywhere if you add `vnet-ctm-build` to `extra_dns_vnets`.
   spaces must not overlap (they never do in the shipped plan).
 * Platform secrets, DNS aliases and hostnames are identical in both regions,
   so failover needs no application reconfiguration; `ctm-global` follows the
-  healthy region automatically through the gateway's TCP health probe.
+  healthy region automatically through each gateway's TCP health probe, and
+  with `access.appgw.dr_instance` the **DR gateway twin** keeps the entry
+  itself alive through a primary-region loss (the DR zone copy's `ctm-global`
+  already points at the twin; `ctmdeploy failover` re-asserts it). Corporate
+  DNS forwarders that resolve `*.ctm.internal` through **primary-region**
+  VNets (or a primary-region DNS Private Resolver) are the remaining
+  dependency — their forwarder target may need switching to a DR-region
+  resolver during a regional outage.
 
 ## Packer builds
 

@@ -1,16 +1,25 @@
 # ---------------------------------------------------------------------------
 # DR failover (primary region -> DR region), the SDK port of the retired
 # scripts/dr-failover.sh: promote the PG replica, ASR unplanned failover of
-# the EM/Server VMs, re-point ctm-db in the DR private zone, scale the DR
+# the EM/Server VMs, re-point ctm-db in the DR private zone, re-assert
+# ctm-global at the DR gateway twin (access.appgw.dr_instance), scale the DR
 # agent pools to each Server's agents.min read from config.yaml (no tfvars).
 # ---------------------------------------------------------------------------
 """``ctmdeploy failover --env prod [--test] [--yes]``.
 
-Steps (identical to the old runbook script):
+Steps (1-3 and 5 identical to the old runbook script):
   1. Promote the PostgreSQL cross-region replica to a standalone server.
   2. Fail over EM/Server VMs with Azure Site Recovery (latest recovery point).
   3. Point ctm-db.<env>.ctm.internal in the DR private zone at the promoted DB.
-  4. Scale each DR agent scale set to the Server's production minimum.
+  4. Re-assert ctm-global at the DR gateway twin's private IP (only when
+     ``access.appgw.dr_instance``): an idempotent upsert in the DR copy of the
+     platform zone — the access phase already created that record — and a
+     BEST-EFFORT upsert in the primary zone copy (skipped with a warning when
+     the primary region is unreachable). The twin's IP is read LIVE from the
+     gateway via the SDK (a GET against the DR-region resource, so it works
+     during a primary-region loss) rather than derived from config — the live
+     frontend is authoritative even if the bicep IP derivation ever changes.
+  5. Scale each DR agent scale set to the Server's production minimum.
 ``--test`` runs a Site Recovery test failover only (no DB promotion, no DNS
 change). Azure SDK imports are guarded inside the functions that need them.
 """
@@ -33,6 +42,12 @@ Failover issued. Next (see docs/DR-RUNBOOK.md):
   * re-point Traffic Manager / users to the DR load balancer if not automatic
   * run 'ctmdeploy deploy --env {env}' later to reconcile the platform (the replica is now standalone)
 """
+
+FORWARDER_NOTE = """\
+    note: corporate DNS forwarders that resolve *.ctm.internal through
+    primary-region VNets (or a primary-region DNS Private Resolver) may need
+    their forwarder target switched to a DR-region resolver before on-prem
+    clients see ctm-global resolve to the DR gateway."""
 
 
 class FailoverError(RuntimeError):
@@ -114,7 +129,7 @@ def _promote_replica(cfg: EnvironmentConfig, credential: "TokenCredential") -> s
     from azure.mgmt.postgresqlflexibleservers import models as pg_models
 
     client = PostgreSQLManagementClient(credential, cfg.subscription_id)
-    print("== 1/4 promoting PostgreSQL replica")
+    print("== 1/5 promoting PostgreSQL replica")
     client.servers.begin_update(
         cfg.dr_resource_group_name,
         cfg.replica_name,
@@ -135,7 +150,7 @@ def _unplanned_failover(client: Any, cfg: EnvironmentConfig) -> None:
             "no replication-protected items found in "
             f"{cfg.asr_container_primary}; run `ctmdeploy deploy --phase replication` first"
         )
-    print("== 2/4 Site Recovery unplanned failover of EM/Server VMs")
+    print("== 2/5 Site Recovery unplanned failover of EM/Server VMs")
     pollers = []
     for name in names:
         pollers.append(
@@ -164,7 +179,7 @@ def _upsert_db_cname(cfg: EnvironmentConfig, credential: "TokenCredential", fqdn
     from azure.mgmt.privatedns import PrivateDnsManagementClient
     from azure.mgmt.privatedns import models as dns_models
 
-    print(f"== 3/4 ensuring ctm-db.{cfg.private_dns_zone_name} -> {fqdn} in the DR private zone")
+    print(f"== 3/5 ensuring ctm-db.{cfg.private_dns_zone_name} -> {fqdn} in the DR private zone")
     client = PrivateDnsManagementClient(credential, cfg.subscription_id)
     client.record_sets.create_or_update(
         cfg.dr_resource_group_name,
@@ -175,6 +190,88 @@ def _upsert_db_cname(cfg: EnvironmentConfig, credential: "TokenCredential", fqdn
     )
 
 
+def _dr_appgw_private_ip(cfg: EnvironmentConfig, credential: "TokenCredential") -> str:
+    """Private frontend IP of the DR gateway twin, read LIVE via the SDK.
+
+    Robust path: the GET is an ARM read of a DR-region resource, so it keeps
+    working while the primary region is down, and the live frontend IP is
+    authoritative — unlike re-deriving cidrHost(prefix, 3) from the config
+    plan, it cannot drift from what the gateway actually serves. Returns ''
+    when the gateway does not exist (the access phase has not deployed the
+    twin yet).
+    """
+    from azure.core.exceptions import ResourceNotFoundError
+    from azure.mgmt.network import NetworkManagementClient
+
+    client = NetworkManagementClient(credential, cfg.subscription_id)
+    try:
+        appgw = client.application_gateways.get(cfg.dr_resource_group_name, cfg.dr_appgw_name)
+    except ResourceNotFoundError:
+        return ""
+    for frontend in appgw.frontend_ip_configurations or []:
+        ip = getattr(frontend, "private_ip_address", None)
+        if ip:
+            return str(ip)
+    return ""
+
+
+def _upsert_ctm_global(cfg: EnvironmentConfig, credential: "TokenCredential") -> None:
+    """Step 4/5: assert ctm-global -> the DR gateway twin's private IP.
+
+    The access phase already created the record in the DR zone copy (it
+    points at the twin from day one), so the DR upsert is an idempotent
+    re-assert; the PRIMARY zone copy is updated best-effort only — clients
+    still resolving through primary-region VNet links get moved to the DR
+    gateway too, but an unreachable primary region must never fail the
+    failover. Skipped (with a note) when the twin is not configured/deployed.
+    """
+    print("== 4/5 re-pointing ctm-global at the DR gateway twin")
+    if not (
+        cfg.environment == "prod"
+        and cfg.access.appgw_enabled
+        and cfg.access.appgw_dr_instance
+    ):
+        print(
+            "    skipped: access.appgw.dr_instance is not enabled — no DR gateway "
+            "twin; ctm-global keeps relying on the primary gateway's health probe"
+        )
+        return
+    ip = _dr_appgw_private_ip(cfg, credential)
+    if not ip:
+        print(
+            f"    skipped: DR gateway {cfg.dr_appgw_name} not found in "
+            f"{cfg.dr_resource_group_name} (deploy `--phase access` to create the twin)"
+        )
+        return
+
+    from azure.mgmt.privatedns import PrivateDnsManagementClient
+    from azure.mgmt.privatedns import models as dns_models
+
+    client = PrivateDnsManagementClient(credential, cfg.subscription_id)
+    record = dns_models.RecordSet(
+        ttl=60, a_records=[dns_models.ARecord(ipv4_address=ip)]
+    )
+    # DR zone copy: the authoritative entry for every DR-linked VNet
+    # (idempotent — the access phase created this exact record).
+    client.record_sets.create_or_update(
+        cfg.dr_resource_group_name, cfg.private_dns_zone_name, "A", "ctm-global", record
+    )
+    print(f"    DR zone copy: ctm-global.{cfg.private_dns_zone_name} -> {ip}")
+    # Primary zone copy: BEST-EFFORT (its resource group lives in the lost
+    # region; private DNS is a global service but the write may still fail).
+    try:
+        client.record_sets.create_or_update(
+            cfg.resource_group_name, cfg.private_dns_zone_name, "A", "ctm-global", record
+        )
+        print(f"    primary zone copy: ctm-global.{cfg.private_dns_zone_name} -> {ip}")
+    except Exception as exc:  # noqa: BLE001 - best-effort by design
+        print(
+            "    warning: could not update ctm-global in the PRIMARY zone copy "
+            f"(continuing — expected while the primary region is unreachable): {exc}"
+        )
+    print(FORWARDER_NOTE)
+
+
 def _scale_dr_agent_pools(cfg: EnvironmentConfig, credential: "TokenCredential") -> None:
     """Scale ctm-<env>-dr-agents-<stage> to agents.min from config (default 1).
 
@@ -183,7 +280,7 @@ def _scale_dr_agent_pools(cfg: EnvironmentConfig, credential: "TokenCredential")
     """
     from azure.mgmt.compute import ComputeManagementClient
 
-    print("== 4/4 scaling DR agent pools (one per DR-protected Control-M/Server)")
+    print("== 5/5 scaling DR agent pools (one per DR-protected Control-M/Server)")
     client = ComputeManagementClient(credential, cfg.subscription_id)
     for stage in cfg.dr_servers():
         server = cfg.servers[stage]
@@ -236,6 +333,7 @@ def run(
     fqdn = _promote_replica(cfg, credential)
     _unplanned_failover(asr, cfg)
     _upsert_db_cname(cfg, credential, fqdn)
+    _upsert_ctm_global(cfg, credential)
     _scale_dr_agent_pools(cfg, credential)
     print(CHECKLIST.format(env=cfg.environment))
     return 0

@@ -22,6 +22,9 @@ dependencies = [
     "azure-mgmt-recoveryservicessiterecovery>=1.2",
     "azure-mgmt-postgresqlflexibleservers>=1.0",
     "azure-mgmt-privatedns>=1.1",
+    # Failover step 4/5: reads the DR gateway twin's LIVE private frontend IP
+    # (GET the Application Gateway) before re-asserting the ctm-global record.
+    "azure-mgmt-network>=25.3",
     "azure-mgmt-compute>=33.0",
     # Reads existing object-replication policy/rule ids so DR re-deploys
     # converge instead of creating duplicate policies (idempotency).

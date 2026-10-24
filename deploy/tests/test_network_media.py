@@ -693,6 +693,25 @@ def test_poc_network_plan_validates_prod() -> None:
     )
 
 
+def test_poc_network_plan_dr_utility_has_the_appgw_subnet() -> None:
+    """The DR gateway twin's subnet ships in the prod plan (both inputs are
+    kept in sync with network/params/prod.bicepparam by hand)."""
+    cfg = _poc_config("prod")
+    dr_utility = cfg.network_infrastructure.vnet("vnet-dr-utility")
+    assert dr_utility is not None
+    appgw = dr_utility.subnet_by_role("appgw")
+    assert appgw is not None and appgw.name == "snet-ctm-appgw"
+    assert appgw.prefix == "10.80.2.0/26"
+    # The access phase resolves the twin's subnet id from this entry.
+    assert cfg.appgw_subnet_id("dr").endswith(
+        "/virtualNetworks/vnet-dr-utility/subnets/snet-ctm-appgw"
+    )
+    # Each gateway's backend connections ride the em-subnet user-access rule:
+    # BOTH appgw subnet prefixes must stay in user_access_cidrs.
+    cidrs = set(cfg.network_infrastructure.user_access_cidrs)
+    assert {"10.70.2.64/26", "10.80.2.0/26"} <= cidrs
+
+
 def test_poc_media_block_parses() -> None:
     for env in ("nonprod", "prod"):
         raw = _raw_env_config(env)

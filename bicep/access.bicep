@@ -4,7 +4,11 @@
 //      private SSH to every node and build agent, DR included via peering.
 //   2. PRIVATE Application Gateway Standard_v2 (prod only - the orchestrator
 //      gates it): layer-4 TCP 443/8443 across BOTH regional internal LBs,
-//      plus the ctm-global A record in the platform private DNS zone.
+//      plus the ctm-global A record in the platform private DNS zone. With
+//      drAppgwEnabled a DR TWIN of the gateway deploys into the DR utility
+//      VNet (same two-LB backend pool, its own private frontend) and the DR
+//      COPY of the platform zone gets its ctm-global record pointed at the
+//      twin - the private entry point survives a primary-region loss.
 //   3. Key Vault -> Control-M sync Durable Function infra (EP1 plan, storage,
 //      python 3.11 app, system MI + Key Vault Secrets User, VNet-integrated).
 //   4. Azure DevOps build-agent VMSS in its own resource group (created here).
@@ -38,6 +42,18 @@ param appgwBackendIps array = []
 
 @description('Platform private DNS zone name (e.g. prod.ctm.internal); the gateway adds the ctm-global A record to it.')
 param dnsZoneName string
+
+@description('Deploy a DR TWIN of the private gateway in the DR utility VNet (prod + dr.enabled + access.appgw.dr_instance): same backend pool (both regional LBs), its own private frontend, plus the ctm-global A record in the DR copy of the platform zone.')
+param drAppgwEnabled bool = false
+
+@description('snet-ctm-appgw subnet id in the DR utility VNet; required when drAppgwEnabled.')
+param drAppgwSubnetId string = ''
+
+@description('DR platform resource group (ctm-<env>-dr-rg): hosts the DR gateway twin and the DR copy of the platform private DNS zone; required when drAppgwEnabled.')
+param drPlatformRgName string = ''
+
+@description('DR region; the DR gateway twin deploys there. Required when drAppgwEnabled.')
+param drLocation string = ''
 
 @description('Deploy the Key Vault -> Control-M sync Function infrastructure (code arrives via `ctmdeploy kvsync deploy`).')
 param kvSyncEnabled bool
@@ -97,6 +113,28 @@ module appgw 'modules/appgw.bicep' = if (appgwEnabled) {
   }
 }
 
+// DR TWIN of the gateway (drAppgwEnabled): the SAME module scoped to the DR
+// platform resource group, so its `existing` zone reference resolves to the
+// DR COPY of the platform zone - ctm-global THERE points at the twin while
+// the primary zone's record (created above) keeps pointing at the primary
+// gateway. Both gateways balance the same two internal LBs with healthy-only
+// routing, so either entry reaches the active region's EM - and the DR entry
+// keeps answering when the primary region is lost. The scope expression falls
+// back to platformRgName only to stay deployable while disabled (ARM
+// evaluates a conditional module's scope regardless of its condition).
+module drAppgw 'modules/appgw.bicep' = if (drAppgwEnabled) {
+  name: '${name}-dr-appgw'
+  scope: resourceGroup(empty(drPlatformRgName) ? platformRgName : drPlatformRgName)
+  params: {
+    name: '${name}-dr' // -> gateway '<name>-dr-appgw' (module appends -appgw)
+    location: drLocation
+    subnetId: drAppgwSubnetId
+    backendIps: appgwBackendIps
+    dnsZoneName: dnsZoneName
+    tags: tags
+  }
+}
+
 // ---------------- 3. Key Vault -> Control-M sync Function ----------------
 module kvsync 'modules/function-kvsync.bicep' = if (kvSyncEnabled) {
   name: '${name}-access-kvsync'
@@ -143,6 +181,9 @@ module buildPool 'modules/build-agents.bicep' = if (buildAgentsEnabled) {
 output bastionId string = bastionEnabled ? bastion!.outputs.bastionId : ''
 output appgwPrivateIp string = appgwEnabled ? appgw!.outputs.privateIp : ''
 output ctmGlobalFqdn string = appgwEnabled ? 'ctm-global.${dnsZoneName}' : ''
+
+@description('Static private frontend IP of the DR gateway twin (the ctm-global record in the DR zone copy points here); empty when drAppgwEnabled is false.')
+output drAppgwPrivateIp string = drAppgwEnabled ? drAppgw!.outputs.privateIp : ''
 output kvsyncFunctionAppName string = kvSyncEnabled ? kvsync!.outputs.functionAppName : ''
 output kvsyncPrincipalId string = kvSyncEnabled ? kvsync!.outputs.principalId : ''
 output buildAgentsVmssId string = buildAgentsEnabled ? buildPool!.outputs.vmssId : ''

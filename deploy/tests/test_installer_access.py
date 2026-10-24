@@ -573,9 +573,11 @@ def test_shims_fetch_and_run_the_node_installer() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _synthetic_prod_config() -> cfgmod.EnvironmentConfig:
-    """A prod config with DR + access + kv_sync + build_agents + the network
-    plan entries the access phase derives its subnet ids from."""
+def _synthetic_prod_config_data(*, dr_instance: bool = False) -> dict[str, Any]:
+    """Raw config dict: prod with DR + access + kv_sync + build_agents + the
+    network plan entries the access phase derives its subnet ids from. With
+    dr_instance=True, access.appgw.dr_instance is set and the DR utility VNet
+    joins the plan with an appgw-role subnet (the DR gateway twin's)."""
     data: dict[str, Any] = {
         "subscription_id": cfgmod.PLACEHOLDER_SUBSCRIPTION_ID,
         "environment": "prod",
@@ -670,7 +672,27 @@ def _synthetic_prod_config() -> cfgmod.EnvironmentConfig:
             },
         },
     }
-    return _load_dict(data)
+    if dr_instance:
+        data["access"]["appgw"]["dr_instance"] = True
+        data["network_infrastructure"]["vnets"].append(
+            {
+                "name": "vnet-dr-utility",
+                "resource_group_name": "rg-net-dr",
+                "location": "centralus",
+                "role": "utility",
+                "address_space": "10.80.0.0/22",
+                "subnets": [
+                    {"name": "snet-em", "prefix": "10.80.0.0/24", "role": "em"},
+                    {"name": "snet-data", "prefix": "10.80.1.0/27", "role": "data"},
+                    {"name": "snet-appgw", "prefix": "10.80.2.0/26", "role": "appgw"},
+                ],
+            }
+        )
+    return data
+
+
+def _synthetic_prod_config(*, dr_instance: bool = False) -> cfgmod.EnvironmentConfig:
+    return _load_dict(_synthetic_prod_config_data(dr_instance=dr_instance))
 
 
 def _foundation_outputs(prefix: str) -> dict[str, Any]:
@@ -731,6 +753,10 @@ def test_access_phase_param_derivation_prod() -> None:
         "appgwSubnetId",
         "appgwBackendIps",
         "dnsZoneName",
+        "drAppgwEnabled",
+        "drAppgwSubnetId",
+        "drPlatformRgName",
+        "drLocation",
         "kvSyncEnabled",
         "funcSubnetId",
         "keyVaultId",
@@ -751,6 +777,10 @@ def test_access_phase_param_derivation_prod() -> None:
     # primary first, DR second (healthy-only routing = automatic failover).
     assert params["appgwBackendIps"] == ["10.70.0.10", "10.80.0.10"]
     assert params["dnsZoneName"] == "prod.ctm.internal"
+    # dr_instance is absent from this config -> the DR gateway twin stays off.
+    assert params["drAppgwEnabled"] is False
+    assert params["drAppgwSubnetId"] == ""
+    assert params["drPlatformRgName"] == "" and params["drLocation"] == ""
     assert params["kvSyncEnabled"] is True
     assert params["funcSubnetId"].endswith("/subnets/snet-func")
     assert params["keyVaultId"].endswith("/vaults/ctm-prod-kv-p01")
@@ -844,9 +874,96 @@ def test_access_phase_nonprod_is_bastion_and_kvsync_only() -> None:
     assert params["bastionEnabled"] is True
     assert params["appgwEnabled"] is False  # honored on prod only
     assert params["appgwBackendIps"] == [] and params["appgwSubnetId"] == ""
+    assert params["drAppgwEnabled"] is False  # no gateway -> no DR twin
+    assert params["drAppgwSubnetId"] == "" and params["drPlatformRgName"] == ""
     assert params["kvSyncEnabled"] is True
     assert params["buildAgents"]["enabled"] is False
     assert params["buildAgents"]["sshPublicKey"] == ""  # nothing resolved
+
+
+def test_access_appgw_dr_instance_parses_and_defaults_off() -> None:
+    """access.appgw.dr_instance: bool, default false, validated at load."""
+    # Default: absent -> False (the shipped nonprod shape is untouched).
+    assert _synthetic_prod_config().access.appgw_dr_instance is False
+
+    # Enabled: parses, and the DR gateway placement resolves from the plan.
+    cfg = _synthetic_prod_config(dr_instance=True)
+    assert cfg.access.appgw_dr_instance is True
+    assert cfg.appgw_subnet_id("dr").endswith(
+        "/virtualNetworks/vnet-dr-utility/subnets/snet-appgw"
+    )
+    # Deterministic twin name (bicep: '<name>-dr' + '-appgw').
+    assert cfg.appgw_name == "ctm-prod-appgw"
+    assert cfg.dr_appgw_name == "ctm-prod-dr-appgw"
+
+    # Not a bool -> the usual type error.
+    broken = _synthetic_prod_config_data()
+    broken["access"]["appgw"]["dr_instance"] = "yes"
+    try:
+        _load_dict(broken)
+    except cfgmod.ConfigError as exc:
+        assert "dr_instance" in str(exc) and "boolean" in str(exc)
+    else:
+        raise AssertionError("a non-bool dr_instance was accepted")
+
+
+def test_access_appgw_dr_instance_requires_the_dr_appgw_subnet() -> None:
+    """dr_instance needs an appgw-role subnet in the DR utility VNet plan."""
+    # dr_instance set but NO DR utility VNet entry in the plan at all.
+    data = _synthetic_prod_config_data()
+    data["access"]["appgw"]["dr_instance"] = True
+    try:
+        _load_dict(data)
+    except cfgmod.ConfigError as exc:
+        message = str(exc)
+        assert "dr_instance" in message and "appgw" in message
+        assert "vnet-dr-utility" in message
+    else:
+        raise AssertionError("dr_instance without a DR utility plan entry was accepted")
+
+    # DR utility VNet declared but WITHOUT an appgw-role subnet.
+    data = _synthetic_prod_config_data(dr_instance=True)
+    dr_vnet = data["network_infrastructure"]["vnets"][-1]
+    assert dr_vnet["name"] == "vnet-dr-utility"
+    dr_vnet["subnets"] = [s for s in dr_vnet["subnets"] if s["role"] != "appgw"]
+    try:
+        _load_dict(data)
+    except cfgmod.ConfigError as exc:
+        message = str(exc)
+        assert "dr_instance" in message and "role-'appgw'" in message
+    else:
+        raise AssertionError("dr_instance without an appgw-role DR subnet was accepted")
+
+    # The flag is inert when dr.enabled is false: nothing is validated.
+    data = _synthetic_prod_config_data()
+    data["access"]["appgw"]["dr_instance"] = True
+    data["dr"] = {"enabled": False}
+    cfg = _load_dict(data)
+    assert cfg.access.appgw_dr_instance is True  # parsed, but meaningless
+
+
+def test_access_phase_params_carry_the_dr_gateway_trio() -> None:
+    """prod + dr.enabled + dr_instance -> the access params enable the twin."""
+    cfg = _synthetic_prod_config(dr_instance=True)
+    engine = _engine_with_outputs(cfg)
+    captured: dict[str, Any] = {}
+
+    def fake_deploy(scope, name, template, params, what_if):
+        captured.update(params=params)
+        return []
+
+    engine._deploy = fake_deploy  # type: ignore[method-assign]
+    engine.phase_access()
+    params = captured["params"]
+    assert params["appgwEnabled"] is True
+    assert params["drAppgwEnabled"] is True
+    assert params["drAppgwSubnetId"].endswith(
+        "/virtualNetworks/vnet-dr-utility/subnets/snet-appgw"
+    )
+    assert params["drPlatformRgName"] == "ctm-prod-dr-rg"
+    assert params["drLocation"] == "centralus"
+    # Both gateways share ONE backend-IP pair: primary LB first, DR LB second.
+    assert params["appgwBackendIps"] == ["10.70.0.10", "10.80.0.10"]
 
 
 def test_access_phase_skips_when_everything_disabled() -> None:

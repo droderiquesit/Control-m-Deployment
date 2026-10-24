@@ -22,7 +22,12 @@ carrying a public IP; on prod a **private Application Gateway** (layer-4 TCP
 443/8443, static private frontend, backend pool = the primary **and** DR
 internal LB frontends) publishes **`ctm-global`** — a single alias that
 follows whichever region's EM answers the TCP health probe, giving automatic
-primary/DR behavior; and the **kvsync Durable Function** (VNet-integrated
+primary/DR behavior. With `access.appgw.dr_instance` (the shipped prod
+config) the gateway gets a **DR twin** in the DR utility VNet — same two-LB
+backend pool, its own private frontend — and each regional copy of the
+platform zone resolves `ctm-global` to its **local** gateway, so the private
+entry point itself survives a primary-region loss (the twin pattern); and
+the **kvsync Durable Function** (VNet-integrated
 into `snet-ctm-func`) mirrors Key Vault secrets tagged `ctm-sync=true` into
 Control-M's secret store through the EM Automation API. A dedicated **build
 VNet** hosts the `ctm-build-agents` scale set — Azure DevOps elastic-pool
@@ -82,6 +87,7 @@ flowchart TB
       LBD[Standard Load Balancer]
       PGR["PostgreSQL read replica<br/>all databases, ctm_uat included<br/>(promote on failover)"]
       ASREM["Site Recovery target: ctm-em-a/b<br/>(em subnet)"]
+      AGWD["DR gateway TWIN, L4 TCP<br/>ctm-global via the DR zone copy<br/>snet-ctm-appgw (access.appgw.dr_instance)"]
       KVD[(Key Vault replica secrets)]
       BLOBD[(Blob - object replication)]
     end
@@ -95,6 +101,9 @@ flowchart TB
   U -->|"443/8443 ctm-global"| AGW
   AGW -->|"8443 + TCP probe"| LB
   AGW ==>|"8443 via utility-to-utility GLOBAL peering"| LBD
+  U -.->|"443/8443 ctm-global (DR zone copy)"| AGWD
+  AGWD -->|"8443 + TCP probe"| LBD
+  AGWD ==>|"8443 via the GLOBAL peering"| LB
   U --> LB
   LB --> EMA
   LB -. standby .-> EMB
@@ -326,7 +335,15 @@ regions in rotation, so `ctm-global.<zone>` follows the active EM
 automatically — DR joins the moment its EM answers, with no DNS edit and no
 runbook step. An internal load balancer cannot do this (its backends must be
 NICs in its own region/VNet); Traffic Manager could, but only for public
-endpoints.
+endpoints. **Why a DR twin of the gateway** (`access.appgw.dr_instance`): a
+single gateway is itself a primary-region resource — lose the region and the
+entry point dies with it, however healthy the DR backend is. The twin in the
+DR utility VNet shares the same two-LB backend pool, and each regional copy
+of the platform zone resolves `ctm-global` to its local gateway, so clients
+in DR-linked VNets keep a working entry through a full primary-region loss;
+`ctmdeploy failover` merely re-asserts the records (idempotent in the DR zone
+copy, best-effort in the primary one) and reminds operators about corporate
+DNS forwarders that resolve through primary-region VNets.
 
 **Why Azure Bastion.** No platform VM carries a public IP, and the old
 assumption of a customer-provided jump host left SSH access undefined.
