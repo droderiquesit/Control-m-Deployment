@@ -1,0 +1,59 @@
+# ---------------------------------------------------------------------------
+# ctmdeploy — python orchestrator for the Control-M on Azure platform.
+# Compiles/deploys Bicep, seeds Key Vault secrets, renders cloud-init shims
+# (the real install logic lives in node-scripts/ctm_node_install.py, uploaded
+# to blob by the compute phase), moves installer media, zip-deploys the
+# kvsync Durable Function, enables ASR replication and drives DR failover.
+# Install: pip install -e deploy/
+# ---------------------------------------------------------------------------
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ctmdeploy"
+version = "1.0.0"
+description = "Deployment orchestrator for the BMC Control-M platform on Azure (Bicep + Python + Packer toolchain)."
+requires-python = ">=3.11"
+dependencies = [
+    "azure-identity>=1.17",
+    "azure-mgmt-resource>=23.1",
+    "azure-keyvault-secrets>=4.8",
+    "azure-mgmt-recoveryservicessiterecovery>=1.2",
+    "azure-mgmt-postgresqlflexibleservers>=1.0",
+    "azure-mgmt-privatedns>=1.1",
+    # Failover step 4/5: reads the DR gateway twin's LIVE private frontend IP
+    # (GET the Application Gateway) before re-asserting the ctm-global record.
+    "azure-mgmt-network>=25.3",
+    "azure-mgmt-compute>=33.0",
+    # Reads existing object-replication policy/rule ids so DR re-deploys
+    # converge instead of creating duplicate policies (idempotency).
+    "azure-mgmt-storage>=21.2",
+    # `ctmdeploy media upload`: pushes the BMC installer media into the
+    # installers blob container of each platform (primary + DR).
+    "azure-storage-blob>=12.19",
+    "PyYAML>=6.0",
+    "cryptography>=42.0",
+]
+
+[project.scripts]
+ctmdeploy = "ctmdeploy.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    # Pinned to the 0.6 series: the repo lints clean here, while newer ruff
+    # releases broadened the default rule set and fail `make lint`.
+    "ruff>=0.6,<0.7",
+]
+
+[tool.setuptools]
+packages = ["ctmdeploy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

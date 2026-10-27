@@ -1,0 +1,228 @@
+# ---------------------------------------------------------------------------
+# NONPROD platform: one Enterprise Manager (single node) managing two
+# Control-M/Servers, CTM_DEV and CTM_QA, each with its own agent pool.
+# Zone-redundant database so QA can rehearse HA; no DR.
+# Network placement v2: the EM + shared services live in the utility VNet;
+# every Control-M/Server runs in its OWN VNet with its agents beside it.
+# Single source of truth: ctmdeploy reads this file and feeds Bicep its params.
+# ---------------------------------------------------------------------------
+subscription_id: "00000000-0000-0000-0000-000000000000"
+environment: nonprod
+location: eastus2
+unique_suffix: n01
+resource_lock: false
+
+tags:
+  costCenter: scheduling
+  owner: platform-team
+
+# Existing networks (select, not create). All VNets pre-exist and must be
+# peered per docs/NETWORK-REQUIREMENTS.md (each server VNet <-> utility VNet).
+network:
+  utility: # EM VMs + internal LB frontend, delegated postgres subnet, private endpoints
+    vnet_name: vnet-dev-utility
+    vnet_resource_group_name: rg-network-nonprod
+    em_subnet_name: snet-ctm-em
+    data_subnet_name: snet-ctm-postgres
+    pe_subnet_name: snet-ctm-pe
+  # Hub-managed private DNS zones (optional keys: blob, file, vault, postgres)
+  # existing_private_dns_zone_ids: { blob: "...", file: "...", vault: "...", postgres: "..." }
+  existing_private_dns_zone_ids: {}
+  # Extra VNets to link into the platform/privatelink DNS zones (e.g. a jump VNet):
+  # extra_dns_vnets: [{vnet_name: ..., vnet_resource_group_name: ...}]
+  extra_dns_vnets: []
+
+# Optional full network ("Option A" in docs/NETWORK-REQUIREMENTS.md): every
+# VNet the placement blocks above reference, provisioned by
+# `ctmdeploy deploy --env nonprod --phase network` (network/main.bicep:
+# resource groups, VNets, subnets, one NSG per subnet — bastion subnet
+# excepted — and every peering, both directions). Default stays bring-your-own
+# (create: false); the vnets list below is the complete PoC address plan, so
+# flipping the one flag provisions it. The cloud team can deploy the SAME plan
+# with az alone from network/params/nonprod.bicepparam (keep the two in sync;
+# see network/README.md). Address spaces are non-overlapping across all
+# platforms (required for DR/failback and build-agent peering).
+network_infrastructure:
+  create: false            # true = ctmdeploy provisions the full network below
+  user_access_cidrs: []    # CIDRs allowed to reach Control-M Web/API (NSG rule)
+  bastion_cidrs:           # CIDRs allowed SSH 22 to nodes. Keep the
+    - "10.60.2.0/26"       # AzureBastionSubnet prefix: Bastion sessions egress
+                           # from it and the agents subnets only allow SSH from
+                           # these CIDRs. Append operator/jump CIDRs as needed.
+  vnets:                   # every VNet referenced by the placement blocks above
+    - name: vnet-dev-utility
+      resource_group_name: rg-network-nonprod
+      location: eastus2
+      role: utility        # utility | spoke | build | external (network/README.md)
+      address_space: 10.60.0.0/22
+      subnets:
+        - {name: snet-ctm-em,       prefix: 10.60.0.0/24,  role: em}
+        - {name: snet-ctm-postgres, prefix: 10.60.1.0/27,  role: data}
+        - {name: snet-ctm-pe,       prefix: 10.60.1.64/26, role: pe}
+        # Azure Bastion (access.bastion.enabled) — the literal subnet name is
+        # an Azure requirement; no NSG (Azure Bastion manages its own plane).
+        - {name: AzureBastionSubnet, prefix: 10.60.2.0/26, role: bastion}
+        # kvsync Function App VNet integration (kv_sync.enabled); delegated
+        # to Microsoft.Web/serverFarms.
+        - {name: snet-ctm-func,     prefix: 10.60.2.64/26, role: func}
+    - name: vnet-ctm-dev
+      resource_group_name: rg-network-nonprod
+      location: eastus2
+      role: spoke
+      peer_to: vnet-dev-utility
+      address_space: 10.60.8.0/24
+      subnets:
+        - {name: snet-ctm-server, prefix: 10.60.8.0/26,  role: server}
+        - {name: snet-ctm-agents, prefix: 10.60.8.64/26, role: agents}
+    - name: vnet-ctm-qa
+      resource_group_name: rg-network-nonprod
+      location: eastus2
+      role: spoke
+      peer_to: vnet-dev-utility
+      address_space: 10.60.9.0/24
+      subnets:
+        - {name: snet-ctm-server, prefix: 10.60.9.0/26,  role: server}
+        - {name: snet-ctm-agents, prefix: 10.60.9.64/26, role: agents}
+
+deployer_ip_cidrs:
+  - "203.0.113.10/32"
+
+key_vault_public_access: true
+
+ctm_version: "9.0.21.300"
+
+# Blob-name overrides for the EM/Server installers / silent XMLs; {} keeps
+# the defaults (same blob names as before the toolchain migration). v4.1:
+# there are NO agent keys — the Control-M/Agent is baked into the ctm-agent
+# golden image, so agent media never reaches the installers container.
+installer_blobs: {}
+
+# Access layer (deployed by `ctmdeploy deploy --env nonprod --phase access`):
+# Azure Bastion into the utility VNet (AzureBastionSubnet in the network
+# plan). appgw is parsed everywhere but HONORED ON PROD ONLY — the private
+# Application Gateway balances the primary and DR internal load balancers,
+# which nonprod does not have.
+access:
+  bastion: {enabled: true}
+  appgw: {enabled: true} # ignored on nonprod (prod-only feature)
+
+# Key Vault -> Control-M secret sync (functions/kvsync Durable Function,
+# infra from the access phase, code via `ctmdeploy kvsync deploy`).
+# COST NOTE: the EP1 Elastic Premium plan keeps a warm instance running;
+# set enabled: false in nonprod if that cost is not worth the rehearsal.
+kv_sync:
+  enabled: true
+  schedule: "0 */15 * * * *" # NCRONTAB (6 fields): every 15 minutes
+
+# Compute Gallery golden images published by Packer (v4.1 two-image model):
+# base = ctm-rhel9 (OS only; EM/Server VMs — packer/ctm-rhel9.pkr.hcl),
+# agent = ctm-agent (OS prep + Control-M/Agent silent-installed but
+# UNCONFIGURED; the agent scale sets — packer/ctm-agent.pkr.hcl). Bumping
+# agent.version + a compute deploy rolls the VMSS model: new instances boot
+# the new image.
+image:
+  gallery_resource_group: ctm-images-rg
+  gallery_name: ctmgallery
+  base:  {definition: ctm-rhel9, version: latest} # or a pinned "1.0.0"
+  agent: {definition: ctm-agent, version: latest}
+
+em:
+  vm_size: Standard_D4s_v5
+  data_disk_gb: 256
+  disk_type: Premium_LRS
+  enable_secondary: false # single EM is enough for nonprod; flip to true to rehearse EM failover
+  zones: ["1", "2"]
+  web_port: 8443
+
+servers:
+  dev:
+    name: CTM_DEV
+    vm_size: Standard_D4s_v5
+    data_disk_gb: 128
+    disk_type: Premium_LRS
+    enable_secondary: false
+    zones: ["1", "2"]
+    network: # REQUIRED: this server's own VNet (isolated from the other servers)
+      vnet_name: vnet-ctm-dev
+      vnet_resource_group_name: rg-network-nonprod
+      server_subnet_name: snet-ctm-server
+      agents_subnet_name: snet-ctm-agents # optional; default = server_subnet_name
+      # Agents may be relocated to another VNet entirely (optional overrides):
+      # agents_vnet_name: null
+      # agents_vnet_resource_group_name: null
+    agents:
+      vm_size: Standard_D2s_v5
+      min: 1
+      max: 2
+      default: 1
+      use_spot: true
+      scale_out_cpu: 70
+      scale_in_cpu: 25
+  qa:
+    name: CTM_QA
+    vm_size: Standard_D4s_v5
+    data_disk_gb: 256
+    disk_type: Premium_LRS
+    enable_secondary: true # Server HA pair, so failover is tested before prod
+    zones: ["1", "2"]
+    network:
+      vnet_name: vnet-ctm-qa
+      vnet_resource_group_name: rg-network-nonprod
+      server_subnet_name: snet-ctm-server
+      agents_subnet_name: snet-ctm-agents
+    agents:
+      vm_size: Standard_D2s_v5
+      min: 1
+      max: 4
+      default: 2
+      use_spot: true
+      scale_out_cpu: 70
+      scale_in_cpu: 25
+
+database:
+  sku_name: GP_Standard_D2ds_v5
+  storage_mb: 131072
+  high_availability_mode: ZoneRedundant
+  backup_retention_days: 7
+  geo_redundant_backup: false
+  postgres_version: "16"
+
+storage:
+  blob_replication_type: ZRS
+  files_replication_type: ZRS
+  shared_share_quota_gb: 256
+
+load_balancer:
+  internal: true
+
+backup:
+  enabled: true
+  storage_mode_type: ZoneRedundant
+  cross_region_restore: false
+  daily_retention_days: 14
+  weekly_retention_weeks: 12
+  include_files_share: true
+
+observability:
+  log_retention_days: 30
+  alert_emails:
+    - ctm-nonprod-alerts@example.com
+
+dr:
+  enabled: false
+
+# Installer media source of truth: the BMC EPD archives + silent-install XMLs
+# live as Universal Packages in an Azure Artifacts feed. The pipeline (or
+# `ctmdeploy media upload`) moves them into the installers blob container;
+# nodes still download from blob via managed identity at first boot. Replace
+# the REPLACE_WITH_* placeholders with your Azure DevOps organization/project.
+media:
+  azure_artifacts:
+    organization: "https://dev.azure.com/REPLACE_WITH_ORG"
+    project: "REPLACE_WITH_PROJECT"
+    feed: ctm-media
+    packages:                 # universal packages holding the BMC EPD files + silent XMLs
+      em:         {name: control-m-em,         version: "9.0.21.300"}
+      server:     {name: control-m-server,     version: "9.0.21.300"}
+      agent:      {name: control-m-agent,      version: "9.0.21.300"}
+      silent_xml: {name: control-m-silent-xml, version: "1.0.0"}

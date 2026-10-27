@@ -1,0 +1,138 @@
+# Installer media publish: downloads the three EM/Server BMC media Universal
+# Packages (EM + Server EPD archives, silent-install XMLs) from the Azure
+# Artifacts feed and pushes them into each platform's installers blob
+# container with `ctmdeploy media upload` (primary + DR when dr.enabled),
+# alongside the node installer script. The VMs are never touched — EM/Server
+# nodes download from blob via managed identity at first boot. The AGENT
+# media (control-m-agent package) is deliberately NOT handled here: v4.1
+# bakes the Control-M/Agent into the ctm-agent golden image, so that package
+# feeds the IMAGE stage (stage-image.yml, imageKind=agent) instead. Manual:
+# run the pipeline with publishMedia=true on main. Feed/package pins live in
+# pipelines/variables/common.yml (keep them in sync with the media: block of
+# environments/<env>/config.yaml); setup: docs/AZURE-DEVOPS.md.
+parameters:
+  - name: enabled
+    type: boolean
+    default: false
+  - name: environments
+    type: object
+    default:
+      - name: nonprod
+      - name: prod
+  - name: dependsOn
+    type: object
+    default: [validate]
+  # '' = Microsoft-hosted ubuntu-latest; a name = the self-hosted scale-set pool.
+  - name: agentPool
+    type: string
+    default: ""
+
+stages:
+  - stage: media
+    displayName: Media (Azure Artifacts → installers blob)
+    dependsOn: ${{ parameters.dependsOn }}
+    # Deliberate and main-only: the installer blobs feed first-boot
+    # provisioning, so a PR or feature branch must never rewrite them.
+    # Independent of whatif/apply — publishing media is not a deployment.
+    condition: >-
+      and(
+        succeeded(),
+        eq('${{ parameters.enabled }}', 'True'),
+        eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+        ne(variables['Build.Reason'], 'PullRequest')
+      )
+    jobs:
+      - ${{ each env in parameters.environments }}:
+          - job: media_${{ env.name }}
+            displayName: media upload (${{ env.name }})
+            timeoutInMinutes: 120 # EPD archives are multi-GB
+            pool:
+              ${{ if eq(parameters.agentPool, '') }}:
+                vmImage: ubuntu-latest
+              ${{ else }}:
+                name: ${{ parameters.agentPool }}
+            steps:
+              - checkout: self
+                fetchDepth: 1
+
+              - template: steps-tools-install.yml
+
+              - bash: |
+                  set -euo pipefail
+                  for value in "$(artifactsOrganization)" "$(artifactsProject)"; do
+                    case "$value" in
+                      *REPLACE_WITH_*)
+                        echo "##[error]pipelines/variables/common.yml still contains the REPLACE_WITH_* Azure Artifacts placeholders; set artifactsOrganization/artifactsProject (and the media: block in environments/<env>/config.yaml) before running publishMedia"
+                        exit 1
+                        ;;
+                    esac
+                  done
+                displayName: Check Azure Artifacts settings
+
+              # One download per Universal Package. The download directories
+              # em/ and server/ ARE the blob prefixes (`ctmdeploy media
+              # upload` uploads an already-prefixed em/ or server/ tree
+              # verbatim); the silent_xml package's files are mapped by
+              # filename instead (silent-em-* → em/, silent-server-* →
+              # server/; silent-agent.xml is skipped with a warning — it is
+              # consumed by the Packer agent-image build, not by blob). The
+              # task authenticates with the job access token; the pipeline
+              # identity needs Feed Reader on the feed (docs/AZURE-DEVOPS.md).
+              # Feeds in another organization need feedsToUse: external plus
+              # a service connection instead.
+              - task: UniversalPackages@0
+                displayName: Download $(mediaEmPackage) $(mediaEmVersion)
+                inputs:
+                  command: download
+                  feedsToUse: internal
+                  vstsFeed: $(artifactsProject)/$(artifactsFeed)
+                  vstsFeedPackage: $(mediaEmPackage)
+                  vstsPackageVersion: $(mediaEmVersion)
+                  downloadDirectory: $(Pipeline.Workspace)/media/em
+
+              - task: UniversalPackages@0
+                displayName: Download $(mediaServerPackage) $(mediaServerVersion)
+                inputs:
+                  command: download
+                  feedsToUse: internal
+                  vstsFeed: $(artifactsProject)/$(artifactsFeed)
+                  vstsFeedPackage: $(mediaServerPackage)
+                  vstsPackageVersion: $(mediaServerVersion)
+                  downloadDirectory: $(Pipeline.Workspace)/media/server
+
+              - task: UniversalPackages@0
+                displayName: Download $(mediaXmlPackage) $(mediaXmlVersion)
+                inputs:
+                  command: download
+                  feedsToUse: internal
+                  vstsFeed: $(artifactsProject)/$(artifactsFeed)
+                  vstsFeedPackage: $(mediaXmlPackage)
+                  vstsPackageVersion: $(mediaXmlVersion)
+                  downloadDirectory: $(Pipeline.Workspace)/media/silent_xml
+
+              # Runs inside AzureCLI@2 so DefaultAzureCredential resolves
+              # through the task's federated az login (WIF, no secrets).
+              # `media upload` targets both the primary and the DR installers
+              # containers when the environment has dr.enabled (prod), and
+              # warns about any installer_blobs name still missing afterwards.
+              - task: AzureCLI@2
+                displayName: ctmdeploy media upload (${{ env.name }})
+                inputs:
+                  azureSubscription: $(azureServiceConnection)
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  addSpnToEnvironment: true
+                  inlineScript: |
+                    set -euo pipefail
+                    export ARM_CLIENT_ID="$servicePrincipalId"
+                    export ARM_TENANT_ID="$tenantId"
+                    export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                    export AZURE_CLIENT_ID="$ARM_CLIENT_ID"
+                    export AZURE_TENANT_ID="$ARM_TENANT_ID"
+                    export AZURE_SUBSCRIPTION_ID="$ARM_SUBSCRIPTION_ID"
+
+                    python -m ctmdeploy media upload \
+                      --env ${{ env.name }} \
+                      --path "$(Pipeline.Workspace)/media"
+                env:
+                  SYSTEM_ACCESSTOKEN: $(System.AccessToken)

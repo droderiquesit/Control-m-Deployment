@@ -1,0 +1,37 @@
+# ---------------------------------------------------------------------------
+# Control-M/Enterprise Manager node (__EM_ROLE__) — THIN role stub appended
+# to the common shim by ctmdeploy render.py. Writes /etc/ctm/node.json
+# (names/ids ONLY, never secrets) and runs the idempotent python installer,
+# which waits for dependencies, pulls secrets from Key Vault in-memory,
+# caches the media on NFS, renders the silent XML, runs setup.sh, installs
+# the controlm-em.service unit and the 01:15 backup cron.
+# ---------------------------------------------------------------------------
+cat > /etc/ctm/node.json <<'NODEJSON'
+{
+  "role": "__ROLE__",
+  "environment": "__ENVIRONMENT__",
+  "key_vault_name": "__KEY_VAULT_NAME__",
+  "identity_client_id": "__IDENTITY_CLIENT_ID__",
+  "blob_account": "__BLOB_ACCOUNT__",
+  "installers_container": "__INSTALLERS_CONTAINER__",
+  "backups_container": "__BACKUPS_CONTAINER__",
+  "nfs_server": "__NFS_SERVER__",
+  "nfs_export": "__NFS_EXPORT__",
+  "data_mount": "__DATA_MOUNT__",
+  "ctm_version": "__CTM_VERSION__",
+  "dns_zone": "__DNS_ZONE__",
+  "em_role": "__EM_ROLE__",
+  "em_user": "__EM_USER__",
+  "em_installer_blob": "__EM_INSTALLER_BLOB__",
+  "em_silent_blob": "__EM_SILENT_BLOB__",
+  "db_host": "__DB_HOST__",
+  "db_port": "__DB_PORT__",
+  "em_db_name": "__EM_DB_NAME__",
+  "em_db_user": "__EM_DB_USER__",
+  "db_admin_user": "__DB_ADMIN_USER__",
+  "em_primary_host": "__EM_PRIMARY_HOST__",
+  "em_secondary_host": "__EM_SECONDARY_HOST__",
+  "web_port": "__WEB_PORT__"
+}
+NODEJSON
+run_node_installer

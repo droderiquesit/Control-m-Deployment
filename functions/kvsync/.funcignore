@@ -1,0 +1,12 @@
+# Never shipped to the Function App. Azure Functions Core Tools honors this
+# file on `func azure functionapp publish`; `ctmdeploy kvsync deploy` applies
+# the same exclusions (directories AND files) when it zips this folder.
+.git*
+.vscode/
+.venv/
+__pycache__/
+.pytest_cache/
+.python_packages/
+tests/
+local.settings.json
+*.pyc

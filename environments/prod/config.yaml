@@ -1,0 +1,355 @@
+# ---------------------------------------------------------------------------
+# PROD platform: Enterprise Manager HA pair managing two Control-M/Servers,
+# CTM_UAT and CTM_PROD. UAT runs on production infrastructure (same EM,
+# same database host) so what is accepted is what goes live.
+# Zone-redundant everything, 35-day geo backups, Site Recovery + DB replica
+# in the paired region, resource locks and purge protection.
+# Network placement v2: the EM + shared services live in the utility VNet;
+# every Control-M/Server runs in its OWN VNet with its agents beside it, and
+# DR mirrors the layout for the DR-protected servers only (DR utility VNet +
+# one DR VNet per server opted into dr.server_networks; PoC: prod only).
+# Single source of truth: ctmdeploy reads this file and feeds Bicep its params.
+# ---------------------------------------------------------------------------
+subscription_id: "00000000-0000-0000-0000-000000000000"
+environment: prod
+location: eastus2
+unique_suffix: p01
+resource_lock: true
+
+tags:
+  costCenter: scheduling
+  owner: platform-team
+  criticality: tier-1
+
+# Existing networks (select, not create). All VNets pre-exist and must be
+# peered per docs/NETWORK-REQUIREMENTS.md (each server VNet <-> utility VNet).
+network:
+  utility: # EM VMs + internal LB frontend, delegated postgres subnet, private endpoints
+    vnet_name: vnet-prod-utility
+    vnet_resource_group_name: rg-network-prod
+    em_subnet_name: snet-ctm-em
+    data_subnet_name: snet-ctm-postgres
+    pe_subnet_name: snet-ctm-pe
+  # Hub-managed zones (recommended in prod):
+  # existing_private_dns_zone_ids:
+  #   blob: "/subscriptions/.../privateDnsZones/privatelink.blob.core.windows.net"
+  #   file: "/subscriptions/.../privateDnsZones/privatelink.file.core.windows.net"
+  #   vault: "/subscriptions/.../privateDnsZones/privatelink.vaultcore.azure.net"
+  existing_private_dns_zone_ids: {}
+  # Extra VNets to link into the platform/privatelink DNS zones (e.g. a jump VNet):
+  # extra_dns_vnets: [{vnet_name: ..., vnet_resource_group_name: ...}]
+  extra_dns_vnets: []
+
+# Optional full network ("Option A" in docs/NETWORK-REQUIREMENTS.md): every
+# VNet the placement blocks above (and dr: below) reference, provisioned by
+# `ctmdeploy deploy --env prod --phase network` (network/main.bicep:
+# resource groups, VNets, subnets, one NSG per subnet — bastion subnet
+# excepted — and every peering, both directions: spoke <-> utility per region,
+# prod-utility <-> dr-utility GLOBAL, build <-> all three utility VNets; DR
+# VNets included, in the DR region). Default stays bring-your-own
+# (create: false); the vnets list below is the complete PoC address plan, so
+# flipping the one flag provisions it. The cloud team can deploy the SAME plan
+# with az alone from network/params/prod.bicepparam (keep the two in sync; see
+# network/README.md; deploy the NONPROD plan first — the build VNet peers into
+# vnet-dev-utility). Address spaces are non-overlapping across all platforms
+# AND between primary and DR (required for DR/failback and build-agent
+# peering).
+network_infrastructure:
+  create: false            # true = ctmdeploy provisions the full network below
+  user_access_cidrs:       # CIDRs allowed to reach Control-M Web/API (NSG rule).
+    - "10.70.2.64/26"      # Keep BOTH snet-ctm-appgw prefixes (primary + DR):
+    - "10.80.2.0/26"       # each gateway's backend connections to the EM
+                           # internal LBs of BOTH regions ride this rule.
+                           # Append operator CIDRs as needed.
+  bastion_cidrs:           # CIDRs allowed SSH 22 to nodes/build agents. Keep
+    - "10.70.2.0/26"       # the AzureBastionSubnet prefix: Bastion sessions
+                           # egress from it (DR reach over the global peering
+                           # included) and the agents/build subnets only allow
+                           # SSH from these CIDRs. Append operator CIDRs as
+                           # needed.
+  vnets:                   # every VNet referenced by the placement blocks above
+    - name: vnet-prod-utility
+      resource_group_name: rg-network-prod
+      location: eastus2
+      role: utility        # utility | spoke | build | external (network/README.md)
+      # Utility <-> utility GLOBAL peering: the Application Gateway reaches the
+      # DR internal LB and Azure Bastion reaches the DR utility VNet. peer_to
+      # takes a name or a list; declare each pairing on ONE side only (both
+      # directions are emitted automatically).
+      peer_to: [vnet-dr-utility]
+      address_space: 10.70.0.0/22
+      subnets:
+        - {name: snet-ctm-em,       prefix: 10.70.0.0/24,  role: em}
+        - {name: snet-ctm-postgres, prefix: 10.70.1.0/27,  role: data}
+        - {name: snet-ctm-pe,       prefix: 10.70.1.64/26, role: pe}
+        # Azure Bastion (access.bastion.enabled) — the literal subnet name is
+        # an Azure requirement; no NSG (Azure Bastion manages its own plane).
+        - {name: AzureBastionSubnet, prefix: 10.70.2.0/26, role: bastion}
+        # Application Gateway Standard_v2 private frontend (access.appgw.enabled):
+        # balances ctm-global across the primary and DR internal LBs.
+        - {name: snet-ctm-appgw,    prefix: 10.70.2.64/26, role: appgw}
+        # kvsync Function App VNet integration (kv_sync.enabled); delegated
+        # to Microsoft.Web/serverFarms.
+        - {name: snet-ctm-func,     prefix: 10.70.2.128/26, role: func}
+    - name: vnet-ctm-uat
+      resource_group_name: rg-network-prod
+      location: eastus2
+      role: spoke
+      peer_to: vnet-prod-utility
+      address_space: 10.70.8.0/24
+      subnets:
+        - {name: snet-ctm-server, prefix: 10.70.8.0/26,  role: server}
+        - {name: snet-ctm-agents, prefix: 10.70.8.64/26, role: agents}
+    - name: vnet-ctm-prod
+      resource_group_name: rg-network-prod
+      location: eastus2
+      role: spoke
+      peer_to: vnet-prod-utility
+      address_space: 10.70.9.0/24
+      subnets:
+        - {name: snet-ctm-server, prefix: 10.70.9.0/26,  role: server}
+        - {name: snet-ctm-agents, prefix: 10.70.9.64/26, role: agents}
+    - name: vnet-dr-utility
+      resource_group_name: rg-network-prod-dr
+      location: centralus
+      role: utility
+      address_space: 10.80.0.0/22
+      subnets:
+        - {name: snet-ctm-em,       prefix: 10.80.0.0/24,  role: em}
+        - {name: snet-ctm-postgres, prefix: 10.80.1.0/27,  role: data}
+        - {name: snet-ctm-pe,       prefix: 10.80.1.64/26, role: pe}
+        # DR TWIN of the Application Gateway (access.appgw.dr_instance): its
+        # own private frontend keeps the ctm-global entry answering when the
+        # primary region is lost.
+        - {name: snet-ctm-appgw,    prefix: 10.80.2.0/26,  role: appgw}
+    - name: vnet-ctm-prod-dr
+      resource_group_name: rg-network-prod-dr
+      location: centralus
+      role: spoke
+      peer_to: vnet-dr-utility
+      address_space: 10.80.9.0/24
+      subnets:
+        - {name: snet-ctm-server, prefix: 10.80.9.0/26,  role: server}
+        - {name: snet-ctm-agents, prefix: 10.80.9.64/26, role: agents}
+    # Azure DevOps scale-set build agents (build_agents block below): peered
+    # to ALL THREE utility VNets so pipeline deployments reach nonprod, prod
+    # AND DR. vnet-dev-utility belongs to the NONPROD plan — the peering
+    # crosses environment configs by VNet name and resolves through the
+    # `role: external` entry below, so `ctmdeploy deploy --phase network`
+    # emits the build <-> vnet-dev-utility pair too (both directions, the
+    # nonprod side landing in rg-network-nonprod), exactly like the cloud
+    # team's network/params/prod.bicepparam. Deploy the NONPROD plan first.
+    # See network/README.md.
+    - name: vnet-ctm-build
+      resource_group_name: rg-network-prod
+      location: eastus2
+      role: build
+      peer_to: [vnet-dev-utility, vnet-prod-utility, vnet-dr-utility]
+      address_space: 10.90.0.0/24
+      subnets:
+        - {name: snet-ctm-build, prefix: 10.90.0.0/26, role: build}
+    # RESOLUTION-ONLY (role external): vnet-dev-utility is created by the
+    # NONPROD plan; declaring its name + resource group + address space here
+    # lets the build-VNet peering above resolve (and its space feed the NSG
+    # rules). Nothing is created for this entry — no subnets, no peer_to.
+    - name: vnet-dev-utility
+      resource_group_name: rg-network-nonprod
+      location: eastus2
+      role: external
+      address_space: 10.60.0.0/22
+
+deployer_ip_cidrs:
+  - "203.0.113.10/32"
+
+key_vault_public_access: true
+
+ctm_version: "9.0.21.300"
+
+# Blob-name overrides for the EM/Server installers / silent XMLs; {} keeps
+# the defaults (same blob names as before the toolchain migration). v4.1:
+# there are NO agent keys — the Control-M/Agent is baked into the ctm-agent
+# golden image, so agent media never reaches the installers container.
+installer_blobs: {}
+
+# Access layer (deployed by `ctmdeploy deploy --env prod --phase access`,
+# after compute and before dr): Azure Bastion into the utility VNet
+# (AzureBastionSubnet) and the PRIVATE Application Gateway (snet-ctm-appgw)
+# whose single backend pool holds BOTH internal LB frontend IPs — primary
+# and DR. Healthy-only routing makes ctm-global.<zone> follow whichever
+# region's EM answers (automatic primary/DR behavior).
+# dr_instance: also deploy a DR TWIN of the gateway (ctm-prod-dr-appgw) in
+# the DR utility VNet's snet-ctm-appgw — same two-LB backend pool, its own
+# private frontend — and point ctm-global in the DR COPY of the platform
+# zone at it, so the private entry point survives a primary-region loss
+# (requires the appgw-role subnet in vnet-dr-utility above).
+access:
+  bastion: {enabled: true}
+  appgw: {enabled: true, dr_instance: true}
+
+# Key Vault -> Control-M secret sync (functions/kvsync Durable Function,
+# infra from the access phase, code via `ctmdeploy kvsync deploy`). The
+# function's managed identity only READS tagged secrets (Key Vault Secrets
+# User); see functions/kvsync/README.md for the ctm-sync/ctm-name tags.
+kv_sync:
+  enabled: true
+  schedule: "0 */15 * * * *" # NCRONTAB (6 fields): every 15 minutes
+
+# Azure DevOps scale-set build agents (uniform VMSS ctm-build-agents in its
+# own resource group, Ubuntu 22.04, Manual upgrade, no autoscale — the ADO
+# elastic pool owns capacity). The VNet below is the build VNet from the
+# network plan, peered to the nonprod, prod AND DR utility VNets so one
+# agent pool deploys into all three platforms. After deployment: register
+# the VMSS as an ADO elastic pool; ADO's service principal needs VMSS
+# Contributor on ctm-build-rg (documented in docs/AZURE-DEVOPS.md — not
+# granted here).
+build_agents:
+  enabled: true
+  resource_group: ctm-build-rg
+  vm_size: Standard_D4s_v5
+  instances: 2
+  network:
+    vnet_name: vnet-ctm-build
+    vnet_resource_group_name: rg-network-prod
+    subnet_name: snet-ctm-build
+
+# Compute Gallery golden images published by Packer (v4.1 two-image model):
+# base = ctm-rhel9 (OS only; EM/Server VMs — packer/ctm-rhel9.pkr.hcl),
+# agent = ctm-agent (OS prep + Control-M/Agent silent-installed but
+# UNCONFIGURED; the agent scale sets — packer/ctm-agent.pkr.hcl). Bumping
+# agent.version + a compute deploy rolls the VMSS model: new instances boot
+# the new image.
+image:
+  gallery_resource_group: ctm-images-rg
+  gallery_name: ctmgallery
+  base:  {definition: ctm-rhel9, version: latest} # or a pinned "1.0.0"
+  agent: {definition: ctm-agent, version: latest}
+
+em:
+  vm_size: Standard_D16s_v5
+  data_disk_gb: 1024
+  disk_type: Premium_ZRS
+  enable_secondary: true
+  zones: ["1", "2"]
+  web_port: 8443
+
+servers:
+  uat:
+    name: CTM_UAT
+    vm_size: Standard_D8s_v5
+    data_disk_gb: 512
+    disk_type: Premium_ZRS
+    enable_secondary: true
+    zones: ["1", "2"]
+    network: # REQUIRED: this server's own VNet (isolated from the other servers)
+      vnet_name: vnet-ctm-uat
+      vnet_resource_group_name: rg-network-prod
+      server_subnet_name: snet-ctm-server
+      agents_subnet_name: snet-ctm-agents # optional; default = server_subnet_name
+      # Agents may be relocated to another VNet entirely (optional overrides):
+      # agents_vnet_name: null
+      # agents_vnet_resource_group_name: null
+    agents:
+      vm_size: Standard_D4s_v5
+      min: 2
+      max: 6
+      default: 2
+      use_spot: false
+      scale_out_cpu: 70
+      scale_in_cpu: 25
+  prod:
+    name: CTM_PROD
+    vm_size: Standard_D16s_v5
+    data_disk_gb: 1024
+    disk_type: Premium_ZRS
+    enable_secondary: true
+    zones: ["1", "2"]
+    network:
+      vnet_name: vnet-ctm-prod
+      vnet_resource_group_name: rg-network-prod
+      server_subnet_name: snet-ctm-server
+      agents_subnet_name: snet-ctm-agents
+    agents:
+      vm_size: Standard_D4s_v5
+      min: 3
+      max: 20
+      default: 3
+      use_spot: false
+      scale_out_cpu: 65
+      scale_in_cpu: 20
+
+database:
+  sku_name: GP_Standard_D8ds_v5
+  storage_mb: 524288
+  high_availability_mode: ZoneRedundant
+  backup_retention_days: 35
+  geo_redundant_backup: true
+  postgres_version: "16"
+
+storage:
+  blob_replication_type: RAGZRS
+  files_replication_type: ZRS
+  shared_share_quota_gb: 512
+
+load_balancer:
+  internal: true
+
+backup:
+  enabled: true
+  storage_mode_type: GeoRedundant
+  cross_region_restore: true
+  daily_retention_days: 35
+  weekly_retention_weeks: 52
+  include_files_share: true
+
+observability:
+  log_retention_days: 90
+  alert_emails:
+    - ctm-prod-alerts@example.com
+    - noc@example.com
+
+dr:
+  enabled: true
+  location: centralus
+  network:
+    utility: # DR EM failover target, DB replica subnet, PEs, DR LB frontend
+      vnet_name: vnet-dr-utility
+      vnet_resource_group_name: rg-network-prod-dr
+      em_subnet_name: snet-ctm-em
+      data_subnet_name: snet-ctm-postgres
+      pe_subnet_name: snet-ctm-pe
+    existing_private_dns_zone_ids: {}
+    extra_dns_vnets: []
+  # DR OPT-IN SET: a server is DR-protected if and only if it has an entry
+  # here (ASR failover target + warm agents, same shape as servers.*.network).
+  # CTM_UAT is intentionally absent: it is re-deployable and not
+  # business-critical — no uat DR VNet, no uat ASR items, no uat warm pool.
+  # Note: the shared PG replica still carries EVERY database on the server
+  # (ctm_uat included) because replication is server-level, so UAT *data*
+  # survives even though UAT compute is not replicated.
+  server_networks:
+    prod:
+      vnet_name: vnet-ctm-prod-dr
+      vnet_resource_group_name: rg-network-prod-dr
+      server_subnet_name: snet-ctm-server
+      agents_subnet_name: snet-ctm-agents
+  warm_agents: 1 # per DR-protected Server (prod only) in the DR region
+  replica_sku_name: GP_Standard_D8ds_v5
+  enable_site_recovery: true
+  traffic_manager: false
+
+# Installer media source of truth: the BMC EPD archives + silent-install XMLs
+# live as Universal Packages in an Azure Artifacts feed. The pipeline (or
+# `ctmdeploy media upload`) moves them into the installers blob containers of
+# BOTH the primary and the DR platform; nodes still download from blob via
+# managed identity at first boot. Replace the REPLACE_WITH_* placeholders with
+# your Azure DevOps organization/project.
+media:
+  azure_artifacts:
+    organization: "https://dev.azure.com/REPLACE_WITH_ORG"
+    project: "REPLACE_WITH_PROJECT"
+    feed: ctm-media
+    packages:                 # universal packages holding the BMC EPD files + silent XMLs
+      em:         {name: control-m-em,         version: "9.0.21.300"}
+      server:     {name: control-m-server,     version: "9.0.21.300"}
+      agent:      {name: control-m-agent,      version: "9.0.21.300"}
+      silent_xml: {name: control-m-silent-xml, version: "1.0.0"}

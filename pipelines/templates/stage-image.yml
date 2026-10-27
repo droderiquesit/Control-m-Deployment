@@ -1,0 +1,140 @@
+# Golden image build: a pinned, checksum-verified Packer publishes a new
+# gallery version (replicated eastus2+centralus). Two image kinds (v4.1):
+#   imageKind: base  → ctm-rhel9 (OS only — NEVER contains BMC software)
+#   imageKind: agent → ctm-agent (OS prep + Control-M/Agent silent-installed,
+#                      UNCONFIGURED; fed by the control-m-agent +
+#                      control-m-silent-xml Universal Packages, downloaded
+#                      here and handed to `ctmdeploy image build --image agent
+#                      --media-path ...` — the agent media never reaches the
+#                      platform blob containers)
+# Manual: run the pipeline with runImageBuild=true, an imageVersion and the
+# imageKind to publish. Agent image revisions roll to the scale sets via the
+# VMSS model update on the next compute deployment (new instances boot the
+# new version; recycle/reimage old instances to converge — docs/OPERATIONS.md).
+parameters:
+  - name: enabled
+    type: boolean
+    default: false
+  - name: imageVersion
+    type: string
+  # Which golden image to build: base (ctm-rhel9) or agent (ctm-agent).
+  - name: imageKind
+    type: string
+    default: base
+    values: [base, agent]
+  - name: dependsOn
+    type: object
+    default: [validate]
+  # '' = Microsoft-hosted ubuntu-latest; a name = the self-hosted scale-set pool.
+  - name: agentPool
+    type: string
+    default: ""
+
+stages:
+  - stage: image
+    displayName: Image (Packer ${{ parameters.imageKind }})
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: and(succeeded(), eq('${{ parameters.enabled }}', 'True'))
+    jobs:
+      - job: packer_build
+        displayName: packer build ${{ parameters.imageKind }} ${{ parameters.imageVersion }}
+        timeoutInMinutes: 120
+        pool:
+          ${{ if eq(parameters.agentPool, '') }}:
+            vmImage: ubuntu-latest
+          ${{ else }}:
+            name: ${{ parameters.agentPool }}
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - template: steps-tools-install.yml
+
+          - bash: |
+              set -euo pipefail
+              V="$(packerVersion)"
+              cd "$(Agent.TempDirectory)"
+              curl -fsSLO "https://releases.hashicorp.com/packer/${V}/packer_${V}_linux_amd64.zip"
+              curl -fsSLO "https://releases.hashicorp.com/packer/${V}/packer_${V}_SHA256SUMS"
+              grep "packer_${V}_linux_amd64.zip" "packer_${V}_SHA256SUMS" | sha256sum -c -
+              unzip -oq "packer_${V}_linux_amd64.zip" packer
+              sudo install -m 0755 packer /usr/local/bin/packer
+              packer version
+            displayName: Install Packer $(packerVersion) (sha256 verified)
+
+          # Agent image only: the Control-M/Agent media feeds the PACKER
+          # build (never the blob installers containers). The EPD archive
+          # comes from the control-m-agent package, the silent-agent.xml
+          # answer file from the control-m-silent-xml package. The task
+          # authenticates with the job access token; the pipeline identity
+          # needs Feed Reader on the feed (docs/AZURE-DEVOPS.md).
+          - ${{ if eq(parameters.imageKind, 'agent') }}:
+              - bash: |
+                  set -euo pipefail
+                  for value in "$(artifactsOrganization)" "$(artifactsProject)"; do
+                    case "$value" in
+                      *REPLACE_WITH_*)
+                        echo "##[error]pipelines/variables/common.yml still contains the REPLACE_WITH_* Azure Artifacts placeholders; set artifactsOrganization/artifactsProject before building the agent image"
+                        exit 1
+                        ;;
+                    esac
+                  done
+                displayName: Check Azure Artifacts settings
+
+              - task: UniversalPackages@0
+                displayName: Download $(mediaAgentPackage) $(mediaAgentVersion)
+                inputs:
+                  command: download
+                  feedsToUse: internal
+                  vstsFeed: $(artifactsProject)/$(artifactsFeed)
+                  vstsFeedPackage: $(mediaAgentPackage)
+                  vstsPackageVersion: $(mediaAgentVersion)
+                  downloadDirectory: $(Pipeline.Workspace)/agent-media
+
+              - task: UniversalPackages@0
+                displayName: Download $(mediaXmlPackage) $(mediaXmlVersion)
+                inputs:
+                  command: download
+                  feedsToUse: internal
+                  vstsFeed: $(artifactsProject)/$(artifactsFeed)
+                  vstsFeedPackage: $(mediaXmlPackage)
+                  vstsPackageVersion: $(mediaXmlVersion)
+                  downloadDirectory: $(Pipeline.Workspace)/agent-media
+
+          # Packer authenticates through the az CLI session the task opens
+          # (use_azure_cli_auth = true in packer/*.pkr.hcl) — no credentials
+          # on disk, no service-principal secret anywhere.
+          - task: AzureCLI@2
+            displayName: ctmdeploy image gallery + build (${{ parameters.imageKind }})
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                export AZURE_CLIENT_ID="$ARM_CLIENT_ID"
+                export AZURE_TENANT_ID="$ARM_TENANT_ID"
+                export AZURE_SUBSCRIPTION_ID="$ARM_SUBSCRIPTION_ID"
+
+                # Idempotent: resource group ctm-images-rg + gallery ctmgallery
+                # + BOTH image definitions ctm-rhel9/ctm-agent (bicep/images.bicep).
+                python -m ctmdeploy image gallery --env prod
+
+                # Builds from the marketplace RHEL 9 base and publishes gallery
+                # version ${{ parameters.imageVersion }} (immutable — bump, never
+                # rebuild). The agent image additionally consumes the media
+                # downloaded above (--media-path); the base image takes none.
+                MEDIA_ARGS=()
+                if [ "${{ parameters.imageKind }}" = "agent" ]; then
+                  MEDIA_ARGS=(--media-path "$(Pipeline.Workspace)/agent-media")
+                fi
+                python -m ctmdeploy image build --env prod \
+                  --image "${{ parameters.imageKind }}" \
+                  "${MEDIA_ARGS[@]}" \
+                  --version "${{ parameters.imageVersion }}"
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)

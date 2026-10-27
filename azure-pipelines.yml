@@ -1,15 +1,36 @@
 # ---------------------------------------------------------------------------
-# Control-M platform — Azure DevOps pipeline
+# Control-M platform — Azure DevOps pipeline (Bicep + Python + Packer)
 #
-#   validate ─► security (Checkmarx One: SAST + SCA + IaC) ─► plan(nonprod|prod)
+#   validate ─► security (Checkmarx One: SAST + SCA + IaC) ─► whatif(nonprod|prod)
 #            ─► apply nonprod (CTM_DEV + CTM_QA) ─► apply prod (CTM_UAT + CTM_PROD)
 #               main branch only; approvals/checks live on the ADO environments
 #               ctm-nonprod and ctm-prod
+#   image    ─► manual (runImageBuild=true + imageKind): Packer publishes a new
+#               gallery version — imageKind=base builds ctm-rhel9 (OS only,
+#               NEVER any BMC software; EM/Server install at provision time)
+#               and imageKind=agent builds ctm-agent (the Control-M/Agent
+#               silent-installed from the control-m-agent Universal Package,
+#               UNCONFIGURED — the agent VMSS boots this image and only
+#               configures/starts/registers at boot)
+#   media    ─► manual (publishMedia=true, main only): the EM/Server installer
+#               media (EPD archives + silent XMLs — three Universal Packages)
+#               is downloaded from the Azure Artifacts feed and uploaded to
+#               each platform's installers blob container (primary + DR),
+#               where the EM/Server nodes pull it at first boot via managed
+#               identity. Agent media never goes to blob (see the image stage)
+#
+# Agents: every job runs on Microsoft-hosted ubuntu-latest by default. Set
+# agentPoolName in pipelines/variables/common.yml to the Azure DevOps
+# scale-set pool backed by the ctm-build-agents VMSS (access phase) to run
+# the same jobs on self-hosted agents inside the build VNet — peered to the
+# nonprod, prod AND DR utility VNets, so one pool deploys everywhere; WIF
+# provides the deployment identity either way.
 #
 # Secrets: Delinea DevOps Secrets Vault (DSV) supplies the Control-M platform
-# passwords (TF_VAR_platform_secrets) and the Checkmarx credentials; Azure auth
-# is a Workload Identity Federation service connection (no stored SPN secret).
-# Setup steps: docs/AZURE-DEVOPS.md
+# passwords (CTM_PLATFORM_SECRETS, seeded into Key Vault by ctmdeploy) and the
+# Checkmarx credentials; Azure auth is a Workload Identity Federation service
+# connection (no stored SPN secret). Setup steps: docs/AZURE-DEVOPS.md;
+# required roles: docs/IDENTITY-PERMISSIONS.md (identity/deployer-role.bicep)
 # ---------------------------------------------------------------------------
 name: ctm-$(Date:yyyyMMdd)$(Rev:.r)
 
@@ -17,13 +38,41 @@ trigger:
   branches:
     include: [main]
   paths:
-    include: [modules, environments, pipelines, azure-pipelines.yml]
+    include:
+      [
+        bicep,
+        deploy,
+        environments,
+        cloud-init,
+        node-scripts,
+        functions,
+        network,
+        identity,
+        packer,
+        pipelines,
+        scripts,
+        azure-pipelines.yml,
+      ]
 
 pr:
   branches:
     include: [main]
   paths:
-    include: [modules, environments, pipelines, azure-pipelines.yml]
+    include:
+      [
+        bicep,
+        deploy,
+        environments,
+        cloud-init,
+        node-scripts,
+        functions,
+        network,
+        identity,
+        packer,
+        pipelines,
+        scripts,
+        azure-pipelines.yml,
+      ]
 
 parameters:
   - name: environments
@@ -45,20 +94,43 @@ parameters:
     displayName: Environments allowed to apply in this run (manual runs can restrict)
     type: object
     default: [nonprod, prod]
+  - name: runImageBuild
+    displayName: Build + publish a new golden image (Packer)
+    type: boolean
+    default: false
+  - name: imageKind
+    displayName: Which golden image to build (base = ctm-rhel9 OS-only; agent = ctm-agent with the Control-M/Agent baked in)
+    type: string
+    default: base
+    values: [base, agent]
+  - name: imageVersion
+    displayName: Gallery image version to publish (semver; only with runImageBuild)
+    type: string
+    default: "1.0.0"
+  - name: publishMedia
+    displayName: Publish BMC installer media (Azure Artifacts feed → installers blob)
+    type: boolean
+    default: false
 
 variables:
   - template: pipelines/variables/common.yml
   # Variable group holding the DSV client credentials (secret) — see docs/AZURE-DEVOPS.md
   - group: ctm-dsv-auth
 
+# Default pool for any job that does not set one. '' = Microsoft-hosted;
+# a pool name = the self-hosted scale-set pool (ctm-build-agents VMSS).
 pool:
-  vmImage: ${{ variables.agentImage }}
+  ${{ if eq(variables.agentPoolName, '') }}:
+    vmImage: ${{ variables.agentImage }}
+  ${{ else }}:
+    name: ${{ variables.agentPoolName }}
 
 stages:
   # ---------------- 1. static validation ----------------
   - template: pipelines/templates/stage-validate.yml
     parameters:
       environments: ${{ parameters.environments }}
+      agentPool: ${{ variables.agentPoolName }}
 
   # ---------------- 2. Checkmarx One ----------------
   - template: pipelines/templates/stage-security.yml
@@ -66,15 +138,35 @@ stages:
       enabled: ${{ parameters.runCheckmarx }}
       failOnThreshold: ${{ parameters.failOnCheckmarxThreshold }}
       dependsOn: [validate]
+      agentPool: ${{ variables.agentPoolName }}
 
-  # ---------------- 3+4. plan and gated apply per environment ----------------
+  # ---------------- golden image (manual) ----------------
+  - template: pipelines/templates/stage-image.yml
+    parameters:
+      enabled: ${{ parameters.runImageBuild }}
+      imageVersion: ${{ parameters.imageVersion }}
+      imageKind: ${{ parameters.imageKind }}
+      dependsOn: [validate]
+      agentPool: ${{ variables.agentPoolName }}
+
+  # ---------------- installer media (manual, main only) ----------------
+  - template: pipelines/templates/stage-media.yml
+    parameters:
+      enabled: ${{ parameters.publishMedia }}
+      environments: ${{ parameters.environments }}
+      dependsOn: [validate]
+      agentPool: ${{ variables.agentPoolName }}
+
+  # ---------------- 3+4. what-if and gated apply per environment ----------------
   - ${{ each env in parameters.environments }}:
-      - template: pipelines/templates/stage-plan.yml
+      - template: pipelines/templates/stage-whatif.yml
         parameters:
           environment: ${{ env.name }}
+          agentPool: ${{ variables.agentPoolName }}
 
       - template: pipelines/templates/stage-apply.yml
         parameters:
           environment: ${{ env.name }}
           previousEnvironment: ${{ coalesce(env.promoteFrom, '') }}
           enabled: ${{ containsValue(parameters.applyEnvironments, env.name) }}
+          agentPool: ${{ variables.agentPoolName }}

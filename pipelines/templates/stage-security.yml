@@ -1,4 +1,5 @@
-# Checkmarx One scan (SAST + SCA + IaC Security/KICS for Terraform).
+# Checkmarx One scan (SAST + SCA + IaC Security/KICS for the Bicep templates,
+# pipelines and shell scripts).
 # Two ways to run it:
 #   1. marketplace task "Checkmarx AST" with a Checkmarx One service connection
 #      (set variable checkmarxServiceConnection)
@@ -14,6 +15,10 @@ parameters:
   - name: dependsOn
     type: object
     default: []
+  # '' = Microsoft-hosted ubuntu-latest; a name = the self-hosted scale-set pool.
+  - name: agentPool
+    type: string
+    default: ""
 
 stages:
   - stage: security
@@ -23,6 +28,11 @@ stages:
     jobs:
       - job: checkmarx
         displayName: Checkmarx One scan
+        pool:
+          ${{ if eq(parameters.agentPool, '') }}:
+            vmImage: ubuntu-latest
+          ${{ else }}:
+            name: ${{ parameters.agentPool }}
         steps:
           - checkout: self
             fetchDepth: 0 # full history lets Checkmarx attribute findings to commits
@@ -72,7 +82,7 @@ stages:
                     --report-format sarif,summaryHTML \
                     --output-path "$(Build.ArtifactStagingDirectory)" \
                     --tags "pipeline=$(Build.DefinitionName),build=$(Build.BuildId)" \
-                    --file-filter '!**/.terraform/**,!**/*.tfstate*'
+                    --file-filter '!**/.git/**,!**/__pycache__/**,!**/*.egg-info/**'
                 displayName: cx scan create (sast, sca, iac-security)
                 continueOnError: ${{ not(parameters.failOnThreshold) }}
                 env:

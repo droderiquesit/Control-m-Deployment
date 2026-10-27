@@ -18,9 +18,27 @@ terraform.rc
 *.secret.tfvars
 *.auto.tfvars.local
 .env
+# Azure Functions local settings can hold real connection strings/secrets
+# (functions/kvsync); .funcignore and `ctmdeploy kvsync deploy` also exclude it.
+local.settings.json
 
 # Editors / OS
 .idea/
 .vscode/
 *.swp
 .DS_Store
+
+# Python (ctmdeploy)
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+
+# Packer
+packer_cache/
+packer/*.pkrvars.hcl
+
+# Bicep build artifacts (bicep build without --stdout)
+bicep/**/*.json

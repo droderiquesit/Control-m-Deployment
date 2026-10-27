@@ -1,21 +1,28 @@
+# Pre-commit hooks for the Bicep + Python + Packer toolchain.
+# The bicep hooks are local and need the Bicep CLI on PATH (https://aka.ms/bicep).
 repos:
-  - repo: https://github.com/antonbabenko/pre-commit-terraform
-    rev: v1.96.2
-    hooks:
-      - id: terraform_fmt
-      - id: terraform_validate
-        args:
-          - --hook-config=--retry-once-with-cleanup=true
-      - id: terraform_tflint
-        args:
-          - --args=--config=__GIT_WORKING_DIR__/.tflint.hcl
-      - id: terraform_checkov
-        args:
-          - --args=--quiet
-          - --args=--skip-check CKV_AWS_144,CKV2_AWS_62
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
     hooks:
       - id: end-of-file-fixer
       - id: trailing-whitespace
       - id: check-yaml
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: [--fix]
+
+  - repo: local
+    hooks:
+      - id: bicep-format
+        name: bicep format
+        entry: bash -c 'for f in "$@"; do bicep format "$f"; done' --
+        language: system
+        files: \.bicep$
+      - id: bicep-lint
+        name: bicep lint
+        entry: bash -c 'rc=0; for f in "$@"; do bicep lint "$f" || rc=1; done; exit $rc' --
+        language: system
+        files: \.bicep$

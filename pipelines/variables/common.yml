@@ -1,11 +1,59 @@
+# Shared pipeline variables: tool pins (with checksums where the vendor does
+# not publish a sums file), the Azure WIF service connection, Delinea DSV and
+# Checkmarx One settings. Toolchain: Bicep + Python (ctmdeploy) + Packer.
 variables:
   agentImage: ubuntu-latest
-  terraformVersion: "1.9.8"
+
+  # Which pool runs every job. '' (the default) = Microsoft-hosted agents
+  # using the agentImage above. Set it to the name of the Azure DevOps
+  # scale-set (elastic) pool backed by the ctm-build-agents VMSS — deployed
+  # by `ctmdeploy deploy --env prod --phase access`, registered per
+  # docs/AZURE-DEVOPS.md §6 — to run jobs on self-hosted agents inside the
+  # build VNet (peered to the nonprod, prod AND DR utility VNets, so one pool
+  # deploys into all three platforms). Evaluated at compile time.
+  agentPoolName: ""
+
+  # Bicep CLI (bicep-linux-x64 asset of https://github.com/Azure/bicep/releases).
+  # The sha256 is of that exact release asset; bump both together.
+  bicepVersion: "0.30.23"
+  bicepSha256: "b6a41ce8bdbf448feaf8fe2286164fb8c84e5d006c293fbc20591ff9baf76f18"
+
+  # Python used for the ctmdeploy orchestrator (requires >= 3.11).
+  pythonVersion: "3.12"
+
+  # Packer, for the golden-image stage only (verified against the vendor's
+  # SHA256SUMS file at download time).
+  packerVersion: "1.11.2"
 
   # Azure Resource Manager service connection (Workload Identity Federation).
   # The GUID is shown in Project settings > Service connections > (connection) > URL (resourceId).
   azureServiceConnection: sc-ctm-platform-wif
   azureServiceConnectionId: 00000000-0000-0000-0000-000000000000
+
+  # Azure Artifacts feed holding the BMC installer media as Universal Packages
+  # (stage-media.yml, publishMedia=true). The REPLACE_WITH_* placeholders match
+  # the media.azure_artifacts block of environments/<env>/config.yaml — keep
+  # the two in sync when filling them in or bumping a package version. The
+  # organization URL is used by the `az artifacts universal publish` examples
+  # in docs/AZURE-DEVOPS.md and by the placeholder check; UniversalPackages@0
+  # downloads from the feed of the organization running the pipeline (a feed
+  # in another organization needs an external service connection instead).
+  artifactsOrganization: "https://dev.azure.com/REPLACE_WITH_ORG"
+  artifactsProject: "REPLACE_WITH_PROJECT"
+  artifactsFeed: ctm-media
+  mediaEmPackage: control-m-em
+  mediaEmVersion: "9.0.21.300"
+  mediaServerPackage: control-m-server
+  mediaServerVersion: "9.0.21.300"
+  # The agent package feeds the IMAGE stage (stage-image.yml, imageKind=agent:
+  # the Control-M/Agent is baked into the ctm-agent golden image), NOT the
+  # media stage — agent media never reaches the installers blob containers.
+  mediaAgentPackage: control-m-agent
+  mediaAgentVersion: "9.0.21.300"
+  # silent_xml is shared: silent-em-*/silent-server-* go to blob via the media
+  # stage; silent-agent.xml is consumed by the Packer agent-image build.
+  mediaXmlPackage: control-m-silent-xml
+  mediaXmlVersion: "1.0.0"
 
   # Delinea DevOps Secrets Vault
   dsvCliVersion: "1.40.5"

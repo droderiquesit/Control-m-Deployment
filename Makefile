@@ -1,49 +1,68 @@
-# Control-M platform IaC helper targets.
-#   make init ENV=nonprod
-#   make plan ENV=prod
-#   make apply ENV=prod
-ENV ?= nonprod
-TF  ?= terraform
-DIR  = environments/$(ENV)
-ENVS = nonprod prod
+# Control-M platform toolchain helpers (Bicep + Python ctmdeploy + Packer).
+#   make whatif ENV=nonprod
+#   make deploy ENV=prod [PHASE=compute]
+#   make image VERSION=1.0.0
+ENV    ?= nonprod
+PHASE  ?= all
+VERSION ?=
+PY     ?= python3
+BICEP  ?= bicep
+CTM     = $(PY) -m ctmdeploy
 
-.PHONY: help bootstrap init plan apply destroy fmt validate lint output clean
+.PHONY: help install image gallery whatif deploy secrets failover render fmt lint test clean
 
 help:
-	@echo "Targets: bootstrap init plan apply destroy fmt validate lint output clean"
-	@echo "Usage:   make <target> ENV=<nonprod|prod>"
+	@echo "Targets: install image gallery whatif deploy secrets failover fmt lint test clean"
+	@echo "Usage:   make whatif ENV=<nonprod|prod>"
+	@echo "         make deploy ENV=<nonprod|prod> [PHASE=all|rg|foundation|secrets|compute|dr|replication]"
+	@echo "         make image VERSION=x.y.z [ENV=prod] [IMAGE=base|agent MEDIA=dir]  (packer -> Compute Gallery)"
+	@echo "         make failover ENV=prod                (DR runbook: docs/DR-RUNBOOK.md)"
 
-bootstrap:
-	$(TF) -chdir=bootstrap init && $(TF) -chdir=bootstrap apply
+install:
+	$(PY) -m pip install -e "deploy/[dev]"
 
-init:
-	$(TF) -chdir=$(DIR) init -upgrade -reconfigure -backend-config=backend.hcl
+# Golden images: packer build -> Compute Gallery version (immutable; bump,
+# never rebuild). IMAGE=base (default, ctm-rhel9 OS-only) or IMAGE=agent
+# (ctm-agent with the Control-M/Agent baked in; needs MEDIA=<dir>).
+IMAGE ?= base
+MEDIA ?=
+image:
+	@test -n "$(VERSION)" || { echo "usage: make image VERSION=x.y.z [ENV=prod] [IMAGE=base|agent MEDIA=dir]"; exit 2; }
+	$(CTM) image build --env $(ENV) --version $(VERSION) --image $(IMAGE) $(if $(MEDIA),--media-path $(MEDIA),)
 
-plan: init
-	$(TF) -chdir=$(DIR) plan -out=$(ENV).tfplan
+# One-time (idempotent): ctm-images-rg + ctmgallery + the ctm-rhel9 and
+# ctm-agent definitions.
+gallery:
+	$(CTM) image gallery --env $(ENV)
 
-apply:
-	$(TF) -chdir=$(DIR) apply $(ENV).tfplan
+whatif:
+	$(CTM) whatif --env $(ENV)
 
-destroy:
-	$(TF) -chdir=$(DIR) destroy
+deploy:
+	$(CTM) deploy --env $(ENV) --phase $(PHASE)
+
+secrets:
+	$(CTM) secrets --env $(ENV)
+
+failover:
+	$(CTM) failover --env $(ENV)
+
+render:
+	$(CTM) render --env $(ENV) --role em --allow-placeholders
 
 fmt:
-	$(TF) fmt -recursive
-
-validate:
-	@for e in $(ENVS); do \
-	  echo "== validate $$e"; \
-	  $(TF) -chdir=environments/$$e init -backend=false -input=false >/dev/null && \
-	  $(TF) -chdir=environments/$$e validate || exit 1; \
-	done
+	@find bicep -name '*.bicep' -print -exec $(BICEP) format {} \;
 
 lint:
-	tflint --recursive --config "$(CURDIR)/.tflint.hcl"
+	@rc=0; for f in $$(find bicep -name '*.bicep' | sort); do \
+	  echo "== bicep lint $$f"; $(BICEP) lint "$$f" || rc=1; \
+	done; \
+	$(PY) -m ruff check deploy || rc=1; \
+	exit $$rc
 
-output:
-	$(TF) -chdir=$(DIR) output
+test:
+	$(PY) -m pytest deploy/tests -q
 
 clean:
-	find . -name "*.tfplan" -delete
-	find . -type d -name ".terraform" -prune -exec rm -rf {} +
+	find . -type d \( -name "__pycache__" -o -name ".pytest_cache" -o -name "*.egg-info" -o -name ".ruff_cache" -o -name "packer_cache" \) -prune -exec rm -rf {} +
+	find bicep -name "*.json" -delete

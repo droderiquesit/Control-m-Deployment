@@ -1,0 +1,6 @@
+# Key Vault -> Control-M secret sync (python v2 programming model).
+azure-functions
+azure-functions-durable
+azure-identity
+azure-keyvault-secrets
+requests

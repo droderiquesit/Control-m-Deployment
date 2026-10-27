@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# Control-M node bootstrap SHIM (rendered by ctmdeploy render.py, which
+# substitutes the two-underscore token placeholders). Runs once via
+# cloud-init on first boot and is deliberately THIN: it prepares the OS-side
+# plumbing (DNS search, data disk, NFS), writes /etc/ctm/node.json (names and
+# ids ONLY — never secrets), fetches node-scripts/ctm_node_install.py from
+# the installers blob container via the managed identity and runs it. ALL
+# Control-M install logic lives in that idempotent python script; re-run it
+# any time with the ctm-install.service oneshot installed below.
+# ---------------------------------------------------------------------------
+set -euo pipefail
+exec > >(tee -a /var/log/ctm-bootstrap.log | logger -t ctm-bootstrap) 2>&1
+export CTM_SHIM_LOGS=1
+
+ROLE="__ROLE__"
+ENVIRONMENT="__ENVIRONMENT__"
+KEY_VAULT="__KEY_VAULT_NAME__"
+IDENTITY_CLIENT_ID="__IDENTITY_CLIENT_ID__"
+BLOB_ACCOUNT="__BLOB_ACCOUNT__"
+INSTALLERS_CONTAINER="__INSTALLERS_CONTAINER__"
+BACKUPS_CONTAINER="__BACKUPS_CONTAINER__"
+NFS_SERVER="__NFS_SERVER__"
+NFS_EXPORT="__NFS_EXPORT__"
+DATA_MOUNT="__DATA_MOUNT__"
+ATTACH_DATA_DISK="__ATTACH_DATA_DISK__"
+CTM_VERSION="__CTM_VERSION__"
+DNS_ZONE="__DNS_ZONE__"
+NODE_SCRIPT_BLOB="__NODE_SCRIPT_BLOB__"
+SHARED_MOUNT=/mnt/ctm-shared
+MARKER=/var/lib/ctm/bootstrap.done
+NODE_SCRIPT=/usr/local/sbin/ctm_node_install.py
+
+if [ -f "$MARKER" ]; then
+  echo "bootstrap already completed on $(cat "$MARKER"); nothing to do"
+  exit 0
+fi
+mkdir -p /var/lib/ctm /etc/ctm
+echo "== $(date -u +%FT%TZ) bootstrap start role=$ROLE env=$ENVIRONMENT host=$(hostname)"
+
+# Managed-identity token from IMDS (no Azure CLI needed on the box).
+imds_token() {
+  curl -sS --retry 5 --retry-delay 3 -H "Metadata: true" \
+    "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=$1&client_id=$IDENTITY_CLIENT_ID" \
+    | jq -r .access_token
+}
+
+wait_for() { # wait_for <seconds> <command...>
+  local deadline=$(( $(date +%s) + $1 )); shift
+  until "$@"; do
+    if [ "$(date +%s)" -ge "$deadline" ]; then echo "timeout waiting for: $*"; return 1; fi
+    sleep 5
+  done
+}
+
+# Nodes resolve each other through the platform private DNS zone.
+if ! grep -q "$DNS_ZONE" /etc/systemd/resolved.conf 2>/dev/null; then
+  mkdir -p /etc/systemd/resolved.conf.d
+  printf '[Resolve]\nDomains=%s\n' "$DNS_ZONE" > /etc/systemd/resolved.conf.d/ctm.conf
+  systemctl restart systemd-resolved 2>/dev/null || true
+fi
+grep -q "search $DNS_ZONE" /etc/resolv.conf || echo "search $DNS_ZONE" >> /etc/resolv.conf
+
+# Persistent data disk (LUN 0) -> $DATA_MOUNT (EM/Server homes; agents skip).
+if [ "$ATTACH_DATA_DISK" = "true" ]; then
+  DEV=/dev/disk/azure/scsi1/lun0
+  wait_for 600 test -e "$DEV"
+  if ! blkid "$DEV" >/dev/null 2>&1; then
+    mkfs.xfs -f -L ctmdata "$DEV"
+  fi
+  mkdir -p "$DATA_MOUNT"
+  grep -q "LABEL=ctmdata" /etc/fstab || echo "LABEL=ctmdata $DATA_MOUNT xfs defaults,nofail 0 2" >> /etc/fstab
+  mount -a
+fi
+mkdir -p "$DATA_MOUNT"
+
+# Shared NFS filesystem (Azure Files Premium, NFS 4.1): installer cache,
+# EM/Server backups and shared logs.
+mkdir -p "$SHARED_MOUNT"
+if ! grep -q "$NFS_SERVER:$NFS_EXPORT" /etc/fstab; then
+  echo "$NFS_SERVER:$NFS_EXPORT $SHARED_MOUNT nfs vers=4,minorversion=1,sec=sys,nofail,_netdev 0 0" >> /etc/fstab
+fi
+wait_for 300 mount "$SHARED_MOUNT"
+mkdir -p "$SHARED_MOUNT"/{installers,backups,logs}
+
+# Fetch the idempotent node installer from the installers blob container via
+# the managed identity, so the running script version == the repo version
+# (deploy.py uploads it on every compute deployment; media upload too).
+TOK=$(imds_token "https://storage.azure.com/")
+curl -sSf --retry 5 --retry-delay 5 -H "Authorization: Bearer $TOK" -H "x-ms-version: 2021-08-06" \
+  "https://$BLOB_ACCOUNT.blob.core.windows.net/$INSTALLERS_CONTAINER/$NODE_SCRIPT_BLOB" \
+  -o "$NODE_SCRIPT"
+chmod 0755 "$NODE_SCRIPT"
+unset TOK
+
+# systemd oneshot for MANUAL re-runs (the installer is safe to re-run at any
+# time): systemctl start ctm-install.service
+cat > /etc/systemd/system/ctm-install.service <<'UNIT'
+[Unit]
+Description=Control-M node installer (idempotent; safe to re-run)
+After=network-online.target remote-fs.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/sbin/ctm_node_install.py --config /etc/ctm/node.json
+TimeoutStartSec=0
+UNIT
+systemctl daemon-reload
+
+# The role section below writes /etc/ctm/node.json and calls this.
+run_node_installer() {
+  chmod 0640 /etc/ctm/node.json
+  python3 "$NODE_SCRIPT" --config /etc/ctm/node.json
+  date -u +%FT%TZ > "$MARKER"
+  echo "== bootstrap finished role=$ROLE"
+}
+
+echo "== common shim finished; handing over to the role section"
